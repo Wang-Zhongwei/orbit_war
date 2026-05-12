@@ -6,6 +6,9 @@ from agents.rule_based import (
     run_agent,
     AgentConfig,
     GameContext,
+    StatefulAgentConfig,
+    StatefulAgent,
+    make_stateful_agent,
 )
 
 __all__ = [
@@ -16,4 +19,7 @@ __all__ = [
     "run_agent",
     "AgentConfig",
     "GameContext",
+    "StatefulAgentConfig",
+    "StatefulAgent",
+    "make_stateful_agent",
 ]
