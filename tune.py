@@ -639,13 +639,13 @@ REGISTRY.register(
         factory=_never_miss_factory,
         params=[
             CategoricalParam("source_sort",          ["none", "richest_first"]),
-            # CategoricalParam("target_mode",          ["nearest", "roi", "random_biased"]),
-            # FloatParam(      "limit_top_k_fraction", 0.1, 0.5),
-            # IntParam(        "bias_draws",           1,   4),
-            # CategoricalParam("accept_comet_src",     [True, False]),
-            # CategoricalParam("cost_mode",            ["none", "turns_weighted"]),
-            # FloatParam(      "cost_weight",          1.0, 3.0),
-            # IntParam(        "max_moves",            1,   12),
+            CategoricalParam("target_mode",          ["nearest", "roi", "random_biased"]),
+            FloatParam(      "limit_top_k_fraction", 0.1, 0.5),
+            IntParam(        "bias_draws",           1,   4),
+            CategoricalParam("accept_comet_src",     [True, False]),
+            CategoricalParam("cost_mode",            ["none", "turns_weighted"]),
+            FloatParam(      "cost_weight",          1.0, 3.0),
+            IntParam(        "max_moves",            1,   12),
         ],
         agent_fn_name="never_miss_agent",
         description="generalized agent: source_sort, target_mode, bias, cost_mode, max_moves",
@@ -655,13 +655,14 @@ REGISTRY.register(
 def _stateful_factory(config: dict) -> Callable:
     """Build a fresh StatefulAgent instance from a sampled hyperparameter dict."""
     agent_config = StatefulAgentConfig(
-        score_dist_base     = config.get("score_dist_base",     100.0),
-        score_prod_mult     = config.get("score_prod_mult",      15.0),
-        score_enemy_bonus   = config.get("score_enemy_bonus",    10.0),
-        score_ships_penalty = config.get("score_ships_penalty",   0.7),
-        score_eta_penalty   = config.get("score_eta_penalty",     2.0),
-        min_ships_attack    = config.get("min_ships_attack",       10),
-        top_k_targets       = config.get("top_k_targets",          3),
+        score_prod_mult       = config.get("score_prod_mult",       20.55),
+        score_enemy_bonus     = config.get("score_enemy_bonus",     17.40),
+        score_ships_penalty   = config.get("score_ships_penalty",    0.467),
+        score_time_penalty    = config.get("score_time_penalty",     1.89),
+        min_ships_attack      = config.get("min_ships_attack",         13),
+        top_k_targets         = config.get("top_k_targets",            2),
+        comet_penalty         = config.get("comet_penalty",           10),
+        min_ships_coop_target = config.get("min_ships_coop_target",    20),
     )
     return make_stateful_agent(agent_config)
 
@@ -671,34 +672,19 @@ REGISTRY.register(
     TunableStrategy(
         factory=_stateful_factory,
         params=[
-            FloatParam("score_dist_base",      70.0, 130.0),
-            FloatParam("score_prod_mult",        8.0,  25.0),
-            FloatParam("score_enemy_bonus",      4.0,  18.0),
-            FloatParam("score_ships_penalty",    0.3,   1.2),
-            FloatParam("score_eta_penalty",      0.5,   4.0),
-            IntParam(  "min_ships_attack",         5,    18),
-            IntParam(  "top_k_targets",            2,     6),
+            FloatParam("score_prod_mult",         12.0,  30.0),
+            FloatParam("score_enemy_bonus",        4.0,  18.0),
+            FloatParam("score_ships_penalty",      0.3,   1.2),
+            FloatParam("score_time_penalty",       0.5,   8.0),
+            IntParam(  "min_ships_attack",          10,    24),
+            FloatParam("comet_penalty",             0.0,  20.0),
+            IntParam(  "min_ships_coop_target",     10,    40),
+            IntParam(  "top_k_targets",             2,     6),
         ],
         agent_fn_name="stateful_agent",
-        description="stateful: score weights, min_ships_attack, top_k_targets",
+        description="stateful: score weights, min_ships_attack, comet_penalty, min_ships_coop_target",
     ),
 )
-
-# ── Template for a future agent ──────────────────────────────────────────────
-# REGISTRY.register(
-#     "my_agent",
-#     TunableStrategy(
-#         factory=lambda config: (lambda obs: my_agent(obs, config)),
-#         params=[
-#             FloatParam("alpha",  0.0, 1.0),
-#             IntParam(  "depth",  1,   5),
-#             CategoricalParam("mode", ["greedy", "cautious"]),
-#         ],
-#         agent_fn_name="my_agent",
-#         description="my_agent: alpha, depth, mode",
-#     ),
-# )
-
 
 # ---------------------------------------------------------------------------
 # CLI
