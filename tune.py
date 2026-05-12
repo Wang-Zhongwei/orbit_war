@@ -74,6 +74,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import statistics
 import sys
@@ -89,6 +90,19 @@ from evaluation import AGENTS, run_match_raw
 from agents.rule_based import AgentConfig, run_agent, StatefulAgentConfig, make_stateful_agent
 
 RESULTS_DIR = Path(__file__).parent / "results"
+RATINGS_FILE = RESULTS_DIR / "opponent_ratings.json"
+DEFAULT_RATING = 1500
+
+
+def load_ratings() -> dict[str, float]:
+    """Load opponent ratings from ``results/opponent_ratings.json``.
+
+    Returns a dict mapping opponent name to Elo-style rating.  Any opponent
+    absent from the file gets ``DEFAULT_RATING`` (1500) at lookup time.
+    """
+    if RATINGS_FILE.exists():
+        return json.loads(RATINGS_FILE.read_text())
+    return {}
 
 
 def _default_optuna_storage_uri() -> str:
@@ -328,6 +342,12 @@ class MatchEvaluator:
         self.episode_steps = episode_steps
         self._opp_fns = [OPPONENT_POOL[o] for o in opponents]  # validated once
 
+        ratings = load_ratings()
+        raw = [ratings.get(opp, DEFAULT_RATING) for opp in opponents]
+        total = sum(raw)
+        self._weights: list[float] = [r / total for r in raw]
+        self._ratings: list[float] = raw
+
     def _play_pair(self, candidate: Callable, opponent: object, seed: int) -> float:
         """Play both slot orderings on one seed and return the candidate's average outcome.
 
@@ -378,9 +398,35 @@ class MatchEvaluator:
                 score = self._play_pair(candidate, opp_fn, seed)
                 scores.append(score)
                 if report_fn is not None:
-                    report_fn(statistics.mean(scores), step)
+                    report_fn(self.weighted_mean(scores), step)
                 step += 1
         return scores
+
+    def weighted_mean(self, scores: list[float]) -> float:
+        """Return the rating-weighted mean score across opponents.
+
+        Scores are grouped by opponent in blocks of ``matches_per_trial``.
+        Incomplete trailing blocks (mid-trial) are included with whatever
+        games have finished so far, so this is safe to call from the
+        intermediate-value callback.
+
+        Args:
+            scores: Flat per-game scores as returned by (or during) ``evaluate``.
+
+        Returns:
+            Weighted mean in [0.0, 1.0].
+        """
+        m = self.matches_per_trial
+        per_opp_means: list[float] = []
+        active_weights: list[float] = []
+        for i, w in enumerate(self._weights):
+            chunk = scores[i * m : (i + 1) * m]
+            if not chunk:
+                break
+            per_opp_means.append(statistics.mean(chunk))
+            active_weights.append(w)
+        total_w = sum(active_weights)
+        return sum(wt * s for wt, s in zip(active_weights, per_opp_means)) / total_w
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +477,7 @@ class TuningObjective:
                 raise optuna.TrialPruned()
 
         scores = self.evaluator.evaluate(candidate, trial.number, report_fn=_report)
-        return statistics.mean(scores)
+        return self.evaluator.weighted_mean(scores)
 
 
 # ---------------------------------------------------------------------------
@@ -525,10 +571,15 @@ class StudyRunner:
         )
         objective = TuningObjective(strategy=strategy, evaluator=evaluator)
 
+        opp_info = "  ".join(
+            f"{opp}(r={r:.0f},w={w:.3f})"
+            for opp, r, w in zip(cfg.opponents, evaluator._ratings, evaluator._weights)
+        )
         print(
             f"Tuning '{cfg.strategy_name}'  |  "
             f"trials={cfg.n_trials}  matches/trial={cfg.matches_per_trial}  "
-            f"opponents={cfg.opponents}  jobs={cfg.n_jobs}"
+            f"jobs={cfg.n_jobs}\n"
+            f"Opponents: {opp_info}"
         )
         if cfg.storage:
             print(f"Storage: {cfg.storage}  (study '{cfg.resolved_study_name}', resumable)")

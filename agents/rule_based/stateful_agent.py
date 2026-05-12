@@ -25,13 +25,13 @@ _COOP_PLANET_CAP       = 8    # not tuned
 class StatefulAgentConfig:
     """Tunable hyperparameters for :class:`StatefulAgent`."""
 
-    score_dist_base:     float = 100.0
-    score_prod_mult:     float = 15.0
-    score_enemy_bonus:   float = 10.0
-    score_ships_penalty: float = 0.7
-    score_eta_penalty:   float = 2.0
-    min_ships_attack:    int   = 10
-    top_k_targets:       int   = 3
+    score_dist_base:     float = 97.574
+    score_prod_mult:     float = 19.228
+    score_enemy_bonus:   float = 6.561
+    score_ships_penalty: float = 0.498
+    score_eta_penalty:   float = 0.572
+    min_ships_attack:    int   = 14
+    top_k_targets:       int   = 2
 
 
 class StatefulAgent:
