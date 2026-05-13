@@ -9,6 +9,8 @@ from agents.rule_based import (
     StatefulAgentConfig,
     StatefulAgent,
     make_stateful_agent,
+    Agent1000Score,
+    agent_1000_score,
 )
 
 __all__ = [
@@ -22,4 +24,6 @@ __all__ = [
     "StatefulAgentConfig",
     "StatefulAgent",
     "make_stateful_agent",
+    "Agent1000Score",
+    "agent_1000_score",
 ]

@@ -15,6 +15,7 @@ from .stateful_agent import (
     make_stateful_agent,
     stateful_agent,
 )
+from .agent_1000_score import Agent1000Score, agent_1000_score
 
 __all__ = [
     "GameContext",
@@ -30,4 +31,6 @@ __all__ = [
     "StatefulAgent",
     "make_stateful_agent",
     "stateful_agent",
+    "Agent1000Score",
+    "agent_1000_score",
 ]

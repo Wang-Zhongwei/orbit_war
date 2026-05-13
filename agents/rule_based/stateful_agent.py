@@ -18,19 +18,21 @@ from .stateless_agents import GameContext
 
 
 _COOP_PLANET_CAP       = 8
+_SCORE_PROD_MULT       = 10
 
 @dataclass
 class StatefulAgentConfig:
     """Tunable hyperparameters for :class:`StatefulAgent`."""
 
-    score_prod_mult:       float = 20.55
-    score_enemy_bonus:     float = 17.40
-    score_ships_penalty:   float = 0.467
-    score_time_penalty:    float = 1.89
+    score_enemy_bonus:     float = 14.61
+    score_ships_penalty:   float = 0.482
+    score_time_penalty:    float = 1.269
     min_ships_attack:      int   = 13
-    top_k_targets:         int   = 2
-    comet_penalty:         float = 5.0   # flat score subtraction when target is a comet
-    min_ships_coop_target: int   = 20    # minimum garrison on enemy for coalition attacks
+    top_k_targets:         int   = 3
+    comet_penalty:         float = 1.52
+    min_ships_coop_target: int   = 34
+    max_tick:              int   = 25
+    attack_buffer:         int   = 3
 
 
 class StatefulAgent:
@@ -44,6 +46,7 @@ class StatefulAgent:
         self._reinf_traj:  list = []
         self._comet_ids:   set  = set()
         self._comet_paths: dict = {}
+        self._traj_cache:  dict = {}
 
     def __call__(self, obs, config=None) -> list:
         return self._run(obs)
@@ -83,13 +86,9 @@ class StatefulAgent:
             "angle": angle, "total_ships": ships, "arrive_tick": arrive_tick,
         })
 
-    def _find_angle(self, src, tgt, ships: int, angular_velocity: float,
-                    comet_path: list | None = None):
+    def _find_angle(self, src, ships: int, traj: list):
         spd = fleet_speed(ships)
-        tick_limit = min(61, len(comet_path) + 1) if comet_path is not None else 61
-        for tick in range(1, tick_limit):
-            tx, ty = comet_path[tick - 1] if comet_path is not None else \
-                     predict_planet_position(tgt, tick, angular_velocity)
+        for tick, (tx, ty) in enumerate(traj, start=1):
             dist = math.sqrt((src.x - tx) ** 2 + (src.y - ty) ** 2)
             if abs(math.ceil(dist / spd) - tick) < 1:
                 angle = math.atan2(ty - src.y, tx - src.x)
@@ -109,17 +108,17 @@ class StatefulAgent:
             total = new
         return total
 
-    def _refine_ships_moving_target(self, src, tgt, needed: int, angular_velocity: float,
-                                    src_avail: int):
-        comet_path = None
+    def _refine_ships_moving_target(self, src, tgt, needed: int, src_avail: int):
         if tgt.id in self._comet_ids:
-            comet_path = self._comet_paths.get(tgt.id) or []
-            if not comet_path:
+            traj = self._comet_paths.get(tgt.id) or []
+            if not traj:
                 return None, needed, None  # comet already expiring
+        else:
+            traj = self._traj_cache[tgt.id]
         total_ships = needed
         arrive_tick = None
         for _ in range(5):
-            angle, arrive_tick = self._find_angle(src, tgt, total_ships, angular_velocity, comet_path)
+            angle, arrive_tick = self._find_angle(src, total_ships, traj)
             if angle is None:
                 return None, needed, None
             new_total = needed + (arrive_tick * tgt.production if tgt.owner != -1 else 0)
@@ -140,7 +139,7 @@ class StatefulAgent:
         prod  = tgt.production
         enemy = tgt.owner != -1
         return (
-            cfg.score_prod_mult * prod
+            _SCORE_PROD_MULT * prod
             + (cfg.score_enemy_bonus * prod if enemy else 0)
             - cfg.score_ships_penalty * (base + (time * prod if enemy else 0))
             - cfg.score_time_penalty * time
@@ -174,40 +173,54 @@ class StatefulAgent:
             if rt["arrive_tick"] <= 0:
                 self._reinf_traj.remove(rt)
 
-    def _planets_under_attack(self, mine, fleets, player: int, angular_velocity: float) -> dict:
-        enemy  = [f for f in fleets if f.owner != player and f.ships > 0]
+    def _planets_under_attack(self, mine, fleets, player: int) -> dict:
+        enemy   = [f for f in fleets if f.owner != player and f.ships > 0]
         result: dict = {}
         seen:   set  = set()
-
-        mov_traj = {
-            m.id: [predict_planet_position(m, t, angular_velocity) for t in range(1, 61)]
-            for m in mine if m.id in self._moving_ids
-        }
+        static  = [m for m in mine if m.id not in self._traj_cache]
+        moving  = [m for m in mine if m.id in self._traj_cache]
 
         for f in enemy:
             spd   = fleet_speed(f.ships)
-            cos_a = math.cos(f.angle) * spd
-            sin_a = math.sin(f.angle) * spd
-            px, py = f.x, f.y
-            for tick in range(1, 61):
-                nx = f.x + cos_a * tick
-                ny = f.y + sin_a * tick
-                for m in mine:
-                    mx, my = mov_traj[m.id][tick - 1] if m.id in mov_traj else (m.x, m.y)
-                    if point_to_segment_distance((mx, my), (px, py), (nx, ny)) <= m.radius:
-                        key = (m.id, f.id)
-                        if key not in seen:
-                            seen.add(key)
-                            result.setdefault(m.id, {"planet": m, "fleets": []})
-                            result[m.id]["fleets"].append({"fleet": f, "arrive_tick": tick})
-                px, py = nx, ny
+            vx    = math.cos(f.angle) * spd
+            vy    = math.sin(f.angle) * spd
+
+            # Static planets: analytic ray-circle intersection — O(1) per planet
+            for m in static:
+                dx0  = f.x - m.x
+                dy0  = f.y - m.y
+                b    = 2 * (dx0 * vx + dy0 * vy)
+                c    = dx0 * dx0 + dy0 * dy0 - m.radius * m.radius
+                disc = b * b - 4 * spd * spd * c
+                if disc < 0:
+                    continue
+                t_enter = (-b - math.sqrt(disc)) / (2 * spd * spd)
+                t_exit  = (-b + math.sqrt(disc)) / (2 * spd * spd)
+                if t_exit < 0 or t_enter > 60:
+                    continue
+                arrive_tick = max(1, math.ceil(t_enter))
+                result.setdefault(m.id, {"planet": m, "fleets": []})
+                result[m.id]["fleets"].append({"fleet": f, "arrive_tick": arrive_tick})
+
+            # Moving planets: tick-by-tick (unchanged)
+            if moving:
+                px, py = f.x, f.y
+                for tick in range(1, self.cfg.max_tick + 1):
+                    nx = f.x + vx * tick
+                    ny = f.y + vy * tick
+                    for m in moving:
+                        mx, my = self._traj_cache[m.id][tick - 1]
+                        if point_to_segment_distance((mx, my), (px, py), (nx, ny)) <= m.radius:
+                            key = (m.id, f.id)
+                            if key not in seen:
+                                seen.add(key)
+                                result.setdefault(m.id, {"planet": m, "fleets": []})
+                                result[m.id]["fleets"].append({"fleet": f, "arrive_tick": tick})
+                    px, py = nx, ny
         return result
 
-    def _sum_enemy_en_route(self, tgt, fleets, player: int, angular_velocity: float) -> int:
-        tgt_traj = (
-            [predict_planet_position(tgt, t, angular_velocity) for t in range(1, 61)]
-            if tgt.id in self._moving_ids else None
-        )
+    def _sum_enemy_en_route(self, tgt, fleets, player: int) -> int:
+        tgt_traj = self._traj_cache.get(tgt.id)
         total = 0
         for f in fleets:
             if f.owner == player or f.ships <= 0:
@@ -216,7 +229,7 @@ class StatefulAgent:
             cos_a = math.cos(f.angle) * spd
             sin_a = math.sin(f.angle) * spd
             px, py = f.x, f.y
-            for tick in range(1, 61):
+            for tick in range(1, self.cfg.max_tick + 1):
                 nx = f.x + cos_a * tick
                 ny = f.y + sin_a * tick
                 tx, ty = tgt_traj[tick - 1] if tgt_traj else (tgt.x, tgt.y)
@@ -233,6 +246,11 @@ class StatefulAgent:
         refined   = needed
         plans     = None
         min_ships = self.cfg.min_ships_attack
+
+        tgt_traj: list | None = None
+        if moving:
+            tgt_traj = self._comet_paths.get(tgt.id) if tgt.id in self._comet_ids else self._traj_cache[tgt.id]
+
         for _ in range(5):
             max_arr   = 0
             rem       = refined
@@ -243,7 +261,7 @@ class StatefulAgent:
                     break
                 p_s = max(min(a["ships"], rem), min_ships)
                 if moving:
-                    ang, arr = self._find_angle(a["planet"], tgt, p_s, angular_velocity)
+                    ang, arr = self._find_angle(a["planet"], p_s, tgt_traj)
                     if arr is None:
                         return refined, None
                 else:
@@ -321,6 +339,10 @@ class StatefulAgent:
 
         self._comet_ids   = comet_ids
         self._comet_paths = ctx.comet_paths
+        self._traj_cache  = {
+            p.id: [predict_planet_position(p, t, angular_velocity) for t in range(1, self.cfg.max_tick + 1)]
+            for p in ctx.planets if p.id in self._moving_ids and p.id not in comet_ids
+        }
 
         if not my_planets or not targets:
             return []
@@ -329,37 +351,40 @@ class StatefulAgent:
         self._age_reinf_traj()
 
         min_ships     = self.cfg.min_ships_attack
-        under_attack  = self._planets_under_attack(my_planets, fleets, player, angular_velocity)
+        under_attack  = self._planets_under_attack(my_planets, fleets, player)
         exhausted_ids: set  = set()
         moves: list         = []
 
         # ── Phase 0: Comet evacuation ─────────────────────────────────────────
+        # Trigger when the comet has <= _COMET_LEAVE_THRESHOLD waypoints left so
+        # we act before it actually leaves the domain (len==0/1 is already too late).
+        _COMET_LEAVE_THRESHOLD = 1
         for comet_src in [p for p in my_planets if p.id in comet_ids]:
-            if len(ctx.comet_paths.get(comet_src.id, [])) > 1:
+            if len(ctx.comet_paths.get(comet_src.id, [])) > _COMET_LEAVE_THRESHOLD:
                 continue
 
             best_tgt = max(targets, key=lambda t: self._score(comet_src, t))
 
-            # sending to best target
+            # sending to best target — use needed=1 so evacuation fires even when
+            # the comet has fewer ships than the normal min_ships_attack threshold
             if best_tgt.id in self._moving_ids or best_tgt.id in comet_ids:
                 angle, _, arrive_tick = self._refine_ships_moving_target(
-                    comet_src, best_tgt, min_ships, angular_velocity, comet_src.ships
+                    comet_src, best_tgt, 1, comet_src.ships
                 )
             else:
                 angle, arrive_tick = self._static_angle(comet_src, best_tgt, comet_src.ships)
-            
+
             if angle is not None:
                 moves.append([comet_src.id, angle, comet_src.ships])
                 exhausted_ids.add(comet_src.id)
                 self._track_fleet(comet_src, best_tgt, angle, comet_src.ships, arrive_tick)
                 break
 
-            # send to my planets
+            # fallback: send to closest own planet
             cloest_my_planet = min(my_planets, key=lambda p: (p.x - comet_src.x) ** 2 + (p.y - comet_src.y) ** 2)
             angle, _, arrive_tick = self._refine_ships_moving_target(
-                comet_src, cloest_my_planet, min_ships, angular_velocity, comet_src.ships
+                comet_src, cloest_my_planet, 1, comet_src.ships
             )
-            
 
             if angle is not None:
                 moves.append([comet_src.id, angle, comet_src.ships])
@@ -398,8 +423,8 @@ class StatefulAgent:
                     continue
 
                 if p.id in self._moving_ids:
-                    _cp = ctx.comet_paths.get(p.id) if p.id in comet_ids else None
-                    angle, arrive_tick = self._find_angle(helper, p, to_send, angular_velocity, _cp)
+                    _traj = ctx.comet_paths.get(p.id) if p.id in comet_ids else self._traj_cache[p.id]
+                    angle, arrive_tick = self._find_angle(helper, to_send, _traj)
                 else:
                     dx, dy      = p.x - helper.x, p.y - helper.y
                     angle       = math.atan2(dy, dx)
@@ -425,7 +450,7 @@ class StatefulAgent:
             en_route_by_tgt[tid] = en_route_by_tgt.get(tid, 0) + ft["total_ships"]
 
         enemy_en_route_by_tgt: dict[int, int] = {
-            tgt.id: self._sum_enemy_en_route(tgt, fleets, player, angular_velocity)
+            tgt.id: self._sum_enemy_en_route(tgt, fleets, player)
             for tgt in targets
         }
 
@@ -443,7 +468,7 @@ class StatefulAgent:
                 enemy_racing = enemy_en_route_by_tgt[tgt.id]
                 base = enemy_racing + tgt.ships + 1
                 if tgt.owner != -1:
-                    base += 2 * tgt.production
+                    base += self.cfg.attack_buffer * tgt.production
 
                 if owned_frac < 0.75 and en_route >= base:
                     continue
@@ -455,7 +480,7 @@ class StatefulAgent:
                 if src_avail >= needed:
                     if tgt.id in comet_ids or tgt.id in self._moving_ids:
                         angle, total_ships, arrive_tick = self._refine_ships_moving_target(
-                            src, tgt, needed, angular_velocity, src_avail
+                            src, tgt, needed, src_avail
                         )
                     else:
                         total_ships = self._refine_ships_static_target(src, tgt, needed) if tgt.owner != -1 else needed
@@ -516,3 +541,5 @@ def stateful_agent(obs) -> list:
     if player not in _sa_instances:
         _sa_instances[player] = StatefulAgent()
     return _sa_instances[player](obs)
+
+

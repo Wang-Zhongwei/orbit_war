@@ -655,14 +655,15 @@ REGISTRY.register(
 def _stateful_factory(config: dict) -> Callable:
     """Build a fresh StatefulAgent instance from a sampled hyperparameter dict."""
     agent_config = StatefulAgentConfig(
-        score_prod_mult       = config.get("score_prod_mult",       20.55),
-        score_enemy_bonus     = config.get("score_enemy_bonus",     17.40),
-        score_ships_penalty   = config.get("score_ships_penalty",    0.467),
-        score_time_penalty    = config.get("score_time_penalty",     1.89),
-        min_ships_attack      = config.get("min_ships_attack",         13),
-        top_k_targets         = config.get("top_k_targets",            2),
-        comet_penalty         = config.get("comet_penalty",           10),
-        min_ships_coop_target = config.get("min_ships_coop_target",    20),
+        score_enemy_bonus     = config.get("score_enemy_bonus",     8.865),
+        score_ships_penalty   = config.get("score_ships_penalty",   0.622),
+        score_time_penalty    = config.get("score_time_penalty",    0.989),
+        min_ships_attack      = config.get("min_ships_attack",        11),
+        top_k_targets         = config.get("top_k_targets",           4),
+        comet_penalty         = config.get("comet_penalty",          1.51),
+        max_tick              = config.get("max_tick",                25),
+        min_ships_coop_target = config.get("min_ships_coop_target",   36),
+        attack_buffer         = config.get("attack_buffer",            3.0),
     )
     return make_stateful_agent(agent_config)
 
@@ -672,14 +673,14 @@ REGISTRY.register(
     TunableStrategy(
         factory=_stateful_factory,
         params=[
-            FloatParam("score_prod_mult",         12.0,  30.0),
-            FloatParam("score_enemy_bonus",        4.0,  18.0),
-            FloatParam("score_ships_penalty",      0.3,   1.2),
-            FloatParam("score_time_penalty",       0.5,   8.0),
+            FloatParam("score_enemy_bonus",        1.0,   10.0),
+            FloatParam("score_ships_penalty",      0.1,   1.0),
+            FloatParam("score_time_penalty",       0.1,   1.0),
             IntParam(  "min_ships_attack",          10,    24),
-            FloatParam("comet_penalty",             0.0,  20.0),
-            IntParam(  "min_ships_coop_target",     10,    40),
-            IntParam(  "top_k_targets",             2,     6),
+            FloatParam("comet_penalty",             0.0,   5.0),
+            IntParam(  "min_ships_coop_target",     15,    40),
+            IntParam(  "top_k_targets",             1,     6),
+            IntParam(  "attack_buffer",             1,     6),
         ],
         agent_fn_name="stateful_agent",
         description="stateful: score weights, min_ships_attack, comet_penalty, min_ships_coop_target",

@@ -14,17 +14,18 @@ from collections.abc import Iterable, Sequence
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
-from agents.rule_based import nearest_planet_sniper, roi_agent, never_miss_agent, stateful_agent  # noqa: E402
+from agents.rule_based import nearest_planet_sniper, roi_agent, never_miss_agent, stateful_agent, agent_1000_score  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Agent registry
 # ---------------------------------------------------------------------------
 AGENTS: dict[str, object] = {
-    "sniper":     nearest_planet_sniper,
-    "roi":        roi_agent,
-    "never_miss": never_miss_agent,
-    "stateful":   stateful_agent,
-    "random":     "random",
+    "sniper":       nearest_planet_sniper,
+    "roi":          roi_agent,
+    "never_miss":   never_miss_agent,
+    "stateful":     stateful_agent,
+    "1000_score":   agent_1000_score,
+    "random":       "random",
 }
 
 
