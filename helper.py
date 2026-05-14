@@ -92,7 +92,6 @@ def planet_trajectory(p, ticks: int, angular_velocity: float) -> list[tuple[floa
     """Return a list of (x, y) positions for a moving planet over `ticks` turns."""
     return [predict_planet_position(p, t, angular_velocity) for t in range(1, ticks + 1)]
 
-# todo: extract aiming logic to game context
 def _path_blocked(sx: float, sy: float, ex: float, ey: float, ticks: int, spd: float,
                   blockers: list, traj_cache: dict) -> bool:
     """Return True if the straight fleet path from (sx,sy) to (ex,ey) over `ticks` turns

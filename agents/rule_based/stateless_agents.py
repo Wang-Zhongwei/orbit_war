@@ -36,64 +36,18 @@ To make it tunable, register it in ``tune.py``::
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from kaggle_environments.envs.orbit_wars.orbit_wars import CENTER, SUN_RADIUS, Planet, point_to_segment_distance
 
 from ..configs import AgentConfig
+from game_context import GameContext
 from helper import (
     aim_for_planet,
     distance,
     fleet_speed,
     predicted_garrison,
-    unpack_obs,
 )
-
-
-# ---------------------------------------------------------------------------
-# GameContext — parsed observation for one turn
-# ---------------------------------------------------------------------------
-
-@dataclass
-class GameContext:
-    """Parsed game state for one turn, derived from a raw observation dict.
-
-    Attributes:
-        player: This agent's player ID.
-        planets: All planets this turn.
-        comet_ids: Planet IDs that are currently comets.
-        angular_velocity: Inner-planet rotation speed (rad/turn).
-        fleets: All active fleets.
-        comet_paths: Remaining waypoints per comet planet ID.
-        my_planets: Planets owned by this agent (derived in ``__post_init__``).
-        enemies: Planets not owned by this agent (derived in ``__post_init__``).
-    """
-
-    player: int
-    planets: list[Planet]
-    comet_ids: set[int]
-    angular_velocity: float
-    fleets: list
-    comet_paths: dict
-    my_planets: list[Planet] = field(init=False, repr=False)
-    enemies: list[Planet]    = field(init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        self.my_planets = [p for p in self.planets if p.owner == self.player]
-        self.enemies    = [p for p in self.planets if p.owner != self.player]
-
-    @classmethod
-    def from_obs(cls, obs) -> GameContext:
-        """Construct from a raw Kaggle Environments observation dict."""
-        player, planets, comet_ids, angular_velocity, fleets, comet_paths = unpack_obs(obs)
-        return cls(
-            player=player,
-            planets=planets,
-            comet_ids=comet_ids,
-            angular_velocity=angular_velocity,
-            fleets=fleets,
-            comet_paths=comet_paths,
-        )
 
 # ---------------------------------------------------------------------------
 # Pre-built configs for the three canonical agents
