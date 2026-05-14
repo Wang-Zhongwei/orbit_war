@@ -9,13 +9,14 @@ from .stateless_agents import (
     roi_agent,
     never_miss_agent,
 )
+from .base import BaseStatefulAgent
 from .stateful_agent import (
     StatefulAgentConfig,
     StatefulAgent,
     make_stateful_agent,
     stateful_agent,
 )
-from .agent_1000_score import Agent1000Score, agent_1000_score
+from .agent_1000_score import Agent1000ScoreConfig, Agent1000Score, make_agent_1000_score, agent_1000_score
 
 __all__ = [
     "GameContext",
@@ -27,10 +28,13 @@ __all__ = [
     "nearest_planet_sniper",
     "roi_agent",
     "never_miss_agent",
+    "BaseStatefulAgent",
     "StatefulAgentConfig",
     "StatefulAgent",
     "make_stateful_agent",
     "stateful_agent",
+    "Agent1000ScoreConfig",
     "Agent1000Score",
+    "make_agent_1000_score",
     "agent_1000_score",
 ]

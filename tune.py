@@ -87,7 +87,7 @@ import optuna
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 from evaluation import AGENTS, run_match_raw
-from agents.rule_based import AgentConfig, run_agent, StatefulAgentConfig, make_stateful_agent
+from agents.rule_based import AgentConfig, run_agent, StatefulAgentConfig, make_stateful_agent, Agent1000ScoreConfig, make_agent_1000_score
 
 RESULTS_DIR = Path(__file__).parent / "results"
 RATINGS_FILE = RESULTS_DIR / "opponent_ratings.json"
@@ -686,6 +686,33 @@ REGISTRY.register(
         description="stateful: score weights, min_ships_attack, comet_penalty, min_ships_coop_target",
     ),
 )
+
+
+def _agent_1000_score_factory(config: dict) -> Callable:
+    """Build a fresh Agent1000Score instance from a sampled hyperparameter dict."""
+    agent_config = Agent1000ScoreConfig(
+        formula_prod_mult           = config.get("formula_prod_mult",           15.0),
+        formula_enemy_bonus_mult    = config.get("formula_enemy_bonus_mult",    10.0),
+        formula_total_ships_percent = config.get("formula_total_ships_percent",  0.7),
+    )
+    agent = make_agent_1000_score(agent_config)
+    return lambda obs: agent(obs)
+
+
+REGISTRY.register(
+    "agent_1000_score",
+    TunableStrategy(
+        factory=_agent_1000_score_factory,
+        params=[
+            FloatParam("formula_prod_mult",           1.0,  30.0),
+            FloatParam("formula_enemy_bonus_mult",     0.0,  25.0),
+            FloatParam("formula_total_ships_percent",  0.1,   2.0),
+        ],
+        agent_fn_name="agent_1000_score",
+        description="agent_1000_score: scoring weights (prod_mult, enemy_bonus_mult, ships_percent)",
+    ),
+)
+
 
 # ---------------------------------------------------------------------------
 # CLI

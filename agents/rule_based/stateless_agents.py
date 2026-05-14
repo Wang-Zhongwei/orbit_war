@@ -38,11 +38,14 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, field
 
-from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
+from kaggle_environments.envs.orbit_wars.orbit_wars import CENTER, SUN_RADIUS, Planet, point_to_segment_distance
 
+from ..configs import AgentConfig
 from helper import (
     aim_for_planet,
-    best_target,
+    distance,
+    fleet_speed,
+    predicted_garrison,
     unpack_obs,
 )
 
@@ -92,73 +95,6 @@ class GameContext:
             comet_paths=comet_paths,
         )
 
-
-# ---------------------------------------------------------------------------
-# AgentConfig — all micro-decisions as tunable hyperparameters
-# ---------------------------------------------------------------------------
-
-@dataclass
-class AgentConfig:
-    """All micro-decisions for ``run_agent``, exposed as tunable hyperparameters.
-
-    Every field corresponds to one decision point in the shared pipeline and
-    maps directly to a ``Param`` entry in ``tune.py``.
-
-    Attributes:
-        source_sort:
-            Order of source planets entering the per-planet loop.
-
-            ``"none"``          — observation order (fastest).
-            ``"richest_first"`` — strongest garrison attacks first; richest planets
-                                  claim the highest-value targets before weaker ones.
-
-        target_mode:
-            Strategy for picking an attack target for each source planet.
-
-            ``"nearest"``       — closest enemy by Euclidean distance.
-            ``"roi"``           — highest production/cost score via ``best_target()``.
-            ``"random_biased"`` — distance-sorted pool, top-K kept, biased random draw.
-
-        limit_top_k_fraction:
-            ``"random_biased"`` only.  Fraction of the distance-sorted enemy pool to
-            keep before drawing.  ``1.0`` = all enemies eligible; ``0.25`` = closest
-            quarter only.
-
-        bias_draws:
-            ``"random_biased"`` only.  Number of uniform random draws whose minimum
-            is taken as the selected index.  ``1`` = uniform; higher = stronger bias
-            toward closer planets.
-
-        accept_comet_src:
-            When ``True``, a move from a comet-source planet is always issued even
-            without ``can_capture``, because comet ships are temporary and should
-            be spent aggressively.
-
-        cost_mode:
-            How to score candidate moves before capping at ``max_moves``.
-
-            ``"none"``           — loop order, no sort.
-            ``"turns_weighted"`` — cost = turns_to_arrive × (cost_weight − can_capture).
-                                   Shorter, certain captures rank first.
-
-        cost_weight:
-            ``"turns_weighted"`` only.  Scaling factor (default ``2.0`` means a
-            certain capture scores half as costly as an uncertain one at equal range).
-
-        max_moves:
-            Maximum number of moves issued per turn.  ``None`` = no limit.
-    """
-
-    source_sort:          str        = "none"
-    target_mode:          str        = "random_biased"
-    limit_top_k_fraction: float      = 0.5
-    bias_draws:           int        = 2
-    accept_comet_src:     bool       = True
-    cost_mode:            str        = "turns_weighted"
-    cost_weight:          float      = 2.0
-    max_moves:            int | None = 6
-
-
 # ---------------------------------------------------------------------------
 # Pre-built configs for the three canonical agents
 # ---------------------------------------------------------------------------
@@ -194,7 +130,6 @@ NEVER_MISS_DEFAULT_CONFIG = AgentConfig(
 # ---------------------------------------------------------------------------
 # Pipeline helpers
 # ---------------------------------------------------------------------------
-
 def _sort_sources(planets: list[Planet], mode: str) -> list[Planet]:
     if mode == "none":
         return planets
@@ -245,6 +180,69 @@ def _compute_cost(turns_to_arrive: int, can_capture: bool, config: AgentConfig) 
     if config.cost_mode == "turns_weighted":
         return turns_to_arrive * (config.cost_weight - float(can_capture))
     raise ValueError(f"Unknown cost_mode: {config.cost_mode!r}")
+
+
+# ---------------------------------------------------------------------------
+# Target scoring
+# ---------------------------------------------------------------------------
+# Comet ROI multiplier — comets are temporary so we prioritise them slightly
+COMET_ROI_BONUS: float = 1.5
+
+# Never spend more than this fraction of a planet's garrison on one attack
+MAX_COMMIT_FRACTION: float = 0.8
+def score_target(src: Planet, tgt: Planet, comet_ids: set[int]) -> float | None:
+    """
+    Compute a scalar ROI score for attacking `tgt` from `src`.
+    Returns None when the attack should be skipped entirely.
+
+    Higher is better.  Score = production / ships_needed  (× comet bonus).
+    """
+    dist = distance(src, tgt)
+    if dist == 0:
+        return None
+
+    if point_to_segment_distance((CENTER, CENTER), (src.x, src.y), (tgt.x, tgt.y)) < SUN_RADIUS + 1:
+        return None
+
+    fleet_size = src.ships // 2
+    if fleet_size < 1:
+        return None
+
+    tt = dist / fleet_speed(fleet_size)
+    garrison = predicted_garrison(tgt, tt)
+    ships_needed = int(garrison) + 1
+
+    if ships_needed > src.ships * MAX_COMMIT_FRACTION:
+        return None
+
+    # todo: add distance penalty
+    roi = tgt.production / ships_needed if ships_needed > 0 else 0.0
+    if tgt.id in comet_ids:
+        roi *= COMET_ROI_BONUS
+
+    return roi
+
+
+def best_target(planets: list[Planet], src: Planet,
+                player: int, assigned: set[int],
+                comet_ids: set[int]) -> Planet | None:
+    """
+    Return the highest-ROI planet that `src` should attack, or None.
+
+    Planets already in `assigned` are skipped to avoid double-sending.
+    """
+    best_score = -float('inf')
+    best: Planet | None = None
+
+    for tgt in planets:
+        if tgt.owner == player or tgt.id in assigned:
+            continue
+        roi = score_target(src, tgt, comet_ids)
+        if roi is not None and roi > best_score:
+            best_score = roi
+            best = tgt
+
+    return best
 
 
 # ---------------------------------------------------------------------------

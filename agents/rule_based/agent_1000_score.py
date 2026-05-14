@@ -3,6 +3,15 @@ from __future__ import annotations
 
 import importlib.util
 import os
+from dataclasses import dataclass
+
+
+@dataclass
+class Agent1000ScoreConfig:
+    """Placeholder config — this wrapper delegates to submission/1000_score.py which has its own constants."""
+    formula_prod_mult:           float = 15.0
+    formula_enemy_bonus_mult:    float = 10.0
+    formula_total_ships_percent: float = 0.7
 
 
 def _load_module():
@@ -160,6 +169,11 @@ class Agent1000Score:
             rt["arrive_tick"] -= 1
             if rt["arrive_tick"] <= 0:
                 self._reinf_traj.remove(rt)
+
+
+def make_agent_1000_score(config: Agent1000ScoreConfig | None = None) -> Agent1000Score:
+    """Factory for tuning: returns a fresh Agent1000Score with isolated state."""
+    return Agent1000Score()
 
 
 _instances: dict[int, Agent1000Score] = {}

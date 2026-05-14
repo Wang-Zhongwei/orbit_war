@@ -7,6 +7,7 @@ evaluate_elo.py so this logic lives in one place.
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import time
 from collections import defaultdict
@@ -17,6 +18,27 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 from agents.rule_based import nearest_planet_sniper, roi_agent, never_miss_agent, stateful_agent, agent_1000_score  # noqa: E402
 
 # ---------------------------------------------------------------------------
+# submission/1000_score.py — load with isolated module state and reset wrapper
+# ---------------------------------------------------------------------------
+_sub_spec = importlib.util.spec_from_file_location(
+    "submission_1000_score",
+    os.path.join(os.path.dirname(__file__), "submission", "1000_score.py"),
+)
+_sub_mod = importlib.util.module_from_spec(_sub_spec)
+_sub_spec.loader.exec_module(_sub_mod)
+
+
+def sub_1000_score(obs) -> list:
+    """submission/1000_score.py agent with per-game global-state reset."""
+    if obs.get("step", 0) == 0:
+        _sub_mod.fleet_trajectories.clear()
+        _sub_mod.reinforcement_trajectories.clear()
+        _sub_mod.moving_planets.clear()
+        _sub_mod.steps = 0
+    return _sub_mod.agent(obs)
+
+
+# ---------------------------------------------------------------------------
 # Agent registry
 # ---------------------------------------------------------------------------
 AGENTS: dict[str, object] = {
@@ -25,6 +47,7 @@ AGENTS: dict[str, object] = {
     "never_miss":   never_miss_agent,
     "stateful":     stateful_agent,
     "1000_score":   agent_1000_score,
+    "sub_1000":     sub_1000_score,
     "random":       "random",
 }
 

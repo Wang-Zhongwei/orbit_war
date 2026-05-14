@@ -1,138 +1,33 @@
 """stateful_agent.py — cross-turn memory, active defence, cooperative attacks, and comet logic."""
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
-
-from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
-
+from ..configs import StatefulAgentConfig
 from helper import (
-    CENTER,
-    SUN_RADIUS,
+    distance,
     fleet_speed,
-    point_to_segment_distance,
-    predict_planet_position,
+    planet_trajectory,
+    my_planets_under_attack,
+    reinforcement_plans,
+    sum_enemy_en_route,
 )
 
+from .base import BaseStatefulAgent
 from .stateless_agents import GameContext
 
 
 _COOP_PLANET_CAP       = 8
 _SCORE_PROD_MULT       = 10
 
-@dataclass
-class StatefulAgentConfig:
-    """Tunable hyperparameters for :class:`StatefulAgent`."""
-
-    score_enemy_bonus:     float = 14.61
-    score_ships_penalty:   float = 0.482
-    score_time_penalty:    float = 1.269
-    min_ships_attack:      int   = 13
-    top_k_targets:         int   = 3
-    comet_penalty:         float = 1.52
-    min_ships_coop_target: int   = 34
-    max_tick:              int   = 25
-    attack_buffer:         int   = 3
-
-
-class StatefulAgent:
+# Assumptions: 1. each turn one source can send up to one fleet 
+class StatefulAgent(BaseStatefulAgent):
     """Stateful Orbit Wars agent with cross-turn memory, active defence, coop attacks, and comet awareness."""
 
     def __init__(self, config: StatefulAgentConfig | None = None) -> None:
-        self.cfg           = config or StatefulAgentConfig()
-        self._steps:       int  = 0
-        self._moving_ids:  set  = set()
-        self._fleet_traj:  list = []
-        self._reinf_traj:  list = []
-        self._comet_ids:   set  = set()
-        self._comet_paths: dict = {}
-        self._traj_cache:  dict = {}
+        super().__init__()
+        self.cfg = config or StatefulAgentConfig()
 
-    def __call__(self, obs, config=None) -> list:
-        return self._run(obs)
-
-    # ── Pure helpers ──────────────────────────────────────────────────────────
-
-    def _hits_sun(self, src_x: float, src_y: float, angle: float, spd: float) -> bool:
-        end_x = src_x + math.cos(angle) * spd * 60
-        end_y = src_y + math.sin(angle) * spd * 60
-        return point_to_segment_distance((CENTER, CENTER), (src_x, src_y), (end_x, end_y)) <= SUN_RADIUS
-
-    def _static_angle(self, src, tgt, ships: int) -> tuple:
-        """Straight shot to tgt's current position. Returns (None, None) if path clips the sun."""
-        dx, dy = tgt.x - src.x, tgt.y - src.y
-        angle  = math.atan2(dy, dx)
-        spd    = fleet_speed(ships)
-        if self._hits_sun(src.x, src.y, angle, spd):
-            return None, None
-        return angle, math.floor(math.sqrt(dx * dx + dy * dy) / spd)
-
-    def _avail(self, planet, under_attack: dict) -> int:
-        """Ships available after subtracting confirmed incoming enemy fleets."""
-        avail = planet.ships
-        if planet.id in under_attack:
-            avail -= sum(a["fleet"].ships for a in under_attack[planet.id]["fleets"])
-        return max(0, avail)
-
-    def _track_fleet(self, src, tgt, angle: float, ships: int, arrive_tick: int) -> None:
-        self._fleet_traj.append({
-            "mine": src, "target": tgt,
-            "angle": angle, "total_ships": ships, "arrive_tick": arrive_tick,
-        })
-
-    def _track_reinf(self, src, tgt, angle: float, ships: int, arrive_tick: int) -> None:
-        self._reinf_traj.append({
-            "mine": src, "target": tgt,
-            "angle": angle, "total_ships": ships, "arrive_tick": arrive_tick,
-        })
-
-    def _find_angle(self, src, ships: int, traj: list):
-        spd = fleet_speed(ships)
-        for tick, (tx, ty) in enumerate(traj, start=1):
-            dist = math.sqrt((src.x - tx) ** 2 + (src.y - ty) ** 2)
-            if abs(math.ceil(dist / spd) - tick) < 1:
-                angle = math.atan2(ty - src.y, tx - src.x)
-                if self._hits_sun(src.x, src.y, angle, spd):
-                    return None, None
-                return angle, tick
-        return None, None
-
-    def _refine_ships_static_target(self, src, tgt, base: int) -> int:
-        dist  = math.sqrt((tgt.x - src.x) ** 2 + (tgt.y - src.y) ** 2)
-        total = base
-        for _ in range(3):
-            tick = math.floor(dist / fleet_speed(total))
-            new  = base + (tick * tgt.production if tgt.owner != -1 else 0)
-            if new == total:
-                break
-            total = new
-        return total
-
-    def _refine_ships_moving_target(self, src, tgt, needed: int, src_avail: int):
-        if tgt.id in self._comet_ids:
-            traj = self._comet_paths.get(tgt.id) or []
-            if not traj:
-                return None, needed, None  # comet already expiring
-        else:
-            traj = self._traj_cache[tgt.id]
-        total_ships = needed
-        arrive_tick = None
-        for _ in range(5):
-            angle, arrive_tick = self._find_angle(src, total_ships, traj)
-            if angle is None:
-                return None, needed, None
-            new_total = needed + (arrive_tick * tgt.production if tgt.owner != -1 else 0)
-            if new_total > src_avail:
-                return None, needed, None
-            if new_total == total_ships:
-                break
-            total_ships = new_total
-        return angle, total_ships, arrive_tick
-
-    def _score(self, src, tgt) -> float:
-        dist = math.sqrt((src.x - tgt.x) ** 2 + (src.y - tgt.y) ** 2)
-        if dist == 0:
-            return -1e9
+    def target_score(self, src, tgt) -> float:
+        dist = distance(src, tgt)
         cfg   = self.cfg
         base  = tgt.ships + 1
         time  = dist / fleet_speed(base)
@@ -143,192 +38,10 @@ class StatefulAgent:
             + (cfg.score_enemy_bonus * prod if enemy else 0)
             - cfg.score_ships_penalty * (base + (time * prod if enemy else 0))
             - cfg.score_time_penalty * time
-            - cfg.comet_penalty * (tgt.id in self._comet_ids)
         )
 
-    # ── State-mutating helpers ────────────────────────────────────────────────
-
-    def _detect_moving_planets(self, obs) -> None:
-        planets  = [Planet(*p) for p in obs.get("planets", [])]
-        init_map = {i[0]: Planet(*i) for i in obs.get("initial_planets", [])}
-        for p in planets:
-            i = init_map.get(p.id)
-            if i and (round(p.x, 3), round(p.y, 3)) != (round(i.x, 3), round(i.y, 3)):
-                self._moving_ids.add(p.id)
-
-    def _age_fleet_traj(self, live_fleets) -> None:
-        for ft in self._fleet_traj[:]:
-            alive = any(
-                f.from_planet_id == ft["mine"].id and abs(f.angle - ft["angle"]) < 1e-3
-                for f in live_fleets
-            )
-            if alive:
-                ft["arrive_tick"] = max(0, ft["arrive_tick"] - 1)
-            else:
-                self._fleet_traj.remove(ft)
-
-    def _age_reinf_traj(self) -> None:
-        for rt in self._reinf_traj[:]:
-            rt["arrive_tick"] -= 1
-            if rt["arrive_tick"] <= 0:
-                self._reinf_traj.remove(rt)
-
-    def _planets_under_attack(self, mine, fleets, player: int) -> dict:
-        enemy   = [f for f in fleets if f.owner != player and f.ships > 0]
-        result: dict = {}
-        seen:   set  = set()
-        static  = [m for m in mine if m.id not in self._traj_cache]
-        moving  = [m for m in mine if m.id in self._traj_cache]
-
-        for f in enemy:
-            spd   = fleet_speed(f.ships)
-            vx    = math.cos(f.angle) * spd
-            vy    = math.sin(f.angle) * spd
-
-            # Static planets: analytic ray-circle intersection — O(1) per planet
-            for m in static:
-                dx0  = f.x - m.x
-                dy0  = f.y - m.y
-                b    = 2 * (dx0 * vx + dy0 * vy)
-                c    = dx0 * dx0 + dy0 * dy0 - m.radius * m.radius
-                disc = b * b - 4 * spd * spd * c
-                if disc < 0:
-                    continue
-                t_enter = (-b - math.sqrt(disc)) / (2 * spd * spd)
-                t_exit  = (-b + math.sqrt(disc)) / (2 * spd * spd)
-                if t_exit < 0 or t_enter > 60:
-                    continue
-                arrive_tick = max(1, math.ceil(t_enter))
-                result.setdefault(m.id, {"planet": m, "fleets": []})
-                result[m.id]["fleets"].append({"fleet": f, "arrive_tick": arrive_tick})
-
-            # Moving planets: tick-by-tick (unchanged)
-            if moving:
-                px, py = f.x, f.y
-                for tick in range(1, self.cfg.max_tick + 1):
-                    nx = f.x + vx * tick
-                    ny = f.y + vy * tick
-                    for m in moving:
-                        mx, my = self._traj_cache[m.id][tick - 1]
-                        if point_to_segment_distance((mx, my), (px, py), (nx, ny)) <= m.radius:
-                            key = (m.id, f.id)
-                            if key not in seen:
-                                seen.add(key)
-                                result.setdefault(m.id, {"planet": m, "fleets": []})
-                                result[m.id]["fleets"].append({"fleet": f, "arrive_tick": tick})
-                    px, py = nx, ny
-        return result
-
-    def _sum_enemy_en_route(self, tgt, fleets, player: int) -> int:
-        tgt_traj = self._traj_cache.get(tgt.id)
-        total = 0
-        for f in fleets:
-            if f.owner == player or f.ships <= 0:
-                continue
-            spd   = fleet_speed(f.ships)
-            cos_a = math.cos(f.angle) * spd
-            sin_a = math.sin(f.angle) * spd
-            px, py = f.x, f.y
-            for tick in range(1, self.cfg.max_tick + 1):
-                nx = f.x + cos_a * tick
-                ny = f.y + sin_a * tick
-                tx, ty = tgt_traj[tick - 1] if tgt_traj else (tgt.x, tgt.y)
-                if point_to_segment_distance((tx, ty), (px, py), (nx, ny)) <= tgt.radius:
-                    total += f.ships
-                    break
-                px, py = nx, ny
-        return total
-
-    def _refine_coalition(
-        self, coalition: list, needed: int, tgt, angular_velocity: float | None = None
-    ) -> tuple[int, list | None]:
-        moving    = angular_velocity is not None and tgt.id in self._moving_ids
-        refined   = needed
-        plans     = None
-        min_ships = self.cfg.min_ships_attack
-
-        tgt_traj: list | None = None
-        if moving:
-            tgt_traj = self._comet_paths.get(tgt.id) if tgt.id in self._comet_ids else self._traj_cache[tgt.id]
-
-        for _ in range(5):
-            max_arr   = 0
-            rem       = refined
-            cur_plans = []
-            ok        = True
-            for a in coalition:
-                if rem <= 0:
-                    break
-                p_s = max(min(a["ships"], rem), min_ships)
-                if moving:
-                    ang, arr = self._find_angle(a["planet"], p_s, tgt_traj)
-                    if arr is None:
-                        return refined, None
-                else:
-                    ang, arr = self._static_angle(a["planet"], tgt, p_s)
-                    if ang is None:
-                        ok = False
-                        break
-                cur_plans.append([a["planet"], ang, p_s, arr])
-                max_arr = max(max_arr, arr)
-                rem     = max(0, rem - p_s)
-            if not ok:
-                return refined, None
-            new_needed = needed + (max_arr * tgt.production if tgt.owner != -1 else 0)
-            plans = cur_plans
-            if new_needed == refined:
-                break
-            refined = new_needed
-        return refined, plans
-
-    def _reinforcement_plans(self, mine, under_attack: dict) -> dict:
-        plans:    dict = {}
-        min_ships       = self.cfg.min_ships_attack
-        for m in mine:
-            if m.id not in under_attack:
-                continue
-            atk_sorted = sorted(under_attack[m.id]["fleets"], key=lambda a: a["arrive_tick"])
-            incoming   = sorted(
-                [r for r in self._reinf_traj if r["target"].id == m.id],
-                key=lambda r: r["arrive_tick"],
-            )
-            avail     = float(m.ships)
-            prev_tick = 0
-            r_idx     = 0
-            for att in atk_sorted:
-                t = att["arrive_tick"]
-                avail += (t - prev_tick) * m.production
-                while r_idx < len(incoming) and incoming[r_idx]["arrive_tick"] <= t:
-                    avail += incoming[r_idx]["total_ships"]
-                    r_idx += 1
-                avail    -= att["fleet"].ships
-                prev_tick = t
-                if avail < 0:
-                    plans[m] = {
-                        "ships_needed":   max(min_ships, int(abs(avail))),
-                        "needed_by_tick": t,
-                    }
-                    break
-        return plans
-
     # ── Main agent logic ──────────────────────────────────────────────────────
-
     def _run(self, obs) -> list:
-        if int(obs.get("step", -1)) == 0 and self._steps > 0:
-            self._steps = 0
-            self._moving_ids.clear()
-            self._fleet_traj.clear()
-            self._reinf_traj.clear()
-            self._comet_ids.clear()
-            self._comet_paths.clear()
-
-        if self._steps < 2:
-            self._steps += 1
-            return []
-        if self._steps == 2:
-            self._detect_moving_planets(obs)
-            self._steps = 3
-
         ctx              = GameContext.from_obs(obs)
         player           = ctx.player
         fleets           = ctx.fleets
@@ -340,132 +53,93 @@ class StatefulAgent:
         self._comet_ids   = comet_ids
         self._comet_paths = ctx.comet_paths
         self._traj_cache  = {
-            p.id: [predict_planet_position(p, t, angular_velocity) for t in range(1, self.cfg.max_tick + 1)]
+            p.id: planet_trajectory(p, self.cfg.max_tick, angular_velocity)
             for p in ctx.planets if p.id in self._moving_ids and p.id not in comet_ids
         }
 
         if not my_planets or not targets:
             return []
 
-        self._age_fleet_traj(fleets)
-        self._age_reinf_traj()
+        self._age_my_fleets()
 
         min_ships     = self.cfg.min_ships_attack
-        under_attack  = self._planets_under_attack(my_planets, fleets, player)
-        exhausted_ids: set  = set()
+        under_attack  = my_planets_under_attack(my_planets, fleets, player, self._traj_cache, self.cfg.max_tick)
+        used_ids: set  = set()
         moves: list         = []
 
         # ── Phase 0: Comet evacuation ─────────────────────────────────────────
-        # Trigger when the comet has <= _COMET_LEAVE_THRESHOLD waypoints left so
-        # we act before it actually leaves the domain (len==0/1 is already too late).
         _COMET_LEAVE_THRESHOLD = 1
         for comet_src in [p for p in my_planets if p.id in comet_ids]:
             if len(ctx.comet_paths.get(comet_src.id, [])) > _COMET_LEAVE_THRESHOLD:
                 continue
 
-            best_tgt = max(targets, key=lambda t: self._score(comet_src, t))
-
-            # sending to best target — use needed=1 so evacuation fires even when
-            # the comet has fewer ships than the normal min_ships_attack threshold
-            if best_tgt.id in self._moving_ids or best_tgt.id in comet_ids:
-                angle, _, arrive_tick = self._refine_ships_moving_target(
-                    comet_src, best_tgt, 1, comet_src.ships
-                )
-            else:
-                angle, arrive_tick = self._static_angle(comet_src, best_tgt, comet_src.ships)
+            best_tgt = max(targets, key=lambda t: self.target_score(comet_src, t))
+            angle, arrive_tick = self.aim(comet_src, best_tgt, comet_src.ships)
 
             if angle is not None:
                 moves.append([comet_src.id, angle, comet_src.ships])
-                exhausted_ids.add(comet_src.id)
-                self._track_fleet(comet_src, best_tgt, angle, comet_src.ships, arrive_tick)
+                used_ids.add(comet_src.id)
+                self._add_my_fleet(comet_src, best_tgt, angle, comet_src.ships, arrive_tick)
                 break
 
             # fallback: send to closest own planet
             cloest_my_planet = min(my_planets, key=lambda p: (p.x - comet_src.x) ** 2 + (p.y - comet_src.y) ** 2)
-            angle, _, arrive_tick = self._refine_ships_moving_target(
-                comet_src, cloest_my_planet, 1, comet_src.ships
-            )
+            angle, arrive_tick = self.aim(comet_src, cloest_my_planet, comet_src.ships)
 
             if angle is not None:
                 moves.append([comet_src.id, angle, comet_src.ships])
-                exhausted_ids.add(comet_src.id)
-                self._track_reinf(comet_src, cloest_my_planet, angle, comet_src.ships, arrive_tick)
+                used_ids.add(comet_src.id)
+                self._add_my_fleet(comet_src, cloest_my_planet, angle, comet_src.ships, arrive_tick)
                 break
          
-
         # ── Phase 1: Defence ─────────────────────────────────────────────────
-        reinf_target_ids: set[int] = {r["target"].id for r in self._reinf_traj}
-        reinf_promised_by_src: dict[int, int] = {}
-        for r in self._reinf_traj:
-            sid = r["mine"].id
-            reinf_promised_by_src[sid] = reinf_promised_by_src.get(sid, 0) + r["total_ships"]
-
-        for p, plan in self._reinforcement_plans(my_planets, under_attack).items():
-            if p.id in reinf_target_ids:
-                continue
+        for p, plan in reinforcement_plans(my_planets, under_attack, self._my_fleets, min_ships).items():
 
             ships_needed   = plan["ships_needed"]
             needed_by_tick = plan["needed_by_tick"]
 
             helpers = sorted(
-                [m for m in my_planets if m.id != p.id and m.id not in exhausted_ids],
+                [m for m in my_planets if m.id != p.id and m.id not in used_ids],
                 key=lambda m: (m.x - p.x) ** 2 + (m.y - p.y) ** 2,
             )
 
             for helper in helpers:
-                promised = reinf_promised_by_src.get(helper.id, 0)
-                if helper.id in under_attack:
-                    promised += sum(a["fleet"].ships for a in under_attack[helper.id]["fleets"])
-                avail = max(0, helper.ships - promised)
+                avail = self._avail(helper, under_attack)
 
                 to_send = max(min_ships, ships_needed)
                 if avail < to_send:
                     continue
 
-                if p.id in self._moving_ids:
-                    _traj = ctx.comet_paths.get(p.id) if p.id in comet_ids else self._traj_cache[p.id]
-                    angle, arrive_tick = self._find_angle(helper, to_send, _traj)
-                else:
-                    dx, dy      = p.x - helper.x, p.y - helper.y
-                    angle       = math.atan2(dy, dx)
-                    spd         = fleet_speed(to_send)
-                    if self._hits_sun(helper.x, helper.y, angle, spd):
-                        angle = None
-                    else:
-                        arrive_tick = math.floor(math.sqrt(dx * dx + dy * dy) / spd)
+                angle, arrive_tick = self.aim(helper, p, to_send)
 
-                if angle is None or arrive_tick is None or arrive_tick > needed_by_tick:
+                if angle is None or arrive_tick > needed_by_tick:
                     continue
 
                 moves.append([helper.id, angle, to_send])
-                exhausted_ids.add(helper.id)
-                self._track_reinf(helper, p, angle, to_send, arrive_tick)
+                used_ids.add(helper.id)
+                self._add_my_fleet(helper, p, angle, to_send, arrive_tick)
                 break
 
+
         # ── Phase 2: Offence ─────────────────────────────────────────────────
-        # Comets included; _score applies comet_penalty as a flat subtraction.
-        en_route_by_tgt: dict[int, int] = {}
-        for ft in self._fleet_traj:
-            tid = ft["target"].id
-            en_route_by_tgt[tid] = en_route_by_tgt.get(tid, 0) + ft["total_ships"]
-
-        enemy_en_route_by_tgt: dict[int, int] = {
-            tgt.id: self._sum_enemy_en_route(tgt, fleets, player)
-            for tgt in targets
-        }
-
         owned_frac    = len(my_planets) / max(1, len(ctx.planets))
+        attacked_ids = set()
+        # Find source sorted by ships
         for src in sorted(my_planets, key=lambda p: p.ships, reverse=True):
-            if src.id in exhausted_ids or src.ships < min_ships:
+            if src.id in used_ids or src.ships < min_ships:
                 continue
 
             src_avail = self._avail(src, under_attack)
-            ranked    = sorted(targets, key=lambda t: self._score(src, t), reverse=True)
+            ranked    = sorted(targets, key=lambda t: self.target_score(src, t), reverse=True)
 
             for tgt in ranked[:self.cfg.top_k_targets]:
-                en_route = en_route_by_tgt.get(tgt.id, 0)
+                if tgt.id in attacked_ids:
+                    continue
 
-                enemy_racing = enemy_en_route_by_tgt[tgt.id]
+                enemy_racing = sum_enemy_en_route(tgt, fleets, player, self._traj_cache.get(tgt.id), self.cfg.max_tick)
+
+                en_route = sum(f.ships for f in self._my_fleets if f.tgt_id == tgt.id)
+
                 base = enemy_racing + tgt.ships + 1
                 if tgt.owner != -1:
                     base += self.cfg.attack_buffer * tgt.production
@@ -475,59 +149,61 @@ class StatefulAgent:
 
                 needed = max(min_ships, base - en_route)
 
-                angle, arrive_tick, total_ships = None, None, 0
+                # 2.1 Single source attack
+                angle, needed, arrive_tick = self._refine_offense_ships_needed(src, tgt, needed)
+
+                if angle is None:
+                    continue
 
                 if src_avail >= needed:
-                    if tgt.id in comet_ids or tgt.id in self._moving_ids:
-                        angle, total_ships, arrive_tick = self._refine_ships_moving_target(
-                            src, tgt, needed, src_avail
-                        )
-                    else:
-                        total_ships = self._refine_ships_static_target(src, tgt, needed) if tgt.owner != -1 else needed
-                        if total_ships <= src_avail:
-                            angle, arrive_tick = self._static_angle(src, tgt, total_ships)
+                    moves.append([src.id, angle, needed])
+                    used_ids.add(src.id)
+                    self._add_my_fleet(src, tgt, angle, needed, arrive_tick)
+                    attacked_ids.add(tgt.id)
+                    break
 
-                    if angle is not None:
-                        moves.append([src.id, angle, total_ships])
-                        exhausted_ids.add(src.id)
-                        self._track_fleet(src, tgt, angle, total_ships, arrive_tick)
-                        break
-
+                # 2.2 Coalition attack
                 elif len(my_planets) > 1 and tgt.ships >= self.cfg.min_ships_coop_target and tgt.id not in comet_ids:
-                    helpers = []
+                    
+                    coalition = [{"planet": src, "angle": angle, "ships": src_avail, "arrive_tick": arrive_tick}]
+                    max_tick = arrive_tick
+                    tot_ships = src_avail
                     for h in sorted(my_planets, key=lambda p: (p.x - tgt.x) ** 2 + (p.y - tgt.y) ** 2):
-                        if h.id == src.id or h.id in exhausted_ids:
+                        if h.id == src.id or h.id in used_ids:
                             continue
-                        h_avail = self._avail(h, under_attack)
-                        if h_avail < min_ships:
-                            continue
-                        helpers.append((h, h_avail))
 
-                    coalition       = [{"planet": src, "ships": src_avail}]
-                    coalition_ships = src_avail
-                    for h, h_avail in helpers:
-                        coalition.append({"planet": h, "ships": h_avail})
-                        coalition_ships += h_avail
-                        if coalition_ships >= needed:
-                            break
+                        h_avail = self._avail(h, under_attack)
+                        if h_avail < min_ships: 
+                            continue
+
+                        angle, arrive_tick = self.aim(h, tgt, h_avail)
+                        if angle is None: 
+                            continue
+
+                        max_tick = max(max_tick, arrive_tick)
+                        tot_ships += h_avail
+
+                        coalition.append({"planet": h, "angle": angle, "ships": h_avail, "arrive_tick": arrive_tick})
+
                         if len(coalition) >= _COOP_PLANET_CAP:
                             break
 
-                    if coalition_ships < needed:
+                        if tot_ships >= needed + max_tick * tgt.production:
+                            break
+                    
+                    if tot_ships < needed + max_tick * tgt.production:
                         continue
 
-                    needed, planned = self._refine_coalition(coalition, needed, tgt, angular_velocity)
-                    if planned is None or coalition_ships < needed:
-                        continue
 
-                    for planet, ang, ships, arr in planned:
-                        self._track_fleet(planet, tgt, ang, ships, arr)
-                        exhausted_ids.add(planet.id)
-                        moves.append([planet.id, ang, ships])
+                    for entry in coalition:
+                        self._add_my_fleet(entry["planet"], tgt, entry["angle"], entry["ships"], entry["arrive_tick"])
+                        used_ids.add(entry["planet"].id)
+                        moves.append([entry["planet"].id, entry["angle"], entry["ships"]])
+
+                    attacked_ids.add(tgt.id)
                     break
 
         return moves
-
 
 def make_stateful_agent(config: StatefulAgentConfig) -> StatefulAgent:
     """Factory for tuning: returns a fresh StatefulAgent with isolated state."""

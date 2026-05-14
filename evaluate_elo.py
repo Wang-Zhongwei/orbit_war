@@ -261,6 +261,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="Save Elo-over-time PNG to this path.")
     p.add_argument("--filter-format", default=None,
                    help="Only score matches whose format matches this string (e.g. '1v1').")
+    p.add_argument("--save-ratings", action="store_true",
+                   help="Write final Elo ratings to results/opponent_ratings.json for use by tune.py.")
     args = p.parse_args(argv)
 
     try:
@@ -297,6 +299,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.plot:
         _plot_history(history, args.init, args.plot)
+
+    if args.save_ratings:
+        import json
+        ratings_file = args.csv.parent / "opponent_ratings.json"
+        ratings_file.write_text(json.dumps(ratings, indent=2))
+        print(f"Saved ratings -> {ratings_file}")
 
     return 0
 
