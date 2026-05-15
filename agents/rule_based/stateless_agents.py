@@ -105,7 +105,7 @@ def _select_target(
 
     # Explicit pool: enemies not yet assigned, comets excluded up front.
     pool = [
-        p for p in ctx.enemies
+        p for p in ctx.targets
         if p.id not in assigned and p.id not in ctx.comet_ids
     ]
     if not pool:
@@ -225,7 +225,7 @@ def run_agent(obs, config: AgentConfig) -> list[list]:
         List of ``[from_planet_id, angle_rad, num_ships]`` triples.
     """
     ctx = GameContext.from_obs(obs)
-    if not ctx.my_planets or not ctx.enemies:
+    if not ctx.my_planets or not ctx.targets:
         return []
 
     sources   = _sort_sources(ctx.my_planets, config.source_sort)

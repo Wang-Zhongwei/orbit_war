@@ -38,6 +38,31 @@ def sub_1000_score(obs) -> list:
     return _sub_mod.agent(obs)
 
 
+def _load_submission(name: str):
+    import sys
+    mod_name = f"submission_{name}"
+    spec = importlib.util.spec_from_file_location(
+        mod_name,
+        os.path.join(os.path.dirname(__file__), "submission", f"{name}.py"),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_v2_mod = _load_submission("stateful_v2")
+_v3_mod = _load_submission("stateful_v3")
+
+
+def sub_stateful_v2(obs) -> list:
+    return _v2_mod.agent(obs)
+
+
+def sub_stateful_v3(obs) -> list:
+    return _v3_mod.agent(obs)
+
+
 # ---------------------------------------------------------------------------
 # Agent registry
 # ---------------------------------------------------------------------------
@@ -48,6 +73,8 @@ AGENTS: dict[str, object] = {
     "stateful":     stateful_agent,
     "1000_score":   agent_1000_score,
     "sub_1000":     sub_1000_score,
+    "sub_v2":       sub_stateful_v2,
+    "sub_v3":       sub_stateful_v3,
     "random":       "random",
 }
 
@@ -80,7 +107,7 @@ def _outcomes_from_ranks(ranks: Sequence[int]) -> list[float]:
     for r in ranks:
         ties = ranks.count(r)
         if ties > 1:
-            shares = [1.0 - (rr - 1) / (n - 1) for rr in range(r, r + ties)]
+            shares = [max(0.0, 1.0 - (rr - 1) / (n - 1)) for rr in range(r, r + ties)]
             out.append(sum(shares) / ties)
         else:
             out.append(1.0 - (r - 1) / (n - 1))
@@ -124,10 +151,12 @@ def run_match_raw(
     statuses: list[str] = []
     for s in final:
         if isinstance(s, dict):
-            rewards.append(s.get("reward", -1))
+            r = s.get("reward")
+            rewards.append(-1 if r is None else r)
             statuses.append(s.get("status", "UNKNOWN"))
         else:
-            rewards.append(getattr(s, "reward", -1))
+            r = getattr(s, "reward", None)
+            rewards.append(-1 if r is None else r)
             statuses.append(getattr(s, "status", "UNKNOWN"))
 
     # The env hands out reward=-1 to *all* players when max_score == 0. Treat
@@ -143,11 +172,15 @@ def run_match_raw(
     bad_slots = [i for i, st in enumerate(statuses) if st != "DONE"]
     if bad_slots:
         good_slots = [i for i in range(n) if i not in bad_slots]
-        good_rewards = [adjusted[i] for i in good_slots]
-        good_ranks = _ranks_from_rewards(good_rewards) if good_rewards else []
-        ranks = [n] * n
-        for j, i in enumerate(good_slots):
-            ranks[i] = good_ranks[j]
+        if not good_slots:
+            # All agents crashed — treat as a draw; keep ranks from adjusted.
+            pass
+        else:
+            good_rewards = [adjusted[i] for i in good_slots]
+            good_ranks = _ranks_from_rewards(good_rewards)
+            ranks = [n] * n
+            for j, i in enumerate(good_slots):
+                ranks[i] = good_ranks[j]
 
     return {
         "rewards":     rewards,

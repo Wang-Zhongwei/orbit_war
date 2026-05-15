@@ -1,8 +1,9 @@
 """stateful_agent.py — cross-turn memory, active defence, cooperative attacks, and comet logic."""
 from __future__ import annotations
+import math
 
 from ..configs import StatefulAgentConfig
-from helper import distance, fleet_speed, sum_enemy_en_route
+from helper import distance, fleet_speed
 from game_context import GameContext
 from .base import BaseStatefulAgent
 
@@ -34,7 +35,7 @@ class StatefulAgent(BaseStatefulAgent):
 
     def _run(self, ctx: GameContext) -> list:
         my_planets = ctx.my_planets
-        targets    = ctx.enemies
+        targets    = ctx.targets
         comet_ids  = ctx.comet_ids
 
         if not my_planets or not targets:
@@ -45,6 +46,7 @@ class StatefulAgent(BaseStatefulAgent):
         moves: list   = []
 
         # ── Phase 0: Comet evacuation ─────────────────────────────────────────
+        # TODO: 
         _COMET_LEAVE_THRESHOLD = 1
         for comet_src in [p for p in my_planets if p.id in comet_ids]:
             if len(ctx.comet_paths.get(comet_src.id, [])) > _COMET_LEAVE_THRESHOLD:
@@ -107,10 +109,9 @@ class StatefulAgent(BaseStatefulAgent):
             for tgt in ranked[:self.cfg.top_k_targets]:
                 if tgt.id in attacked_ids:
                     continue
-
-                enemy_racing = sum_enemy_en_route(
-                    tgt, ctx.fleets, ctx.player, ctx.trajectory(tgt.id), self.cfg.max_tick
-                )
+                
+                enemy_fleets_en_route = ctx.get_enemy_en_route(tgt)
+                enemy_racing = sum(f.ships for f in enemy_fleets_en_route)
                 en_route = sum(f.ships for f in ctx.my_fleets if f.tgt_id == tgt.id)
 
                 base = enemy_racing + tgt.ships + 1
@@ -120,8 +121,8 @@ class StatefulAgent(BaseStatefulAgent):
                 if owned_frac < 0.75 and en_route >= base:
                     continue
 
-                needed = max(min_ships, base - en_route)
-                src_angle, needed, src_arrive = ctx.ships_to_capture(src, tgt, needed)
+                instant_needed = max(min_ships, base - en_route)
+                src_angle, needed, src_arrive = ctx.ships_to_capture(src, tgt, instant_needed)
 
                 if src_angle is None:
                     continue
@@ -140,6 +141,8 @@ class StatefulAgent(BaseStatefulAgent):
                     and tgt.ships >= self.cfg.min_ships_coop_target
                     and tgt.id not in comet_ids
                 ):
+                    # src_avail < needed, src_arrive is longer than computed before
+                    src_arrive = math.ceil(distance(src, tgt) / fleet_speed(src_avail))
                     coalition  = [{"planet": src, "angle": src_angle, "ships": src_avail, "arrive_tick": src_arrive}]
                     max_tick_v = src_arrive
                     tot_ships  = src_avail
@@ -162,10 +165,10 @@ class StatefulAgent(BaseStatefulAgent):
 
                         if len(coalition) >= _COOP_PLANET_CAP:
                             break
-                        if tot_ships >= needed + max_tick_v * tgt.production:
+                        if tot_ships >= instant_needed + max_tick_v * tgt.production * (tgt.owner != -1):
                             break
 
-                    if tot_ships < needed + max_tick_v * tgt.production:
+                    if tot_ships < instant_needed + max_tick_v * tgt.production * (tgt.owner != -1):
                         continue
 
                     for entry in coalition:

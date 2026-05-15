@@ -145,8 +145,8 @@ def find_angle(src, traj: list, ships: int,
     cache = traj_cache or {}
 
     for tick, (tx, ty) in enumerate(traj, start=1):
-        dist = math.sqrt((src.x - tx) ** 2 + (src.y - ty) ** 2) - src.radius - tgt_radius
-        if abs(dist / spd - tick) < 0.5:
+        dist = math.sqrt((src.x - tx) ** 2 + (src.y - ty) ** 2) - src.radius
+        if abs(dist - spd * tick) < tgt_radius:
             angle = math.atan2(ty - src.y, tx - src.x)
             lx = src.x + math.cos(angle) * src.radius
             ly = src.y + math.sin(angle) * src.radius
@@ -234,29 +234,6 @@ def my_planets_under_attack(
                 px, py = nx, ny
     return result
 
-
-def sum_enemy_en_route(tgt, fleets, player: int, tgt_traj, max_ticks: int = MAX_TICKS) -> int:
-    """Count enemy ships headed toward `tgt` within `max_ticks` turns.
-
-    tgt_traj: precomputed trajectory for a moving target, or None for static.
-    """
-    total = 0
-    for f in fleets:
-        if f.owner == player or f.ships <= 0:
-            continue
-        spd   = fleet_speed(f.ships)
-        cos_a = math.cos(f.angle) * spd
-        sin_a = math.sin(f.angle) * spd
-        px, py = f.x, f.y
-        for tick in range(1, max_ticks + 1):
-            nx = f.x + cos_a * tick
-            ny = f.y + sin_a * tick
-            tx, ty = (tgt_traj[tick - 1] if tick <= len(tgt_traj) else (tgt.x, tgt.y)) if tgt_traj else (tgt.x, tgt.y)
-            if point_to_segment_distance((tx, ty), (px, py), (nx, ny)) <= tgt.radius:
-                total += f.ships
-                break
-            px, py = nx, ny
-    return total
 
 
 def reinforcement_plans(

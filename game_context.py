@@ -1,14 +1,15 @@
 """game_context.py — GameContext: per-turn game state + cross-turn memory + physics queries."""
 from __future__ import annotations
 
-from math import sqrt
+import math
 
-from kaggle_environments.envs.orbit_wars.orbit_wars import CENTER, ROTATION_RADIUS_LIMIT
+from kaggle_environments.envs.orbit_wars.orbit_wars import CENTER, ROTATION_RADIUS_LIMIT, point_to_segment_distance
 
 from helper import (
     DirectedFleet,
     MAX_TICKS,
     find_angle,
+    fleet_speed,
     my_planets_under_attack,
     planet_trajectory,
     reinforcement_plans,
@@ -52,7 +53,7 @@ class GameContext:
         self.player:           int   = 0
         self.planets:          list  = []
         self.my_planets:       list  = []
-        self.enemies:          list  = []
+        self.targets:          list  = []
         self.fleets:           list  = []
         self.comet_ids:        set   = set()
         self.comet_paths:      dict  = {}
@@ -74,7 +75,7 @@ class GameContext:
         self.player           = player
         self.planets          = planets
         self.my_planets       = [p for p in planets if p.owner == player]
-        self.enemies          = [p for p in planets if p.owner != player]
+        self.targets          = [p for p in planets if p.owner != player]
         self.fleets           = fleets
         self.comet_ids        = comet_ids
         self.comet_paths      = comet_paths
@@ -84,7 +85,7 @@ class GameContext:
         # Detect moving planets once; _moving_ids is empty only after reset().
         if not self._moving_ids:
             for p in planets:
-                if sqrt((p.x - CENTER) ** 2 + (p.y - CENTER) ** 2) + p.radius < ROTATION_RADIUS_LIMIT:
+                if math.sqrt((p.x - CENTER) ** 2 + (p.y - CENTER) ** 2) + p.radius < ROTATION_RADIUS_LIMIT:
                     self._moving_ids.add(p.id)
 
         # Rebuild trajectory cache for non-comet moving planets.
@@ -93,15 +94,51 @@ class GameContext:
             for p in planets
             if p.id in self._moving_ids and p.id not in comet_ids
         }
+        # Add comets as moving blockers using their precomputed future paths.
+        for pid, path in comet_paths.items():
+            if path:
+                self._traj_cache[pid] = path
 
-        # Age tracked fleets; evict those that have arrived.
-        self._my_fleets = [
-            DirectedFleet(f.src_id, f.tgt_id, f.angle, f.ships, f.arrive_tick - 1)
-            for f in self._my_fleets
-            if f.arrive_tick > 1
-        ]
+        # Sync tracked fleets against the observation; evict those that have arrived.
+        self._refresh_my_fleets()
 
         self._under_attack_cache = None
+
+    # todo: what if miss the target? 
+    def _refresh_my_fleets(self) -> None:
+        """Sync _my_fleets against the current observation.
+
+        Matches each tracked fleet to an actual obs fleet by source planet, angle,
+        and ship count, then recomputes arrive_tick from the fleet's real position.
+        Fleets absent from the observation have arrived (or were destroyed) and are
+        evicted. This avoids the off-by-one of blind tick decrement and correctly
+        handles mid-flight attrition.
+        """
+        my_obs_fleets = [f for f in self.fleets if f.owner == self.player]
+        planet_by_id  = {p.id: p for p in self.planets}
+
+        updated = []
+        for df in self._my_fleets:
+            match = next(
+                (f for f in my_obs_fleets
+                 if f.from_planet_id == df.src_id
+                 and abs(f.angle - df.angle) < 1e-4
+                 and f.ships == df.ships),
+                None,
+            )
+            if match is None:
+                continue  # arrived or destroyed
+
+            tgt = planet_by_id.get(df.tgt_id)
+            if tgt is None:
+                continue
+
+            spd  = fleet_speed(match.ships)
+            dist = math.sqrt((match.x - tgt.x) ** 2 + (match.y - tgt.y) ** 2) - tgt.radius
+            arrive_tick = max(1, math.ceil(max(0.0, dist) / spd))
+            updated.append(DirectedFleet(df.src_id, df.tgt_id, df.angle, df.ships, arrive_tick))
+
+        self._my_fleets = updated
 
     @classmethod
     def from_obs(cls, obs) -> GameContext:
@@ -184,3 +221,35 @@ class GameContext:
                 break
             last_needed = needed
         return angle, needed, arrive_tick
+    
+    def get_enemy_en_route(self, tgt) -> list[DirectedFleet]:
+        """Return enemy fleets whose paths intersect `tgt` within max_tick turns.
+
+        Each fleet is represented as a DirectedFleet with tgt_id set to tgt.id and
+        arrive_tick set to the first tick the fleet segment enters the target radius.
+        The list is sorted by arrive_tick (earliest threat first).
+        """
+        tgt_traj = self._traj_cache.get(tgt.id)
+        result: list[DirectedFleet] = []
+        for f in self.fleets:
+            if f.owner == self.player or f.ships <= 0:
+                continue
+            spd   = fleet_speed(f.ships)
+            cos_a = math.cos(f.angle) * spd
+            sin_a = math.sin(f.angle) * spd
+            px, py = f.x, f.y
+            for tick in range(1, self.max_tick + 1):
+                nx = f.x + cos_a * tick
+                ny = f.y + sin_a * tick
+                if tgt_traj:
+                    tx, ty = tgt_traj[tick - 1] if tick <= len(tgt_traj) else (tgt.x, tgt.y)
+                else:
+                    tx, ty = tgt.x, tgt.y
+                if point_to_segment_distance((tx, ty), (px, py), (nx, ny)) < tgt.radius:
+                    result.append(DirectedFleet(f.from_planet_id, tgt.id, f.angle, f.ships, tick))
+                    break
+                px, py = nx, ny
+        result.sort(key=lambda df: df.arrive_tick)
+        return result
+
+
