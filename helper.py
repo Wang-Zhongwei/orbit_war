@@ -119,10 +119,10 @@ def _path_blocked(sx: float, sy: float, ex: float, ey: float, ticks: int, spd: f
                 pfx = sx + ux * spd * (t - 1)
                 pfy = sy + uy * spd * (t - 1)
                 px, py = ptraj[t - 1]
-                if point_to_segment_distance((px, py), (pfx, pfy), (fx, fy)) < p.radius:
+                if point_to_segment_distance((px, py), (pfx, pfy), (fx, fy)) <= p.radius:
                     return True
         else:
-            if point_to_segment_distance((p.x, p.y), (sx, sy), (ex, ey)) < p.radius:
+            if point_to_segment_distance((p.x, p.y), (sx, sy), (ex, ey)) <= p.radius:
                 return True
     return False
 

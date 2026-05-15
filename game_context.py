@@ -203,7 +203,7 @@ class GameContext:
         """Precomputed trajectory for a moving planet, or None for static planets."""
         return self._traj_cache.get(planet_id)
 
-    def ships_to_capture(self, src, tgt, needed: int) -> tuple[float | None, int | None, int | None]:
+    def ships_to_capture(self, src, tgt, needed: int, enemy_en_route: list[DirectedFleet]) -> tuple[float | None, int | None, int | None]:
         """Refine ship count to account for enemy production during travel.
 
         Returns (angle, ships, arrive_tick), or (None, None, None) if unreachable.
@@ -216,7 +216,8 @@ class GameContext:
             angle, arrive_tick = self.aim(src, tgt, needed)
             if angle is None:
                 return None, None, None
-            needed = original_needed + (arrive_tick * tgt.production if tgt.owner != -1 else 0)
+            # note: this is gonna be an overestimate if tgt.owner == -1 but we better not drop the it because at some point it might be occupied by enemy
+            needed = original_needed + arrive_tick * tgt.production * (len(enemy_en_route) > 0 or tgt.owner != -1)
             if last_needed == needed:
                 break
             last_needed = needed
