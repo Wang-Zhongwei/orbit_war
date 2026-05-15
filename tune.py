@@ -615,14 +615,14 @@ def _never_miss_factory(config: dict) -> Callable:
         A 1-arg ``obs -> moves`` callable ready for the environment.
     """
     agent_config = AgentConfig(
-        source_sort          = config.get("source_sort",          "none"),
-        target_mode          = config.get("target_mode",          "random_biased"),
-        limit_top_k_fraction = config.get("limit_top_k_fraction", 0.5),
-        bias_draws           = config.get("bias_draws",           2),
-        accept_comet_src     = config.get("accept_comet_src",     True),
-        cost_mode            = config.get("cost_mode",            "turns_weighted"),
-        cost_weight          = config.get("cost_weight",          2.0),
-        max_moves            = config.get("max_moves",            6),
+        source_sort          = config["source_sort"],
+        target_mode          = config["target_mode"],
+        limit_top_k_fraction = config["limit_top_k_fraction"],
+        bias_draws           = config["bias_draws"],
+        accept_comet_src     = config["accept_comet_src"],
+        cost_mode            = config["cost_mode"],
+        cost_weight          = config["cost_weight"],
+        max_moves            = config["max_moves"],
     )
 
     def agent(obs):
@@ -655,17 +655,12 @@ REGISTRY.register(
 def _stateful_factory(config: dict) -> Callable:
     """Build a fresh StatefulAgent instance from a sampled hyperparameter dict."""
     agent_config = StatefulAgentConfig(
-        score_enemy_bonus     = config.get("score_enemy_bonus",     8.865),
-        score_ships_penalty   = config.get("score_ships_penalty",   0.622),
-        score_time_penalty    = config.get("score_time_penalty",    0.989),
-        min_ships_attack      = config.get("min_ships_attack",        11),
-        top_k_targets         = config.get("top_k_targets",           4),
-        # comet_penalty         = config.get("comet_penalty",          1.51),
-        max_tick              = config.get("max_tick",                25),
-        min_ships_coop_target = config.get("min_ships_coop_target",   36),
-        attack_buffer         = config.get("attack_buffer",            3.0),
+        enemy_bonus   = config["enemy_bonus"],
+        ships_penalty = config["ships_penalty"],
+        time_penalty  = config["time_penalty"],
     )
-    return make_stateful_agent(agent_config)
+    agent = make_stateful_agent(agent_config)
+    return lambda obs: agent(obs)
 
 
 REGISTRY.register(
@@ -673,17 +668,17 @@ REGISTRY.register(
     TunableStrategy(
         factory=_stateful_factory,
         params=[
-            FloatParam("score_enemy_bonus",        5.0,   20.0),
-            FloatParam("score_ships_penalty",      0.1,   1.0),
-            FloatParam("score_time_penalty",       1.0,   3.0),
-            IntParam(  "min_ships_attack",          10,    24),
-            # FloatParam("comet_penalty",             0.0,   5.0),
-            IntParam(  "min_ships_coop_target",     15,    40),
+            FloatParam("enemy_bonus",        5.0,   20.0),
+            FloatParam("ships_penalty",      0.1,   1.0),
+            FloatParam("time_penalty",       1.0,   3.0),
+            # FloatParam("comet_penalty",      0.0,   5.0),
+            # IntParam(  "min_ships_attack",          10,    24),
+            # IntParam(  "min_ships_coop_target",     15,    40),
             # IntParam(  "top_k_targets",             1,     6),
             # IntParam(  "attack_buffer",             1,     6),
         ],
         agent_fn_name="stateful_agent",
-        description="stateful: score weights, min_ships_attack, comet_penalty, min_ships_coop_target",
+        description="stateful: score weights, comet_penalty, min_ships_attack, min_ships_coop_target, top_k_targets, attack_buffer",
     ),
 )
 
@@ -691,9 +686,9 @@ REGISTRY.register(
 def _agent_1000_score_factory(config: dict) -> Callable:
     """Build a fresh Agent1000Score instance from a sampled hyperparameter dict."""
     agent_config = Agent1000ScoreConfig(
-        formula_prod_mult           = config.get("formula_prod_mult",           15.0),
-        formula_enemy_bonus_mult    = config.get("formula_enemy_bonus_mult",    10.0),
-        formula_total_ships_percent = config.get("formula_total_ships_percent",  0.7),
+        formula_prod_mult           = config["formula_prod_mult"],
+        formula_enemy_bonus_mult    = config["formula_enemy_bonus_mult"],
+        formula_total_ships_percent = config["formula_total_ships_percent"],
     )
     agent = make_agent_1000_score(agent_config)
     return lambda obs: agent(obs)

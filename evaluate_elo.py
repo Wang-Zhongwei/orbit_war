@@ -32,7 +32,7 @@ from typing import Iterable
 from evaluation import head_to_head, format_head_to_head_matrix
 
 DEFAULT_CSV = Path(__file__).parent / "results" / "matches.csv"
-DEFAULT_INIT = 1500.0
+DEFAULT_INIT = 600.0
 DEFAULT_K = 32.0
 
 

@@ -73,11 +73,12 @@ class AgentConfig:
 class StatefulAgentConfig:
     """Tunable hyperparameters for :class:`StatefulAgent`."""
 
-    score_enemy_bonus:     float = 14
-    score_ships_penalty:   float = 0.48
-    score_time_penalty:    float = 2
+    enemy_bonus:     float = 14
+    ships_penalty:   float = 0.48
+    time_penalty:    float = 2
+    comet_penalty:         float = 100
     min_ships_attack:      int   = 13
     top_k_targets:         int   = 3
     min_ships_coop_target: int   = 34
-    max_tick:              int   = 25
+    max_tick:              int   = 30
     attack_buffer:         int   = 3

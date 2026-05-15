@@ -1,14 +1,35 @@
 """stateful_agent.py — cross-turn memory, active defence, cooperative attacks, and comet logic."""
 from __future__ import annotations
 
+from contextlib import contextmanager
+import math
+
 from ..configs import StatefulAgentConfig
 from helper import distance, fleet_speed
 from game_context import GameContext
 from .base import BaseStatefulAgent
 
 
+@contextmanager
+def record_target_scores(agent):
+    """Temporarily intercept target_score on *agent* and collect all return values."""
+    log: list[float] = []
+    original = type(agent).target_score
+
+    def patched(src, tgt):
+        score = original(agent, src, tgt)
+        log.append(score)
+        return score
+
+    agent.target_score = patched
+    try:
+        yield log
+    finally:
+        del agent.target_score
+
+
 _COOP_PLANET_CAP = 8
-_SCORE_PROD_MULT = 10
+_PROD_MULT = 10
 
 
 class StatefulAgent(BaseStatefulAgent):
@@ -25,11 +46,14 @@ class StatefulAgent(BaseStatefulAgent):
         time  = dist / fleet_speed(base)
         prod  = tgt.production
         enemy = tgt.owner != -1
+        remaining = len(self._ctx.comet_paths.get(tgt.id, []))
+        is_comet  = tgt.id in self._ctx.comet_ids
         return (
-            _SCORE_PROD_MULT * prod
-            + (cfg.score_enemy_bonus * prod if enemy else 0)
-            - cfg.score_ships_penalty * (base + (time * prod if enemy else 0))
-            - cfg.score_time_penalty * time
+            _PROD_MULT * prod
+            + (cfg.enemy_bonus * prod if enemy else 0)
+            - cfg.ships_penalty * (base + (time * prod if enemy else 0))
+            - cfg.time_penalty * time
+            - (cfg.comet_penalty / (remaining + 1) if is_comet else 0)
         )
 
     def _run(self, ctx: GameContext) -> list:
@@ -45,9 +69,8 @@ class StatefulAgent(BaseStatefulAgent):
         moves: list   = []
 
         # ── Phase 0: Comet evacuation ─────────────────────────────────────────
-        _COMET_LEAVE_THRESHOLD = 1
         for comet_src in [p for p in my_planets if p.id in comet_ids]:
-            if len(ctx.comet_paths.get(comet_src.id, [])) > _COMET_LEAVE_THRESHOLD:
+            if len(ctx.comet_paths.get(comet_src.id, [])) > 0:
                 continue
 
             best_tgt = max(targets, key=lambda t: self.target_score(comet_src, t))
@@ -73,7 +96,7 @@ class StatefulAgent(BaseStatefulAgent):
         # ── Phase 1: Defence ─────────────────────────────────────────────────
         for p, plan in ctx.reinforcements_needed(min_ships).items():
             ships_needed   = plan["ships_needed"]
-            needed_by_tick = plan["needed_by_tick"]
+            needed_by_tick = min(self.cfg.max_tick, plan["needed_by_tick"])
 
             helpers = sorted(
                 [m for m in my_planets if m.id != p.id and m.id not in used_ids],
@@ -129,7 +152,7 @@ class StatefulAgent(BaseStatefulAgent):
                 instant_needed = max(min_ships, base - en_route)
                 src_angle, needed, src_arrive = ctx.ships_to_capture(src, tgt, instant_needed, enemy_fleets_en_route)
 
-                if src_angle is None:
+                if src_angle is None or src_arrive > self.cfg.max_tick:
                     continue
 
                 # 2.1 Single source attack
@@ -149,7 +172,7 @@ class StatefulAgent(BaseStatefulAgent):
                 ):
                     # src_avail < needed: recompute angle and arrive_tick for actual ship count
                     src_angle, src_arrive = ctx.aim(src, tgt, src_avail)
-                    if src_angle is None:
+                    if src_angle is None or src_arrive > self.cfg.max_tick:
                         continue
                     coalition  = [{"planet": src, "angle": src_angle, "ships": src_avail, "arrive_tick": src_arrive}]
                     max_tick_v = src_arrive
@@ -164,7 +187,7 @@ class StatefulAgent(BaseStatefulAgent):
                             continue
 
                         h_angle, h_arrive = ctx.aim(h, tgt, h_avail)
-                        if h_angle is None:
+                        if h_angle is None or h_arrive > self.cfg.max_tick:
                             continue
 
                         max_tick_v = max(max_tick_v, h_arrive)
