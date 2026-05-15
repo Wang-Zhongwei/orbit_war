@@ -92,16 +92,33 @@ def planet_trajectory(p, ticks: int, angular_velocity: float) -> list[tuple[floa
     """Return a list of (x, y) positions for a moving planet over `ticks` turns."""
     return [predict_planet_position(p, t, angular_velocity) for t in range(1, ticks + 1)]
 
+def _seg_seg_min_dist(ax: float, ay: float, bx: float, by: float,
+                      cx: float, cy: float, dx: float, dy: float) -> float:
+    """Minimum distance between segment AB and segment CD."""
+    rx, ry = bx - ax, by - ay
+    sx, sy = dx - cx, dy - cy
+    denom = rx * sy - ry * sx
+    if abs(denom) > 1e-10:
+        t = ((cx - ax) * sy - (cy - ay) * sx) / denom
+        u = ((cx - ax) * ry - (cy - ay) * rx) / denom
+        if 0.0 <= t <= 1.0 and 0.0 <= u <= 1.0:
+            return 0.0
+    return min(
+        point_to_segment_distance((ax, ay), (cx, cy), (dx, dy)),
+        point_to_segment_distance((bx, by), (cx, cy), (dx, dy)),
+        point_to_segment_distance((cx, cy), (ax, ay), (bx, by)),
+        point_to_segment_distance((dx, dy), (ax, ay), (bx, by)),
+    )
+
+
 def _path_blocked(sx: float, sy: float, ex: float, ey: float, ticks: int, spd: float,
                   blockers: list, traj_cache: dict) -> bool:
-    """Return True if the straight fleet path from (sx,sy) to (ex,ey) over `ticks` turns
-    is occluded by any planet in `blockers`.
+    """Return True if the fleet collides with any blocker during any tick interval [t-1, t].
 
-    Planets in `traj_cache` are moving — checked tick-by-tick against their
-    precomputed positions.  All others are static — one segment-circle test suffices.
-
-    `spd` is used to compute the fleet's true position at each tick rather than
-    dividing by the rounded `ticks`, which would introduce positional error.
+    At each tick interval, checks the minimum distance between the fleet's path segment
+    and the planet's path segment (or point for static planets) against p.radius.
+    traj_cache[p.id][t-1] is the planet's position at tick t; its position at tick 0
+    is (p.x, p.y).
     """
     dist_total = math.hypot(ex - sx, ey - sy)
     if dist_total == 0:
@@ -109,21 +126,22 @@ def _path_blocked(sx: float, sy: float, ex: float, ey: float, ticks: int, spd: f
     ux = (ex - sx) / dist_total
     uy = (ey - sy) / dist_total
     for p in blockers:
-        if p.id in traj_cache:
-            ptraj = traj_cache[p.id]
-            for t in range(1, ticks + 1):
+        ptraj = traj_cache.get(p.id)
+        for t in range(1, ticks + 1):
+            pfx = sx + ux * spd * (t - 1)
+            pfy = sy + uy * spd * (t - 1)
+            fx  = sx + ux * spd * t
+            fy  = sy + uy * spd * t
+            if ptraj is not None:
                 if t > len(ptraj):
                     break
-                fx  = sx + ux * spd * t
-                fy  = sy + uy * spd * t
-                pfx = sx + ux * spd * (t - 1)
-                pfy = sy + uy * spd * (t - 1)
-                px, py = ptraj[t - 1]
-                if point_to_segment_distance((px, py), (pfx, pfy), (fx, fy)) <= p.radius:
+                px, py   = ptraj[t - 1]
+                ppx, ppy = ptraj[t - 2] if t > 1 else (p.x, p.y)
+                if _seg_seg_min_dist(pfx, pfy, fx, fy, ppx, ppy, px, py) <= p.radius:
                     return True
-        else:
-            if point_to_segment_distance((p.x, p.y), (sx, sy), (ex, ey)) <= p.radius:
-                return True
+            else:
+                if point_to_segment_distance((p.x, p.y), (pfx, pfy), (fx, fy)) <= p.radius:
+                    return True
     return False
 
 

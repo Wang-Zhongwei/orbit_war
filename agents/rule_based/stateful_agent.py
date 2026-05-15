@@ -45,7 +45,6 @@ class StatefulAgent(BaseStatefulAgent):
         moves: list   = []
 
         # ── Phase 0: Comet evacuation ─────────────────────────────────────────
-        # TODO: 
         _COMET_LEAVE_THRESHOLD = 1
         for comet_src in [p for p in my_planets if p.id in comet_ids]:
             if len(ctx.comet_paths.get(comet_src.id, [])) > _COMET_LEAVE_THRESHOLD:
@@ -146,6 +145,7 @@ class StatefulAgent(BaseStatefulAgent):
                     len(my_planets) > 1
                     and tgt.ships >= self.cfg.min_ships_coop_target
                     and tgt.id not in comet_ids
+                    # and tgt.owner != -1 # test
                 ):
                     # src_avail < needed: recompute angle and arrive_tick for actual ship count
                     src_angle, src_arrive = ctx.aim(src, tgt, src_avail)
