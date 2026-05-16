@@ -111,7 +111,7 @@ def _seg_seg_min_dist(ax: float, ay: float, bx: float, by: float,
     )
 
 
-def _path_blocked(sx: float, sy: float, ex: float, ey: float, ticks: int, spd: float,
+def path_blocked(sx: float, sy: float, ex: float, ey: float, ticks: int, spd: float,
                   blockers: list, traj_cache: dict) -> bool:
     """Return True if the fleet collides with any blocker during any tick interval [t-1, t].
 
@@ -126,13 +126,13 @@ def _path_blocked(sx: float, sy: float, ex: float, ey: float, ticks: int, spd: f
     ux = (ex - sx) / dist_total
     uy = (ey - sy) / dist_total
     for p in blockers:
-        ptraj = traj_cache.get(p.id)
+        ptraj = traj_cache.get(p.id, [])
         for t in range(1, ticks + 1):
             pfx = sx + ux * spd * (t - 1)
             pfy = sy + uy * spd * (t - 1)
             fx  = sx + ux * spd * t
             fy  = sy + uy * spd * t
-            if ptraj is not None:
+            if ptraj:
                 if t > len(ptraj):
                     break
                 px, py   = ptraj[t - 1]
@@ -145,113 +145,64 @@ def _path_blocked(sx: float, sy: float, ex: float, ey: float, ticks: int, spd: f
     return False
 
 
-def find_angle(src, traj: list, ships: int,
-               blockers: list | None = None, traj_cache: dict | None = None,
-               tgt_id: int = -1, tgt_radius: float = 0.0) -> tuple[float|None, int|None]:
-    """Angle + arrive tick toward a moving target given its precomputed trajectory.
+def find_angle(src, tgt, ships: int, traj_cache: dict,
+               blockers: list | None = None) -> tuple[float|None, int|None]:
+    """Angle + arrive tick toward `tgt`, handling both moving and static targets.
 
     Returns (None, None) when no intercept is found or every candidate path clips
-    the sun or is occluded by a planet.  When `blockers` is provided (all planets),
-    planets matching src or tgt_id are excluded automatically.
-
-    Blocked-by-planet intercepts are skipped rather than aborting outright, because
-    a blocking planet may have rotated clear by a later tick.  Sun blocks abort
-    immediately (the sun never moves).
+    the sun or is occluded by a planet.  src and tgt are excluded from blockers
+    automatically.  For moving targets, blocked intercepts are skipped (a blocking
+    planet may rotate clear at a later tick); sun blocks abort immediately.
     """
     spd = fleet_speed(ships)
-    obstacles = [p for p in (blockers or []) if p.id != src.id and p.id != tgt_id]
-    cache = traj_cache or {}
 
-    for tick, (tx, ty) in enumerate(traj, start=1):
-        dist = math.sqrt((src.x - tx) ** 2 + (src.y - ty) ** 2) - src.radius
-        if abs(dist - spd * tick) < tgt_radius:
-            angle = math.atan2(ty - src.y, tx - src.x)
-            lx = src.x + math.cos(angle) * src.radius
-            ly = src.y + math.sin(angle) * src.radius
-            if hits_sun(lx, ly, angle, spd, tick):
-                return None, None
-            if obstacles and _path_blocked(lx, ly, tx, ty, tick, spd, obstacles, cache):
-                continue
-            return angle, tick
-    return None, None
+    if tgt.id in traj_cache:
+        traj = traj_cache[tgt.id]
+        n = len(traj)
 
+        def gap(idx):
+            tick = idx + 1
+            tx, ty = traj[idx]
+            dx, dy = tx - src.x, ty - src.y
+            return spd * tick - (math.hypot(dx, dy) - src.radius)
 
-def static_angle(src, tgt, ships: int,
-                 blockers: list | None = None, traj_cache: dict | None = None) -> tuple[float|None, int|None]:
-    """Straight-line angle to a static target.
+        lo, hi, first = 0, n - 1, n
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if gap(mid) >= -tgt.radius:
+                first = mid
+                hi = mid - 1
+            else:
+                lo = mid + 1
 
-    Returns (None, None) if the path clips the sun or any planet in `blockers`.
-    """
-    dx, dy = tgt.x - src.x, tgt.y - src.y
-    angle = math.atan2(dy, dx)
-    spd = fleet_speed(ships)
-    tick = max(1, math.ceil((math.sqrt(dx * dx + dy * dy) - src.radius - tgt.radius) / spd))
+        if first >= n or abs(gap(first)) >= tgt.radius:
+            return None, None
+        tick = first + 1
+        tx, ty = traj[first]
+        dx, dy = tx - src.x, ty - src.y
+        angle = math.atan2(dy, dx)
+        lx = src.x + math.cos(angle) * src.radius
+        ly = src.y + math.sin(angle) * src.radius
+        if hits_sun(lx, ly, angle, spd, tick):
+            return None, None
+        if blockers and path_blocked(lx, ly, tx, ty, tick, spd, blockers, traj_cache):
+            return None, None
+        return angle, tick
+    else:
+        dx, dy = tgt.x - src.x, tgt.y - src.y
+        angle = math.atan2(dy, dx)
+        dist = math.hypot(dx, dy) - src.radius
+        tick = math.ceil((dist - tgt.radius) / spd)
 
-    lx = src.x + math.cos(angle) * src.radius
-    ly = src.y + math.sin(angle) * src.radius
-    if hits_sun(lx, ly, angle, spd, tick):
-        return None, None
+        lx = src.x + math.cos(angle) * src.radius
+        ly = src.y + math.sin(angle) * src.radius
+        if hits_sun(lx, ly, angle, spd, tick):
+            return None, None
 
-    obstacles = [p for p in (blockers or []) if p.id != src.id and p.id != tgt.id]
-    if obstacles and _path_blocked(lx, ly, tgt.x, tgt.y, tick, spd, obstacles, traj_cache or {}):
-        return None, None
+        if blockers and path_blocked(lx, ly, tgt.x, tgt.y, tick, spd, blockers, traj_cache):
+            return None, None
 
-    return angle, tick
-
-def my_planets_under_attack(
-    mine, fleets, player: int, traj_cache: dict, max_ticks: int = MAX_TICKS
-) -> dict[int, list[DirectedFleet]]:  # noqa: F821
-    """Detect which planets in `mine` are targeted by enemy fleets.
-
-    Uses analytic ray-circle intersection for static planets (O(1) per planet)
-    and tick-by-tick segment tests for moving planets whose trajectory is in
-    `traj_cache` (planet_id -> list of (x, y)).
-    """
-    enemy  = [f for f in fleets if f.owner != player and f.ships > 0]
-    result: dict = {}
-    seen:   set  = set()
-    static = [m for m in mine if m.id not in traj_cache]
-    moving = [m for m in mine if m.id in traj_cache]
-
-    for f in enemy:
-        spd = fleet_speed(f.ships)
-        vx  = math.cos(f.angle) * spd
-        vy  = math.sin(f.angle) * spd
-
-        for m in static:
-            dx0  = f.x - m.x
-            dy0  = f.y - m.y
-            b    = 2 * (dx0 * vx + dy0 * vy)
-            c    = dx0 * dx0 + dy0 * dy0 - m.radius * m.radius
-            disc = b * b - 4 * spd * spd * c
-            if disc < 0:
-                continue
-            t_enter = (-b - math.sqrt(disc)) / (2 * spd * spd)
-            t_exit  = (-b + math.sqrt(disc)) / (2 * spd * spd)
-            if t_exit < 0 or t_enter > max_ticks:
-                continue
-            result.setdefault(m.id, [])
-            result[m.id].append(DirectedFleet(f.id, m.id, f.angle, f.ships, max(1, math.ceil(t_enter))))
-
-        if moving:
-            px, py = f.x, f.y
-            for tick in range(1, max_ticks + 1):
-                nx = f.x + vx * tick
-                ny = f.y + vy * tick
-                for m in moving:
-                    traj = traj_cache[m.id]
-                    if tick > len(traj):
-                        continue
-                    mx, my = traj[tick - 1]
-                    if point_to_segment_distance((mx, my), (px, py), (nx, ny)) <= m.radius:
-                        key = (m.id, f.id)
-                        if key not in seen:
-                            seen.add(key)
-                            result.setdefault(m.id, [])
-                            result[m.id].append(DirectedFleet(f.id, m.id, f.angle, f.ships, tick))
-                px, py = nx, ny
-    return result
-
+        return angle, tick
 
 
 def reinforcement_plans(

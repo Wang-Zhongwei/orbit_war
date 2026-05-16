@@ -14,8 +14,8 @@ class BaseStatefulAgent(ABC):
     passed to :meth:`_run`. Subclasses only need to implement strategy.
     """
 
-    def __init__(self, max_tick: int = MAX_TICKS) -> None:
-        self._ctx = GameContext(max_tick=max_tick)
+    def __init__(self, max_tick: int = MAX_TICKS, path_blocking_detection: bool = True) -> None:
+        self._ctx = GameContext(max_tick=max_tick, path_blocking_detection=path_blocking_detection)
 
     def __call__(self, obs) -> list:
         step = obs.get("step", 0)

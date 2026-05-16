@@ -80,5 +80,5 @@ class StatefulAgentConfig:
     min_ships_attack:      int   = 13
     top_k_targets:         int   = 3
     min_ships_coop_target: int   = 34
-    max_tick:              int   = 30
+    max_tick:              int   = 60
     attack_buffer:         int   = 3

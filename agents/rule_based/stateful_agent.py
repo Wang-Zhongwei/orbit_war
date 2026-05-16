@@ -96,7 +96,7 @@ class StatefulAgent(BaseStatefulAgent):
         # ── Phase 1: Defence ─────────────────────────────────────────────────
         for p, plan in ctx.reinforcements_needed(min_ships).items():
             ships_needed   = plan["ships_needed"]
-            needed_by_tick = min(self.cfg.max_tick, plan["needed_by_tick"])
+            needed_by_tick = plan["needed_by_tick"]
 
             helpers = sorted(
                 [m for m in my_planets if m.id != p.id and m.id not in used_ids],
@@ -152,7 +152,7 @@ class StatefulAgent(BaseStatefulAgent):
                 instant_needed = max(min_ships, base - en_route)
                 src_angle, needed, src_arrive = ctx.ships_to_capture(src, tgt, instant_needed, enemy_fleets_en_route)
 
-                if src_angle is None or src_arrive > self.cfg.max_tick:
+                if src_angle is None:
                     continue
 
                 # 2.1 Single source attack
@@ -172,8 +172,9 @@ class StatefulAgent(BaseStatefulAgent):
                 ):
                     # src_avail < needed: recompute angle and arrive_tick for actual ship count
                     src_angle, src_arrive = ctx.aim(src, tgt, src_avail)
-                    if src_angle is None or src_arrive > self.cfg.max_tick:
+                    if src_angle is None:
                         continue
+                    
                     coalition  = [{"planet": src, "angle": src_angle, "ships": src_avail, "arrive_tick": src_arrive}]
                     max_tick_v = src_arrive
                     tot_ships  = src_avail
@@ -187,7 +188,7 @@ class StatefulAgent(BaseStatefulAgent):
                             continue
 
                         h_angle, h_arrive = ctx.aim(h, tgt, h_avail)
-                        if h_angle is None or h_arrive > self.cfg.max_tick:
+                        if h_angle is None:
                             continue
 
                         max_tick_v = max(max_tick_v, h_arrive)
