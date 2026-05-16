@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from itertools import groupby
 import math
 
 from kaggle_environments.envs.orbit_wars.orbit_wars import (
@@ -224,6 +225,55 @@ class GameContext:
         """Precomputed trajectory for a moving planet, or None for static planets."""
         return self._traj_cache.get(planet_id)
 
+    
+    def is_capture_possible(self, tgt, en_route: list[DirectedFleet]):
+        en_route_sorted = sorted(en_route, key=lambda df: df.arrive_tick)
+        batches: list[list[DirectedFleet]] = [
+            list(g) for _, g in groupby(en_route_sorted, key=lambda df: df.arrive_tick)
+        ]
+
+        last_arrive_tick = 0
+        last_owner = tgt.owner
+        garrison = tgt.ships
+
+        for batch in batches:
+            batch_tick = batch[0].arrive_tick
+            duration = batch_tick - last_arrive_tick
+
+            # calculate net ships and owner of the batch
+            net_ships = batch[0].ships
+            batch_owner = batch[0].owner
+            for df in batch[1:]:
+                if df.owner == batch_owner:
+                    net_ships += df.ships
+                else:
+                    net_ships -= df.ships
+                
+                # switchover
+                if net_ships < 0:
+                    net_ships = -net_ships
+                    batch_owner = df.owner
+
+            if net_ships == 0:
+                continue
+            
+            # simulate the arrival process
+            if last_owner != -1:
+                garrison += duration * tgt.production
+
+            if batch_owner == last_owner:
+                garrison += net_ships
+            else:
+                garrison -= net_ships
+
+            if garrison < 0 or garrison == 0 and batch_owner == -1:
+                last_owner = batch_owner
+                garrison = -garrison
+
+            last_arrive_tick = batch_tick
+        
+        return last_owner == self.player
+
     def ships_to_capture(
         self, src, tgt, needed: int, enemy_en_route: list[DirectedFleet]
     ) -> tuple[float | None, int | None, int | None]:
@@ -239,10 +289,15 @@ class GameContext:
             angle, arrive_tick = self.aim(src, tgt, needed)
             if angle is None:
                 return None, None, None
-            # note: this is gonna be an overestimate if tgt.owner == -1 but we better not drop the it because at some point it might be occupied by enemy
-            needed = original_needed + arrive_tick * tgt.production * (
-                len(enemy_en_route) > 0 or tgt.owner != -1
-            )
+            # note: this is gonna be an overestimate
+            if tgt.owner == -1:
+                if len(enemy_en_route) == 0:
+                    needed = original_needed
+                else:
+                    needed = original_needed + (arrive_tick - enemy_en_route[0].arrive_tick) * tgt.production
+            else:
+                needed = original_needed + arrive_tick * tgt.production
+
             if last_needed == needed:
                 break
             last_needed = needed

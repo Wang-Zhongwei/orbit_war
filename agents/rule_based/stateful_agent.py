@@ -119,7 +119,6 @@ class StatefulAgent(BaseStatefulAgent):
                 break
 
         # ── Phase 2: Offence ─────────────────────────────────────────────────
-
         owned_frac   = len(my_planets) / max(1, len(ctx.planets))
         attacked_ids = set()
 
@@ -130,27 +129,28 @@ class StatefulAgent(BaseStatefulAgent):
             src_avail = ctx.avail(src)
             if src_avail < min_ships:
                 continue
-            # todo: comet should not be treated as a planet since the production is transcient
-            # there should be a penalty towards how long the comet will be leaving the domain
-            ranked    = sorted(targets, key=lambda t: self.target_score(src, t), reverse=True)
+
+            ranked = sorted(targets, key=lambda t: self.target_score(src, t), reverse=True)
 
             for tgt in ranked[:self.cfg.top_k_targets]:
                 if tgt.id in attacked_ids:
                     continue
                 
-                enemy_fleets_en_route = ctx.get_enemy_en_route(tgt)
-                enemy_racing = sum(f.ships for f in enemy_fleets_en_route)
-                en_route = sum(f.ships for f in ctx.my_fleets if f.tgt_id == tgt.id)
+                enemy_en_route = ctx.get_enemy_en_route(tgt)
+                mine_en_route = [f for f in ctx.my_fleets if f.tgt_id == tgt.id]
+
+                enemy_racing = sum(f.ships for f in enemy_en_route)
+                mine_racing = sum(f.ships for f in mine_en_route)
 
                 base = enemy_racing + tgt.ships + 1
                 if tgt.owner != -1:
                     base += self.cfg.attack_buffer * tgt.production
 
-                if owned_frac < 0.75 and en_route >= base:
+                if owned_frac < 0.75 and mine_racing >= base:
                     continue
 
-                instant_needed = max(min_ships, base - en_route)
-                src_angle, needed, src_arrive = ctx.ships_to_capture(src, tgt, instant_needed, enemy_fleets_en_route)
+                instant_needed = max(min_ships, base - mine_racing)
+                src_angle, needed, src_arrive = ctx.ships_to_capture(src, tgt, instant_needed, enemy_en_route)
 
                 if src_angle is None:
                     continue
@@ -168,7 +168,6 @@ class StatefulAgent(BaseStatefulAgent):
                     len(my_planets) > 1
                     and tgt.ships >= self.cfg.min_ships_coop_target
                     and tgt.id not in comet_ids
-                    # and tgt.owner != -1 # test
                 ):
                     # src_avail < needed: recompute angle and arrive_tick for actual ship count
                     src_angle, src_arrive = ctx.aim(src, tgt, src_avail)
@@ -178,6 +177,7 @@ class StatefulAgent(BaseStatefulAgent):
                     coalition  = [{"planet": src, "angle": src_angle, "ships": src_avail, "arrive_tick": src_arrive}]
                     max_tick_v = src_arrive
                     tot_ships  = src_avail
+                    found = False
 
                     for h in sorted(my_planets, key=lambda p: (p.x - tgt.x) ** 2 + (p.y - tgt.y) ** 2):
                         if h.id == src.id or h.id in used_ids:
@@ -198,10 +198,19 @@ class StatefulAgent(BaseStatefulAgent):
                         if len(coalition) >= _COOP_PLANET_CAP:
                             break
                         # this is gonna be an overestimate if tgt.owner == -1 but we better not drop the it because at some point it might be occupied by enemy
-                        if tot_ships >= instant_needed + max_tick_v * tgt.production * (len(enemy_fleets_en_route) > 0 or tgt.owner != -1):
-                            break
+                        if tgt.owner == -1:
+                            if len(enemy_en_route) == 0:
+                                extra_needed = 0
+                            else:
+                                extra_needed = (max_tick_v - enemy_en_route[0].arrive_tick) * tgt.production
+                        else:
+                            extra_needed = max_tick_v * tgt.production
 
-                    if tot_ships < instant_needed + max_tick_v * tgt.production * (len(enemy_fleets_en_route) > 0 or tgt.owner != -1):
+                        if tot_ships >= instant_needed + extra_needed:
+                            found = True
+                            break
+                    
+                    if not found:
                         continue
 
                     for entry in coalition:
