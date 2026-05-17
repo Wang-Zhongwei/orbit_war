@@ -156,7 +156,7 @@ class GameContext:
             )
             arrive_tick = max(1, math.ceil(max(0.0, dist) / spd))
             updated.append(
-                DirectedFleet(df.src_id, df.tgt_id, df.angle, df.ships, arrive_tick)
+                DirectedFleet(df.owner, df.src_id, df.tgt_id, df.angle, df.ships, arrive_tick)
             )
 
         self._my_fleets = updated
@@ -174,7 +174,7 @@ class GameContext:
         self, src, tgt, angle: float, ships: int, arrive_tick: int
     ) -> None:
         """Record an outgoing fleet for cross-turn accounting."""
-        self._my_fleets.append(DirectedFleet(src.id, tgt.id, angle, ships, arrive_tick))
+        self._my_fleets.append(DirectedFleet(self.player, src.id, tgt.id, angle, ships, arrive_tick))
 
     @property
     def my_fleets(self) -> list[DirectedFleet]:
@@ -208,8 +208,8 @@ class GameContext:
 
     # ── Aiming ───────────────────────────────────────────────────────────────
 
-    def aim(self, src, tgt, ships: int) -> tuple[float | None, int | None]:
-        """Return (angle, arrive_tick) toward tgt, using trajectory cache for moving targets."""
+    def aim(self, src, tgt, ships: int) -> tuple[float | None, int | None, bool]:
+        """Return (angle, arrive_tick, is_blocked) toward tgt, using trajectory cache for moving targets."""
 
         return find_angle(
             src,
@@ -275,33 +275,32 @@ class GameContext:
         return last_owner == self.player
 
     def ships_to_capture(
-        self, src, tgt, needed: int, enemy_en_route: list[DirectedFleet]
-    ) -> tuple[float | None, int | None, int | None]:
+        self, src, tgt, mine_en_route: list[DirectedFleet], enemy_en_route: list[DirectedFleet],
+    min_ships: int) -> tuple[float | None, int | None, int | None]:
         """Refine ship count to account for enemy production during travel.
 
         Returns (angle, ships, arrive_tick), or (None, None, None) if unreachable.
         """
-        original_needed = needed
-        last_needed = needed
-        angle: float | None = None
-        arrive_tick: int | None = None
-        for _ in range(5):
-            angle, arrive_tick = self.aim(src, tgt, needed)
-            if angle is None:
-                return None, None, None
-            # note: this is gonna be an overestimate
-            if tgt.owner == -1:
-                if len(enemy_en_route) == 0:
-                    needed = original_needed
-                else:
-                    needed = original_needed + (arrive_tick - enemy_en_route[0].arrive_tick) * tgt.production
+        # Binary search for minimum ships regardless of being blocked
+        lo, hi = min_ships, 200
+        while lo < hi:
+            mid = (lo + hi) // 2
+            angle, arrive_tick, is_blocked = self.aim(src, tgt, mid)
+            if arrive_tick is None:  # truly unreachable (beyond max_tick)
+                lo = mid + 1
+                continue
+            
+            if self.is_capture_possible(tgt, mine_en_route + enemy_en_route + [DirectedFleet(self.player, src.id, tgt.id, angle, mid, arrive_tick)]):
+                
+                hi = mid
             else:
-                needed = original_needed + arrive_tick * tgt.production
+                lo = mid + 1
 
-            if last_needed == needed:
-                break
-            last_needed = needed
-        return angle, needed, arrive_tick
+        angle, arrive_tick, is_blocked = self.aim(src, tgt, lo)
+        if arrive_tick is None or is_blocked:
+            return None, None, None
+            
+        return angle, lo, arrive_tick
 
     def get_enemy_en_route(self, tgt) -> list[DirectedFleet]:
         """Return enemy fleets heading toward `tgt` within max_tick turns, sorted by arrive_tick.
@@ -332,7 +331,7 @@ class GameContext:
                     ):
                         result.append(
                             DirectedFleet(
-                                f.from_planet_id, tgt.id, f.angle, f.ships, tick
+                                f.owner, f.from_planet_id, tgt.id, f.angle, f.ships, tick
                             )
                         )
                     break

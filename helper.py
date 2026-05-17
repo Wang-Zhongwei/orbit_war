@@ -19,7 +19,7 @@ from typing import NamedTuple
 
 from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet, SUN_RADIUS, CENTER, ROTATION_RADIUS_LIMIT, point_to_segment_distance
 
-DirectedFleet = NamedTuple("DirectedFleet", [("src_id", int), ("tgt_id", int), ("angle", float), ("ships", int), ("arrive_tick", int)])
+DirectedFleet = NamedTuple("DirectedFleet", [("owner", int), ("src_id", int), ("tgt_id", int), ("angle", float), ("ships", int), ("arrive_tick", int)])
 
 # ---------------------------------------------------------------------------
 # Game constants
@@ -146,13 +146,13 @@ def path_blocked(sx: float, sy: float, ex: float, ey: float, ticks: int, spd: fl
 
 
 def find_angle(src, tgt, ships: int, traj_cache: dict,
-               blockers: list | None = None) -> tuple[float|None, int|None]:
+               blockers: list | None = None) -> tuple[float|None, int|None, bool]:
     """Angle + arrive tick toward `tgt`, handling both moving and static targets.
 
-    Returns (None, None) when no intercept is found or every candidate path clips
-    the sun or is occluded by a planet.  src and tgt are excluded from blockers
-    automatically.  For moving targets, blocked intercepts are skipped (a blocking
-    planet may rotate clear at a later tick); sun blocks abort immediately.
+    Returns (angle, tick, is_blocked):
+      - (None, None, False) when no intercept exists within max_tick (truly unreachable)
+      - (angle, tick, True)  when path is blocked by the sun or a planet
+      - (angle, tick, False) when the path is clear
     """
     spd = fleet_speed(ships)
 
@@ -169,14 +169,14 @@ def find_angle(src, tgt, ships: int, traj_cache: dict,
         lo, hi, first = 0, n - 1, n
         while lo <= hi:
             mid = (lo + hi) // 2
-            if gap(mid) >= -tgt.radius:
+            if gap(mid) > -tgt.radius:
                 first = mid
                 hi = mid - 1
             else:
                 lo = mid + 1
 
         if first >= n or abs(gap(first)) >= tgt.radius:
-            return None, None
+            return None, None, False
         tick = first + 1
         tx, ty = traj[first]
         dx, dy = tx - src.x, ty - src.y
@@ -184,10 +184,10 @@ def find_angle(src, tgt, ships: int, traj_cache: dict,
         lx = src.x + math.cos(angle) * src.radius
         ly = src.y + math.sin(angle) * src.radius
         if hits_sun(lx, ly, angle, spd, tick):
-            return None, None
+            return angle, tick, True
         if blockers and path_blocked(lx, ly, tx, ty, tick, spd, blockers, traj_cache):
-            return None, None
-        return angle, tick
+            return angle, tick, True
+        return angle, tick, False
     else:
         dx, dy = tgt.x - src.x, tgt.y - src.y
         angle = math.atan2(dy, dx)
@@ -197,12 +197,12 @@ def find_angle(src, tgt, ships: int, traj_cache: dict,
         lx = src.x + math.cos(angle) * src.radius
         ly = src.y + math.sin(angle) * src.radius
         if hits_sun(lx, ly, angle, spd, tick):
-            return None, None
+            return angle, tick, True
 
         if blockers and path_blocked(lx, ly, tgt.x, tgt.y, tick, spd, blockers, traj_cache):
-            return None, None
+            return angle, tick, True
 
-        return angle, tick
+        return angle, tick, False
 
 
 def reinforcement_plans(

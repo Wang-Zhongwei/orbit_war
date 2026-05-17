@@ -2,10 +2,9 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-import math
 
 from ..configs import StatefulAgentConfig
-from helper import distance, fleet_speed
+from helper import DirectedFleet, distance, fleet_speed
 from game_context import GameContext
 from .base import BaseStatefulAgent
 
@@ -74,9 +73,9 @@ class StatefulAgent(BaseStatefulAgent):
                 continue
 
             best_tgt = max(targets, key=lambda t: self.target_score(comet_src, t))
-            angle, arrive_tick = ctx.aim(comet_src, best_tgt, comet_src.ships)
+            angle, arrive_tick, is_blocked = ctx.aim(comet_src, best_tgt, comet_src.ships)
 
-            if angle is not None:
+            if angle is not None and not is_blocked:
                 moves.append([comet_src.id, angle, comet_src.ships])
                 used_ids.add(comet_src.id)
                 ctx.record_fleet(comet_src, best_tgt, angle, comet_src.ships, arrive_tick)
@@ -87,8 +86,8 @@ class StatefulAgent(BaseStatefulAgent):
             if not candidates:
                 continue
             closest = min(candidates, key=lambda p: (p.x - comet_src.x) ** 2 + (p.y - comet_src.y) ** 2)
-            angle, arrive_tick = ctx.aim(comet_src, closest, comet_src.ships)
-            if angle is not None:
+            angle, arrive_tick, is_blocked = ctx.aim(comet_src, closest, comet_src.ships)
+            if angle is not None and not is_blocked:
                 moves.append([comet_src.id, angle, comet_src.ships])
                 used_ids.add(comet_src.id)
                 ctx.record_fleet(comet_src, closest, angle, comet_src.ships, arrive_tick)
@@ -109,8 +108,8 @@ class StatefulAgent(BaseStatefulAgent):
                 if avail < to_send:
                     continue
 
-                angle, arrive_tick = ctx.aim(helper, p, to_send)
-                if angle is None or arrive_tick > needed_by_tick:
+                angle, arrive_tick, is_blocked = ctx.aim(helper, p, to_send)
+                if angle is None or is_blocked or arrive_tick > needed_by_tick:
                     continue
 
                 moves.append([helper.id, angle, to_send])
@@ -139,27 +138,19 @@ class StatefulAgent(BaseStatefulAgent):
                 enemy_en_route = ctx.get_enemy_en_route(tgt)
                 mine_en_route = [f for f in ctx.my_fleets if f.tgt_id == tgt.id]
 
-                enemy_racing = sum(f.ships for f in enemy_en_route)
-                mine_racing = sum(f.ships for f in mine_en_route)
-
-                base = enemy_racing + tgt.ships + 1
-                if tgt.owner != -1:
-                    base += self.cfg.attack_buffer * tgt.production
-
-                if owned_frac < 0.75 and mine_racing >= base:
+                if ctx.is_capture_possible(tgt, mine_en_route + enemy_en_route) and owned_frac < 0.75:
                     continue
-
-                instant_needed = max(min_ships, base - mine_racing)
-                src_angle, needed, src_arrive = ctx.ships_to_capture(src, tgt, instant_needed, enemy_en_route)
+               
+                src_angle, src_needed, src_arrive = ctx.ships_to_capture(src, tgt, mine_en_route, enemy_en_route, self.cfg.min_ships_attack)
 
                 if src_angle is None:
                     continue
 
                 # 2.1 Single source attack
-                if src_avail >= needed:
-                    moves.append([src.id, src_angle, needed])
+                if src_avail >= src_needed:
+                    moves.append([src.id, src_angle, src_needed])
                     used_ids.add(src.id)
-                    ctx.record_fleet(src, tgt, src_angle, needed, src_arrive)
+                    ctx.record_fleet(src, tgt, src_angle, src_needed, src_arrive)
                     attacked_ids.add(tgt.id)
                     break
 
@@ -170,13 +161,12 @@ class StatefulAgent(BaseStatefulAgent):
                     and tgt.id not in comet_ids
                 ):
                     # src_avail < needed: recompute angle and arrive_tick for actual ship count
-                    src_angle, src_arrive = ctx.aim(src, tgt, src_avail)
-                    if src_angle is None:
+                    src_angle, src_arrive, is_blocked = ctx.aim(src, tgt, src_avail)
+                    if src_angle is None or is_blocked:
                         continue
                     
                     coalition  = [{"planet": src, "angle": src_angle, "ships": src_avail, "arrive_tick": src_arrive}]
-                    max_tick_v = src_arrive
-                    tot_ships  = src_avail
+                    mine_en_route.append(DirectedFleet(ctx.player, src.id, tgt.id, src_angle, src_avail, src_arrive))
                     found = False
 
                     for h in sorted(my_planets, key=lambda p: (p.x - tgt.x) ** 2 + (p.y - tgt.y) ** 2):
@@ -187,29 +177,28 @@ class StatefulAgent(BaseStatefulAgent):
                         if h_avail < min_ships:
                             continue
 
-                        h_angle, h_arrive = ctx.aim(h, tgt, h_avail)
+                        h_angle, h_needed, h_arrive = ctx.ships_to_capture(h, tgt, mine_en_route, enemy_en_route, self.cfg.min_ships_attack)
                         if h_angle is None:
                             continue
 
-                        max_tick_v = max(max_tick_v, h_arrive)
-                        tot_ships += h_avail
-                        coalition.append({"planet": h, "angle": h_angle, "ships": h_avail, "arrive_tick": h_arrive})
+                        if h_needed > h_avail:
+                            # update angle and arrive_tick since num_ships is h_avail rather than h_needed
+                            h_angle, h_arrive, is_blocked = ctx.aim(h, tgt, h_avail)
+                            if h_angle is None or is_blocked:
+                                continue
+
+                            coalition.append({"planet": h, "angle": h_angle, "ships": h_avail, "arrive_tick": h_arrive})
+                            mine_en_route.append(DirectedFleet(ctx.player, h.id, tgt.id, h_angle, h_avail, h_arrive))
+                        else:
+                            coalition.append({"planet": h, "angle": h_angle, "ships": h_needed, "arrive_tick": h_arrive})
+                            mine_en_route.append(DirectedFleet(ctx.player, h.id, tgt.id, h_angle, h_needed, h_arrive))
+                            found = True
+                            break
 
                         if len(coalition) >= _COOP_PLANET_CAP:
                             break
-                        # this is gonna be an overestimate if tgt.owner == -1 but we better not drop the it because at some point it might be occupied by enemy
-                        if tgt.owner == -1:
-                            if len(enemy_en_route) == 0:
-                                extra_needed = 0
-                            else:
-                                extra_needed = (max_tick_v - enemy_en_route[0].arrive_tick) * tgt.production
-                        else:
-                            extra_needed = max_tick_v * tgt.production
+                       
 
-                        if tot_ships >= instant_needed + extra_needed:
-                            found = True
-                            break
-                    
                     if not found:
                         continue
 

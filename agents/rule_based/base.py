@@ -22,8 +22,6 @@ class BaseStatefulAgent(ABC):
         if step == 0:
             self._ctx.reset()
         self._ctx.update(obs)
-        if step < 3:
-            return []
         return self._run(self._ctx)
 
     @abstractmethod

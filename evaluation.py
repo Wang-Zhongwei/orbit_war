@@ -54,6 +54,7 @@ def _load_submission(name: str):
 _v2_mod = _load_submission("stateful_v2")
 _v3_mod = _load_submission("stateful_v3")
 _v5_mod = _load_submission("stateful_v5")
+_v51_mod = _load_submission("stateful_v5.1")
 
 
 def sub_stateful_v2(obs) -> list:
@@ -66,6 +67,10 @@ def sub_stateful_v3(obs) -> list:
 
 def sub_stateful_v5(obs) -> list:
     return _v5_mod.agent(obs)
+
+
+def sub_stateful_v51(obs) -> list:
+    return _v51_mod.agent(obs)
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +86,7 @@ AGENTS: dict[str, object] = {
     "sub_v2":       sub_stateful_v2,
     "sub_v3":       sub_stateful_v3,
     "sub_v5":       sub_stateful_v5,
+    "sub_v51":      sub_stateful_v51,
     "random":       "random",
 }
 
