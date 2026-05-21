@@ -9,11 +9,8 @@ import numpy as np
 
 from .config import EnvConfig
 from .game_types import GameState, PlanetState, parse_observation
-
-BOARD_CENTER = (50.0, 50.0)
-ROTATION_RADIUS_LIMIT = 50.0
-SUN_RADIUS = 10.0
-PLANET_LAUNCH_RADIUS_OFFSET = 0.1
+from .helper import find_angle, planet_trajectory, MAX_TICKS
+from kaggle_environments.envs.orbit_wars.orbit_wars import CENTER, ROTATION_RADIUS_LIMIT
 
 
 @dataclass(slots=True)
@@ -170,14 +167,25 @@ def build_candidate_features(
     target_angles = [0.0] * env_cfg.candidate_count
     candidate_mask[0] = True
 
+    traj_cache: dict = {
+        p.id: planet_trajectory(p, MAX_TICKS, state.angular_velocity)
+        for p in state.planets
+        if is_rotating_planet(p)
+    }
+    # Comets follow their own waypoints, not orbital rotation — override any rotation entry.
+    traj_cache.update(state.comet_paths)
+
     for idx, tgt in enumerate(candidates, start=1):
         if idx >= env_cfg.candidate_count:
             break
+        ships_needed = fixed_ship_count(src, tgt)
+        blockers = [p for p in state.planets if p.id not in {src.id, tgt.id}]
+        angle, _tick, is_blocked = find_angle(src, tgt, ships_needed, traj_cache, blockers)
+        if angle is None:
+            angle = math.atan2(tgt.y - src.y, tgt.x - src.x)
+            is_blocked = True
         dx = tgt.x - src.x
         dy = tgt.y - src.y
-        angle = math.atan2(dy, dx)
-        crosses_sun = shot_crosses_sun(src, angle, tgt)
-        ships_needed = fixed_ship_count(src, tgt)
         features[idx] = np.asarray(
             [
                 1.0,
@@ -192,13 +200,13 @@ def build_candidate_features(
                 min(tgt.ships, env_cfg.max_ships) / env_cfg.max_ships,
                 tgt.production / env_cfg.max_production,
                 1.0 if is_rotating_planet(tgt) else 0.0,
-                1.0 if crosses_sun else 0.0,
+                1.0 if is_blocked else 0.0,
                 min(src.ships, env_cfg.max_ships) / env_cfg.max_ships,
             ],
             dtype=np.float32,
         )
         ship_counts[idx] = ships_needed
-        candidate_mask[idx] = ships_needed > 0 and not crosses_sun and src.ships >= ships_needed
+        candidate_mask[idx] = ships_needed > 0 and not is_blocked and src.ships >= ships_needed
         candidate_ids[idx] = tgt.id
         target_angles[idx] = angle
 
@@ -239,27 +247,9 @@ def total_ships(planets: list[PlanetState]) -> float:
 
 
 def is_rotating_planet(planet: PlanetState) -> bool:
-    dx = planet.x - BOARD_CENTER[0]
-    dy = planet.y - BOARD_CENTER[1]
+    dx = planet.x - CENTER
+    dy = planet.y - CENTER
     orbital_radius = math.hypot(dx, dy)
     return orbital_radius + planet.radius < ROTATION_RADIUS_LIMIT
 
 
-def shot_crosses_sun(src: PlanetState, angle: float, tgt: PlanetState) -> bool:
-    start_x = src.x + math.cos(angle) * (src.radius + PLANET_LAUNCH_RADIUS_OFFSET)
-    start_y = src.y + math.sin(angle) * (src.radius + PLANET_LAUNCH_RADIUS_OFFSET)
-    return point_to_segment_distance(BOARD_CENTER, (start_x, start_y), (tgt.x, tgt.y)) < SUN_RADIUS
-
-
-def point_to_segment_distance(point: tuple[float, float], start: tuple[float, float], end: tuple[float, float]) -> float:
-    segment_len_sq = (start[0] - end[0]) ** 2 + (start[1] - end[1]) ** 2
-    if segment_len_sq == 0.0:
-        return math.hypot(point[0] - start[0], point[1] - start[1])
-    projection = (
-        ((point[0] - start[0]) * (end[0] - start[0]) + (point[1] - start[1]) * (end[1] - start[1]))
-        / segment_len_sq
-    )
-    projection = max(0.0, min(1.0, projection))
-    closest_x = start[0] + projection * (end[0] - start[0])
-    closest_y = start[1] + projection * (end[1] - start[1])
-    return math.hypot(point[0] - closest_x, point[1] - closest_y)

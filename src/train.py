@@ -9,7 +9,6 @@ import numpy as np
 import torch
 
 from .config import TrainConfig, default_train_config_path, load_train_config
-from .env import OrbitWarsEnv
 from .features import (
     TurnBatch,
     candidate_feature_dim,
@@ -17,9 +16,9 @@ from .features import (
     self_feature_dim,
 )
 from .game_types import PlanetState
-from .opponents import SelfPlayOpponent, build_opponent
 from .policy import PlanetPolicy
 from .ppo import TransitionBatch, ppo_update, sample_actions
+from .vec_env import SubprocVecEnv
 
 
 # Groups all planet decisions that happened within one game tick for one env.
@@ -53,7 +52,7 @@ def seed_everything(seed: int) -> None:
 
 
 def collect_rollout(
-    envs: list[OrbitWarsEnv],
+    vec_env: SubprocVecEnv,
     # batches: current observation for each env (one TurnBatch per env, updated each tick).
     # Returned at the end so the next call can resume from where each env left off.
     batches: list[TurnBatch],
@@ -72,9 +71,9 @@ def collect_rollout(
     log_probs: list[float] = []
     values: list[float] = []        # V(s_t) for each row — used to compute A_t = G_t - V(s_t)
     # Per-env list of StepGroups; used later to assign returns/advantages to each row.
-    groups_per_env: list[list[StepGroup]] = [[] for _ in envs]
+    groups_per_env: list[list[StepGroup]] = [[] for _ in range(len(vec_env))]
     episode_rewards: list[float] = []
-    running_episode_rewards = [0.0 for _ in envs]
+    running_episode_rewards = [0.0 for _ in range(len(vec_env))]
 
     for _ in range(cfg.ppo.rollout_steps):
         # Merge all per-env TurnBatches into one tensor for a single batched forward pass.
@@ -100,8 +99,10 @@ def collect_rollout(
             sampled_target_index = np.zeros((0,), dtype=np.int64)
             sampled_log_prob = np.zeros((0,), dtype=np.float32)
 
-        next_batches: list[TurnBatch] = []
-        for env_idx, env in enumerate(envs):
+        # Phase 1: fill training buffer and compute moves for all envs.
+        moves_per_env: list[list] = []
+        group_indices_per_env: list[list[int]] = []
+        for env_idx in range(len(vec_env)):
             batch = batches[env_idx]
             start = int(offsets[env_idx])
             moves = []
@@ -142,19 +143,30 @@ def collect_rollout(
                 moves.append(
                     [context.source_id, float(context.target_angles[tgt_idx]), ships]
                 )
-            result = env.step(moves)
+            moves_per_env.append(moves)
+            group_indices_per_env.append(group_indices)
+
+        # Phase 2: dispatch all env steps in parallel, then collect.
+        vec_env.step_async(moves_per_env)
+        results = vec_env.step_wait()
+
+        # Phase 3: process results; reset done envs (rare, so serial is fine).
+        next_batches: list[TurnBatch] = []
+        for env_idx, result in enumerate(results):
             running_episode_rewards[env_idx] += float(result.reward)
             # Link this tick's row indices to the reward received so we can compute returns later.
             groups_per_env[env_idx].append(
                 StepGroup(
-                    indices=group_indices, reward=float(result.reward), done=result.done
+                    indices=group_indices_per_env[env_idx],
+                    reward=float(result.reward),
+                    done=result.done,
                 )
             )
             if result.done:
                 episode_rewards.append(running_episode_rewards[env_idx])
                 running_episode_rewards[env_idx] = 0.0
                 next_seed += 1
-                next_batch = env.reset(seed=next_seed)
+                next_batch = vec_env.reset_one(env_idx, seed=next_seed)
             else:
                 next_batch = result.batch
             next_batches.append(next_batch)
@@ -316,15 +328,13 @@ def main() -> None:
     cfg = load_train_config(args.config)
     seed_everything(cfg.seed)
     device = resolve_device(cfg.device)
-    opponent = build_opponent(cfg.opponent, cfg=cfg, device=device)
-    envs = [
-        OrbitWarsEnv(cfg, opponent, env_index=idx) for idx in range(cfg.ppo.num_envs)
-    ]
+
+    vec_env = SubprocVecEnv(cfg.ppo.num_envs, cfg, cfg.opponent, worker_device="cpu")
     next_seed = cfg.seed
-    batches = []
-    for env in envs:
-        batches.append(env.reset(seed=next_seed))
-        next_seed += 1
+    seeds = list(range(next_seed, next_seed + cfg.ppo.num_envs))
+    next_seed += cfg.ppo.num_envs
+    batches = vec_env.reset_all(seeds)
+
     policy = PlanetPolicy(
         self_dim=self_feature_dim(),
         candidate_dim=candidate_feature_dim(),
@@ -332,39 +342,40 @@ def main() -> None:
         candidate_count=cfg.env.candidate_count,
         hidden_size=cfg.model.hidden_size,
     ).to(device)
-    if isinstance(opponent, SelfPlayOpponent):
-        opponent.sync_from(policy)
+    if cfg.opponent == "self":
+        vec_env.sync_opponent(policy.state_dict())
     optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.ppo.lr)
     save_dir = Path(cfg.save_dir)
-    for update in range(1, cfg.ppo.total_updates + 1):
-        batch, batches, next_seed, stats = collect_rollout(
-            envs, batches, policy, cfg, device, next_seed
-        )
-        metrics = ppo_update(
-            policy,
-            optimizer,
-            batch,
-            clip_coef=cfg.ppo.clip_coef,
-            ent_coef=cfg.ppo.ent_coef,
-            vf_coef=cfg.ppo.vf_coef,
-            max_grad_norm=cfg.ppo.max_grad_norm,
-            epochs=cfg.ppo.epochs,
-            minibatch_size=cfg.ppo.minibatch_size,
-            device=device,
-        )
-        if (
-            isinstance(opponent, SelfPlayOpponent)
-            and update % cfg.self_play_update_interval == 0
-        ):
-            opponent.sync_from(policy)
-        if update % cfg.log_every == 0:
-            print(
-                f"update={update} episode_reward_mean={stats['episode_reward_mean']:.4f} "
-                f"episodes={int(stats['episodes_finished'])} samples={int(stats['samples'])} "
-                f"loss={metrics['loss']:.4f}"
+
+    try:
+        for update in range(1, cfg.ppo.total_updates + 1):
+            batch, batches, next_seed, stats = collect_rollout(
+                vec_env, batches, policy, cfg, device, next_seed
             )
-        if update % cfg.checkpoint_every == 0 or update == cfg.ppo.total_updates:
-            save_checkpoint(save_dir, cfg.run_name, update, policy, optimizer, cfg)
+            metrics = ppo_update(
+                policy,
+                optimizer,
+                batch,
+                clip_coef=cfg.ppo.clip_coef,
+                ent_coef=cfg.ppo.ent_coef,
+                vf_coef=cfg.ppo.vf_coef,
+                max_grad_norm=cfg.ppo.max_grad_norm,
+                epochs=cfg.ppo.epochs,
+                minibatch_size=cfg.ppo.minibatch_size,
+                device=device,
+            )
+            if cfg.opponent == "self" and update % cfg.self_play_update_interval == 0:
+                vec_env.sync_opponent(policy.state_dict())
+            if update % cfg.log_every == 0:
+                print(
+                    f"update={update} episode_reward_mean={stats['episode_reward_mean']:.4f} "
+                    f"episodes={int(stats['episodes_finished'])} samples={int(stats['samples'])} "
+                    f"loss={metrics['loss']:.4f}"
+                )
+            if update % cfg.checkpoint_every == 0 or update == cfg.ppo.total_updates:
+                save_checkpoint(save_dir, cfg.run_name, update, policy, optimizer, cfg)
+    finally:
+        vec_env.close()
 
 
 if __name__ == "__main__":

@@ -33,6 +33,12 @@ class GameState:
     player: int
     planets: list[PlanetState]
     fleets: list[FleetState]
+    angular_velocity: float = 0.0
+    comet_paths: dict[int, list] = None  # planet_id -> [[x,y], ...] remaining waypoints
+
+    def __post_init__(self):
+        if self.comet_paths is None:
+            self.comet_paths = {}
 
 
 def parse_observation(observation: Any) -> GameState:
@@ -65,9 +71,18 @@ def parse_observation(observation: Any) -> GameState:
         )
         for row in obs_get("fleets", [])
     ]
+    comet_paths: dict[int, list] = {}
+    for group in obs_get("comets", []):
+        g = group if isinstance(group, dict) else vars(group)
+        idx = g.get("path_index", -1)
+        for pid, path in zip(g.get("planet_ids", []), g.get("paths", [])):
+            comet_paths[int(pid)] = path[idx + 1:]
+
     return GameState(
         step=int(obs_get("step", 0)),
         player=int(obs_get("player", 0)),
         planets=planets,
         fleets=fleets,
+        angular_velocity=float(obs_get("angular_velocity", 0.0)),
+        comet_paths=comet_paths,
     )

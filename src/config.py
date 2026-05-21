@@ -57,7 +57,7 @@ class TrainConfig:
 
 
 def default_train_config_path() -> Path:
-    return Path(__file__).resolve().parent / "configs" / "default.yaml"
+    return Path(__file__).resolve().parent / "configs" / "default_cfg.yaml"
 
 
 def load_train_config(path: str | Path) -> TrainConfig:
