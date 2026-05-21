@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from game_context import GameContext
-from helper import MAX_TICKS
+from src.game_context import GameContext
+from src.helper import MAX_TICKS
 
 
 class BaseStatefulAgent(ABC):

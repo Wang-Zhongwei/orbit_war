@@ -3,11 +3,10 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-from ..configs import StatefulAgentConfig
-from helper import DirectedFleet, distance, fleet_speed
-from game_context import GameContext
+from src.config import StatefulAgentConfig
+from src.helper import DirectedFleet, distance, fleet_speed
+from src.game_context import GameContext
 from .base import BaseStatefulAgent
-
 
 @contextmanager
 def record_target_scores(agent):
@@ -38,18 +37,28 @@ class StatefulAgent(BaseStatefulAgent):
         self.cfg = config or StatefulAgentConfig()
         super().__init__(max_tick=self.cfg.max_tick)
 
-    def target_score(self, src, tgt) -> float:
-        dist  = distance(src, tgt)
+    def target_score(self, src, tgt, use_actual_time: bool = False) -> float:
         cfg   = self.cfg
         base  = tgt.ships + 1
-        time  = dist / fleet_speed(base)
+
+        # add extra time if planet is rotating away from the source planet
+        if use_actual_time: 
+            _, time, _ = self._ctx.aim(src, tgt, base)
+            if time is None:
+                time = distance(src, tgt) / fleet_speed(base)
+        else:
+            time = distance(src, tgt) / fleet_speed(base)
+
         prod  = tgt.production
         enemy = tgt.owner != -1
         remaining = len(self._ctx.comet_paths.get(tgt.id, []))
         is_comet  = tgt.id in self._ctx.comet_ids
+        # rank_fraction = self._ctx.planet_rank_fraction.get(tgt.id, 0.5) # 0: for core planets, 1: for boundary planets
+
         return (
             _PROD_MULT * prod
             + (cfg.enemy_bonus * prod if enemy else 0)
+            # + cfg.boundary_score * rank_fraction
             - cfg.ships_penalty * (base + (time * prod if enemy else 0))
             - cfg.time_penalty * time
             - (cfg.comet_penalty / (remaining + 1) if is_comet else 0)
@@ -85,7 +94,7 @@ class StatefulAgent(BaseStatefulAgent):
             candidates = [p for p in my_planets if p.id != comet_src.id]
             if not candidates:
                 continue
-            closest = min(candidates, key=lambda p: (p.x - comet_src.x) ** 2 + (p.y - comet_src.y) ** 2)
+            closest = min(candidates, key=lambda p: distance(p, comet_src))
             angle, arrive_tick, is_blocked = ctx.aim(comet_src, closest, comet_src.ships)
             if angle is not None and not is_blocked:
                 moves.append([comet_src.id, angle, comet_src.ships])
@@ -93,13 +102,13 @@ class StatefulAgent(BaseStatefulAgent):
                 ctx.record_fleet(comet_src, closest, angle, comet_src.ships, arrive_tick)
 
         # ── Phase 1: Defence ─────────────────────────────────────────────────
-        for p, plan in ctx.reinforcements_needed(min_ships).items():
+        for p, plan in sorted(ctx.reinforcements_needed(min_ships).items(), key=lambda item: item[0].production, reverse=True):
             ships_needed   = plan["ships_needed"]
             needed_by_tick = plan["needed_by_tick"]
 
             helpers = sorted(
                 [m for m in my_planets if m.id != p.id and m.id not in used_ids],
-                key=lambda m: (m.x - p.x) ** 2 + (m.y - p.y) ** 2,
+                key=lambda m: distance(m, p),
             )
 
             for helper in helpers:
@@ -169,7 +178,7 @@ class StatefulAgent(BaseStatefulAgent):
                     mine_en_route.append(DirectedFleet(ctx.player, src.id, tgt.id, src_angle, src_avail, src_arrive))
                     found = False
 
-                    for h in sorted(my_planets, key=lambda p: (p.x - tgt.x) ** 2 + (p.y - tgt.y) ** 2):
+                    for h in sorted(my_planets, key=lambda p: distance(p, tgt)):
                         if h.id == src.id or h.id in used_ids:
                             continue
 

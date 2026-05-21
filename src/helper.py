@@ -17,6 +17,8 @@ from functools import cache
 import math
 from typing import NamedTuple
 
+import numpy as np
+
 from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet, SUN_RADIUS, CENTER, ROTATION_RADIUS_LIMIT, point_to_segment_distance
 
 DirectedFleet = NamedTuple("DirectedFleet", [("owner", int), ("src_id", int), ("tgt_id", int), ("angle", float), ("ships", int), ("arrive_tick", int)])
@@ -92,56 +94,81 @@ def planet_trajectory(p, ticks: int, angular_velocity: float) -> list[tuple[floa
     """Return a list of (x, y) positions for a moving planet over `ticks` turns."""
     return [predict_planet_position(p, t, angular_velocity) for t in range(1, ticks + 1)]
 
-def _seg_seg_min_dist(ax: float, ay: float, bx: float, by: float,
-                      cx: float, cy: float, dx: float, dy: float) -> float:
-    """Minimum distance between segment AB and segment CD."""
-    rx, ry = bx - ax, by - ay
-    sx, sy = dx - cx, dy - cy
-    denom = rx * sy - ry * sx
-    if abs(denom) > 1e-10:
-        t = ((cx - ax) * sy - (cy - ay) * sx) / denom
-        u = ((cx - ax) * ry - (cy - ay) * rx) / denom
-        if 0.0 <= t <= 1.0 and 0.0 <= u <= 1.0:
-            return 0.0
-    return min(
-        point_to_segment_distance((ax, ay), (cx, cy), (dx, dy)),
-        point_to_segment_distance((bx, by), (cx, cy), (dx, dy)),
-        point_to_segment_distance((cx, cy), (ax, ay), (bx, by)),
-        point_to_segment_distance((dx, dy), (ax, ay), (bx, by)),
-    )
+def _pt_seg_dist_sq(px: float, py: float,
+                    ax: float, ay: float, bx: float, by: float) -> float:
+    """Squared distance from point (px,py) to segment (ax,ay)-(bx,by). No sqrt."""
+    rx = bx - ax
+    ry = by - ay
+    len2 = rx * rx + ry * ry
+    if len2 == 0.0:
+        return (px - ax) * (px - ax) + (py - ay) * (py - ay)
+    t = ((px - ax) * rx + (py - ay) * ry) / len2
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
+    dx = px - (ax + t * rx)
+    dy = py - (ay + t * ry)
+    return dx * dx + dy * dy
 
 
 def path_blocked(sx: float, sy: float, ex: float, ey: float, ticks: int, spd: float,
                   blockers: list, traj_cache: dict) -> bool:
     """Return True if the fleet collides with any blocker during any tick interval [t-1, t].
 
-    At each tick interval, checks the minimum distance between the fleet's path segment
-    and the planet's path segment (or point for static planets) against p.radius.
-    traj_cache[p.id][t-1] is the planet's position at tick t; its position at tick 0
-    is (p.x, p.y).
+    Static blockers: fleet path is a straight line so one segment check covers all ticks.
+    Moving blockers: per-tick seg-seg check with hoisted fleet positions and squared-distance
+    comparisons (no sqrt).
     """
     dist_total = math.hypot(ex - sx, ey - sy)
     if dist_total == 0:
         return False
     ux = (ex - sx) / dist_total
     uy = (ey - sy) / dist_total
+    end_x = sx + ux * spd * ticks
+    end_y = sy + uy * spd * ticks
+
+    # Precompute fleet positions once for all moving blockers
+    fleet_x: list[float] = []
+    fleet_y: list[float] = []
+
     for p in blockers:
         ptraj = traj_cache.get(p.id, [])
-        for t in range(1, ticks + 1):
-            pfx = sx + ux * spd * (t - 1)
-            pfy = sy + uy * spd * (t - 1)
-            fx  = sx + ux * spd * t
-            fy  = sy + uy * spd * t
-            if ptraj:
-                if t > len(ptraj):
-                    break
-                px, py   = ptraj[t - 1]
-                ppx, ppy = ptraj[t - 2] if t > 1 else (p.x, p.y)
-                if _seg_seg_min_dist(pfx, pfy, fx, fy, ppx, ppy, px, py) <= p.radius:
+        r = p.radius
+        if not ptraj:
+            # Static blocker: full path is a straight line — one check covers all ticks
+            if point_to_segment_distance((p.x, p.y), (sx, sy), (end_x, end_y)) <= r:
+                return True
+        else:
+            n = min(ticks, len(ptraj))
+            if n == 0:
+                continue
+            # Lazy-build fleet position list on first moving blocker encountered
+            if not fleet_x:
+                fleet_x = [sx + ux * spd * t for t in range(ticks + 1)]
+                fleet_y = [sy + uy * spd * t for t in range(ticks + 1)]
+            r2 = r * r
+            ppx, ppy = p.x, p.y
+            for i in range(n):
+                fax = fleet_x[i];  fay = fleet_y[i]
+                fbx = fleet_x[i + 1]; fby = fleet_y[i + 1]
+                px, py = ptraj[i]
+                # Fast: check if segments intersect (distance = 0)
+                drx = fbx - fax; dry = fby - fay
+                dsx = px - ppx;  dsy = py - ppy
+                denom = drx * dsy - dry * dsx
+                if abs(denom) > 1e-10:
+                    tt = ((ppx - fax) * dsy - (ppy - fay) * dsx) / denom
+                    uu = ((ppx - fax) * dry - (ppy - fay) * drx) / denom
+                    if 0.0 <= tt <= 1.0 and 0.0 <= uu <= 1.0:
+                        return True
+                # Slow: min of 4 endpoint-to-segment squared distances
+                if (_pt_seg_dist_sq(ppx, ppy, fax, fay, fbx, fby) <= r2 or
+                    _pt_seg_dist_sq(px,  py,  fax, fay, fbx, fby) <= r2 or
+                    _pt_seg_dist_sq(fax, fay, ppx, ppy, px,  py)  <= r2 or
+                    _pt_seg_dist_sq(fbx, fby, ppx, ppy, px,  py)  <= r2):
                     return True
-            else:
-                if point_to_segment_distance((p.x, p.y), (pfx, pfy), (fx, fy)) <= p.radius:
-                    return True
+                ppx, ppy = px, py
     return False
 
 

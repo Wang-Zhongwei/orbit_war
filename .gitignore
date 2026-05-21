@@ -3,3 +3,5 @@ results/
 .claude/
 secrets
 submission/*
+episodes/*
+artifacts/*

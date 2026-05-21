@@ -15,7 +15,7 @@ from collections.abc import Iterable, Sequence
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
-from agents.rule_based import nearest_planet_sniper, roi_agent, never_miss_agent, stateful_agent, agent_1000_score  # noqa: E402
+from src.agents.rule_based import nearest_planet_sniper, roi_agent, never_miss_agent, stateful_agent, agent_1000_score  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # submission/1000_score.py — load with isolated module state and reset wrapper
@@ -50,11 +50,11 @@ def _load_submission(name: str):
     spec.loader.exec_module(mod)
     return mod
 
-
 _v2_mod = _load_submission("stateful_v2")
 _v3_mod = _load_submission("stateful_v3")
 _v5_mod = _load_submission("stateful_v5")
 _v51_mod = _load_submission("stateful_v5.1")
+_v52_mod = _load_submission("stateful_v5.2")
 
 
 def sub_stateful_v2(obs) -> list:
@@ -72,6 +72,8 @@ def sub_stateful_v5(obs) -> list:
 def sub_stateful_v51(obs) -> list:
     return _v51_mod.agent(obs)
 
+def sub_stateful_v52(obs) -> list:
+    return _v52_mod.agent(obs)
 
 # ---------------------------------------------------------------------------
 # Agent registry
@@ -87,6 +89,7 @@ AGENTS: dict[str, object] = {
     "sub_v3":       sub_stateful_v3,
     "sub_v5":       sub_stateful_v5,
     "sub_v51":      sub_stateful_v51,
+    "sub_v52":      sub_stateful_v52,
     "random":       "random",
 }
 

@@ -38,6 +38,7 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 from evaluation import AGENTS, run_match_raw, format_head_to_head_matrix
+from src.agents.rl.ppo_agent import make_ppo_agent
 
 
 CSV_HEADER: list[str] = [
@@ -52,6 +53,23 @@ DEFAULT_CSV = Path(__file__).parent / "results" / "matches.csv"
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _register_ppo_agent(
+    cfg_path: str,
+    checkpoint: str | None,
+    device: str,
+    deterministic: bool,
+    name: str = "ppo",
+) -> None:
+    """Build a PPO agent from checkpoint and register it in AGENTS under ``name``."""
+    import torch
+    from src.config import load_train_config
+    cfg = load_train_config(cfg_path)
+    dev_name = device if device != "auto" else cfg.device
+    dev = torch.device("cuda" if dev_name == "auto" and torch.cuda.is_available() else
+                       "cuda" if dev_name == "cuda" else "cpu")
+    AGENTS[name] = make_ppo_agent(cfg, checkpoint, dev, deterministic=deterministic)
+
 
 def _resolve_agents(names: Sequence[str]) -> None:
     for name in names:
@@ -88,6 +106,7 @@ def play_match(
     episode_steps: int = 500,
     csv_path: Path = DEFAULT_CSV,
     match_id: str | None = None,
+    replay_path: Path | None = None,
     _row_buffer: list[list] | None = None,
 ) -> dict:
     """Run one match and return a result dict.
@@ -101,7 +120,16 @@ def play_match(
 
     _resolve_agents(agent_names)
 
-    raw = run_match_raw(agent_names, seed, episode_steps=episode_steps)
+    raw = run_match_raw(list(agent_names), seed, episode_steps=episode_steps)
+
+    if replay_path is not None:
+        from kaggle_environments import make
+        fns = [AGENTS[a] if isinstance(a, str) else a for a in agent_names]
+        env = make("orbit_wars", configuration={"seed": int(seed), "episodeSteps": int(episode_steps)}, debug=False)
+        env.run(fns)
+        replay_path = Path(replay_path)
+        replay_path.parent.mkdir(parents=True, exist_ok=True)
+        replay_path.write_text(env.render(mode="html"), encoding="utf-8")
 
     n = len(agent_names)
     if match_id is None:
@@ -261,21 +289,35 @@ def _build_parser() -> argparse.ArgumentParser:
     p_list = sub.add_parser("list", help="List registered agents.")
     p_list.set_defaults(_handler="list")
 
+    def _add_ppo_args(p: argparse.ArgumentParser) -> None:
+        g = p.add_argument_group("RL agent (optional)")
+        g.add_argument("--checkpoint", type=str, default=None,
+                       help="Path to a .pt checkpoint. Registers a 'ppo' agent (or --ppo-name).")
+        g.add_argument("--config", type=str, default=None,
+                       help="Path to train config YAML (default: src default).")
+        g.add_argument("--device", type=str, default="auto")
+        g.add_argument("--deterministic", action="store_true")
+        g.add_argument("--ppo-name", type=str, default="ppo",
+                       help="Registry key used for the loaded RL agent (default: ppo).")
+
     p_match = sub.add_parser("match", help="Run a single match.")
     p_match.add_argument(
-        "--agents", nargs="+", required=True, choices=sorted(AGENTS),
-        help="Agent names in slot order. Length must be 2 or 4.",
+        "--agents", nargs="+", required=True,
+        help="Agent names in slot order (length 2 or 4). Use 'ppo' for the RL agent.",
     )
     p_match.add_argument("--seed", type=int, default=0)
     p_match.add_argument("--out", type=Path, default=DEFAULT_CSV)
     p_match.add_argument("--episode-steps", type=int, default=500)
+    p_match.add_argument("--replay", type=Path, default=None,
+                         help="Save HTML replay to this path.")
+    _add_ppo_args(p_match)
     p_match.set_defaults(_handler="match")
 
     real_agents = [a for a in AGENTS if a != "random"]
     p_tour = sub.add_parser("tournament", help="Round-robin 1v1 with slot rotation.")
     p_tour.add_argument(
-        "--agents", nargs="+", default=real_agents, choices=sorted(AGENTS),
-        help=f"Agents to include (default: {real_agents}).",
+        "--agents", nargs="+", default=real_agents,
+        help=f"Agents to include (default: {real_agents}). Use 'ppo' for the RL agent.",
     )
     p_tour.add_argument("--rounds", type=int, default=10,
                         help="Number of seed rounds. Each round = (#pairs * 2) matches.")
@@ -287,6 +329,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_tour.add_argument("--workers", type=int, default=1,
                         help="Number of worker processes (default 1).")
     p_tour.add_argument("--quiet", action="store_true")
+    _add_ppo_args(p_tour)
     p_tour.set_defaults(_handler="tournament")
 
     return p
@@ -302,6 +345,12 @@ def main(argv: Iterable[str] | None = None) -> int:
             print(f"  {k:<12} -> {shown}")
         return 0
 
+    # Register RL agent before any agent resolution.
+    if getattr(args, "checkpoint", None) is not None:
+        from src.config import default_train_config_path
+        cfg_path = args.config or str(default_train_config_path())
+        _register_ppo_agent(cfg_path, args.checkpoint, args.device, args.deterministic, args.ppo_name)
+
     if args._handler == "match":
         if len(args.agents) not in (2, 4):
             print("Orbit Wars supports 2 or 4 player matches.", file=sys.stderr)
@@ -314,6 +363,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             seed=args.seed,
             episode_steps=args.episode_steps,
             csv_path=args.out,
+            replay_path=args.replay,
         )
         print(
             f"match_id={res['match_id']}  seed={res['seed']}  "
@@ -321,6 +371,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             f"ranks={res['ranks']}  outcomes={[round(o, 2) for o in res['outcomes']]}  "
             f"wall={res['wall_time_s']:.2f}s"
         )
+        if args.replay:
+            print(f"replay saved to {args.replay}")
         return 0
 
     if args._handler == "tournament":

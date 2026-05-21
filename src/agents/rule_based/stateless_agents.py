@@ -40,9 +40,9 @@ from dataclasses import dataclass
 
 from kaggle_environments.envs.orbit_wars.orbit_wars import CENTER, SUN_RADIUS, Planet, point_to_segment_distance
 
-from ..configs import AgentConfig
-from game_context import GameContext
-from helper import (
+from src.config import AgentConfig
+from src.game_context import GameContext
+from src.helper import (
     aim_for_planet,
     distance,
     fleet_speed,

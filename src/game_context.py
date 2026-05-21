@@ -11,7 +11,7 @@ from kaggle_environments.envs.orbit_wars.orbit_wars import (
     point_to_segment_distance,
 )
 
-from helper import (
+from src.helper import (
     DirectedFleet,
     MAX_TICKS,
     path_blocked,
@@ -70,6 +70,8 @@ class GameContext:
         self.step: int = 0
 
         self._under_attack_cache: dict | None = None
+        self.planet_rank_fraction: dict[int, float] = {}
+        self._player_centroids: dict[int, tuple[float, float]] = {}
 
     def reset(self) -> None:
         """Clear cross-turn state at game start (call when obs.step == 0)."""
@@ -117,6 +119,53 @@ class GameContext:
         self._refresh_my_fleets()
 
         self._under_attack_cache = None
+
+        # Tally fleet ships, planet ships, and planet count per player.
+        self.player_strength: dict[int, dict] = {}
+        for pid in range(4):
+            p_ships = sum(p.ships for p in planets if p.owner == pid)
+            f_ships = sum(f.ships for f in fleets if f.owner == pid)
+            self.player_strength[pid] = {
+                "planets": sum(1 for p in planets if p.owner == pid),
+                "production": sum(p.production for p in planets if p.owner == pid),
+                "planet_ships": p_ships,
+                "fleet_ships": f_ships,
+                "total": p_ships + f_ships,
+            }
+
+        # calculate the centroid of each player
+        self._player_centroids.clear() # player -> (centroid_x, centroid_y)
+        self.planet_rank_fraction.clear() # planet_id -> rank / tot_planets of that player
+        for player in range(4):
+            player_planets = [p for p in self.planets if p.owner == player]
+            # compute weighted average of the centroids
+            centroid_x, centroid_y = 0, 0
+            tot_ships = 0
+
+            for planet in player_planets:
+                centroid_x += planet.x * planet.ships
+                centroid_y += planet.y * planet.ships
+                tot_ships += planet.ships
+
+            if tot_ships > 0:
+                centroid_x /= tot_ships
+                centroid_y /= tot_ships
+                self._player_centroids[player] = (centroid_x, centroid_y)
+            
+
+            if player not in self._player_centroids:
+                continue
+
+            # compute the distance from each player's planet to the centroid and rank (0=closest)
+            cx, cy = self._player_centroids[player]
+            distances_to_centroid = sorted(
+                [(math.hypot(planet.x - cx, planet.y - cy), planet.id) for planet in player_planets],
+                key=lambda x: x[0],
+            )
+            n = len(distances_to_centroid)
+            for i, (_, pid) in enumerate(distances_to_centroid):
+                self.planet_rank_fraction[pid] = i / n
+
 
     # todo: what if miss the target?
     def _refresh_my_fleets(self) -> None:
@@ -273,6 +322,37 @@ class GameContext:
             last_arrive_tick = batch_tick
         
         return last_owner == self.player
+
+    def ships_to_defend(
+        self, p, mine_en_route: list[DirectedFleet], enemy_en_route: list[DirectedFleet],
+        min_ships: int, helper
+    ) -> tuple[float | None, int | None, int | None]:
+        """Find minimum ships to send from helper so that p stays owned by the player.
+
+        Returns (angle, ships, arrive_tick), or (None, None, None) if helper cannot save p.
+        """
+        lo, hi = min_ships, 200
+        while lo < hi:
+            mid = (lo + hi) // 2
+            angle, arrive_tick, is_blocked = self.aim(helper, p, mid)
+            if arrive_tick is None:
+                lo = mid + 1
+                continue
+            new_fleet = DirectedFleet(self.player, helper.id, p.id, angle, mid, arrive_tick)
+            if self.is_capture_possible(p, mine_en_route + enemy_en_route + [new_fleet]):
+                hi = mid
+            else:
+                lo = mid + 1
+
+        angle, arrive_tick, is_blocked = self.aim(helper, p, lo)
+        if arrive_tick is None or is_blocked:
+            return None, None, None
+
+        new_fleet = DirectedFleet(self.player, helper.id, p.id, angle, lo, arrive_tick)
+        if not self.is_capture_possible(p, mine_en_route + enemy_en_route + [new_fleet]):
+            return None, None, None
+
+        return angle, lo, arrive_tick
 
     def ships_to_capture(
         self, src, tgt, mine_en_route: list[DirectedFleet], enemy_en_route: list[DirectedFleet],
