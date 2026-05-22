@@ -6,7 +6,7 @@ from typing import Any
 
 from .config import TrainConfig
 from .features import TurnBatch, encode_turn
-from .opponents import OpponentPolicy
+from .evaluation import OpponentPolicy
 
 
 @dataclass(slots=True)

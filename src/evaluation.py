@@ -1,0 +1,377 @@
+from __future__ import annotations
+
+import importlib.util
+import os
+import sys
+import time
+from collections import defaultdict
+from collections.abc import Iterable, Sequence
+from pathlib import Path
+from typing import Any, Protocol
+
+import torch
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+
+from .agents.rule_based import agent_1000_score, never_miss_agent, nearest_planet_sniper, roi_agent, stateful_agent
+from .config import TrainConfig
+from .features import candidate_feature_dim, encode_turn, global_feature_dim, self_feature_dim
+from .policy import PlanetPolicy
+from .ppo import sample_actions
+
+_SUBMISSION_DIR = Path(__file__).resolve().parent.parent / "submission"
+
+
+# ---------------------------------------------------------------------------
+# submission/1000_score.py — load with isolated module state and reset wrapper
+# ---------------------------------------------------------------------------
+_sub_spec = importlib.util.spec_from_file_location(
+    "submission_1000_score",
+    str(_SUBMISSION_DIR / "1000_score.py"),
+)
+_sub_mod = importlib.util.module_from_spec(_sub_spec)
+_sub_spec.loader.exec_module(_sub_mod)
+
+
+def sub_1000_score(obs) -> list:
+    """submission/1000_score.py agent with per-game global-state reset."""
+    if obs.get("step", 0) == 0:
+        _sub_mod.fleet_trajectories.clear()
+        _sub_mod.reinforcement_trajectories.clear()
+        _sub_mod.moving_planets.clear()
+        _sub_mod.steps = 0
+    return _sub_mod.agent(obs)
+
+
+def _load_submission(name: str):
+    mod_name = f"submission_{name}"
+    spec = importlib.util.spec_from_file_location(
+        mod_name,
+        str(_SUBMISSION_DIR / f"{name}.py"),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_v2_mod = _load_submission("stateful_v2")
+_v3_mod = _load_submission("stateful_v3")
+_v5_mod = _load_submission("stateful_v5")
+_v51_mod = _load_submission("stateful_v5.1")
+_v52_mod = _load_submission("stateful_v5.2")
+
+
+def sub_stateful_v2(obs) -> list:
+    return _v2_mod.agent(obs)
+
+
+def sub_stateful_v3(obs) -> list:
+    return _v3_mod.agent(obs)
+
+
+def sub_stateful_v5(obs) -> list:
+    return _v5_mod.agent(obs)
+
+
+def sub_stateful_v51(obs) -> list:
+    return _v51_mod.agent(obs)
+
+
+def sub_stateful_v52(obs) -> list:
+    return _v52_mod.agent(obs)
+
+
+# ---------------------------------------------------------------------------
+# Agent registry
+# ---------------------------------------------------------------------------
+AGENTS: dict[str, object] = {
+    "sniper":     nearest_planet_sniper,
+    "roi":        roi_agent,
+    "never_miss": never_miss_agent,
+    "stateful":   stateful_agent,
+    "1000_score": agent_1000_score,
+    "sub_1000":   sub_1000_score,
+    "sub_v2":     sub_stateful_v2,
+    "sub_v3":     sub_stateful_v3,
+    "sub_v5":     sub_stateful_v5,
+    "sub_v51":    sub_stateful_v51,
+    "sub_v52":    sub_stateful_v52,
+    "random":     "random",
+}
+
+
+# ---------------------------------------------------------------------------
+# Opponent classes
+# ---------------------------------------------------------------------------
+
+class OpponentPolicy(Protocol):
+    def act(self, observation: Any) -> list[list[float | int]]:
+        ...
+
+
+class StaticAgentOpponent:
+    """Wraps any callable agent function from the AGENTS registry."""
+
+    def __init__(self, agent_fn) -> None:
+        self._agent_fn = agent_fn
+
+    def act(self, observation: Any) -> list[list[float | int]]:
+        return list(self._agent_fn(observation))
+
+
+class KaggleRandomOpponent:
+    def __init__(self) -> None:
+        from kaggle_environments.envs.orbit_wars.orbit_wars import random_agent
+        self._agent = random_agent
+
+    def act(self, observation: Any) -> list[list[float | int]]:
+        payload = {
+            "player": obs_get(observation, "player", 0),
+            "planets": list(obs_get(observation, "planets", [])),
+        }
+        return list(self._agent(payload))
+
+
+class SelfPlayOpponent:
+    """Live self-play opponent — synced with the training policy each interval."""
+
+    is_live: bool = True
+
+    def __init__(self, cfg: TrainConfig, device: torch.device, deterministic: bool = True) -> None:
+        self.cfg = cfg
+        self.device = device
+        self.deterministic = deterministic
+        self.policy = PlanetPolicy(
+            self_dim=self_feature_dim(),
+            candidate_dim=candidate_feature_dim(),
+            global_dim=global_feature_dim(),
+            candidate_count=cfg.env.candidate_count,
+            hidden_size=cfg.model.hidden_size,
+        ).to(device)
+        self.policy.eval()
+
+    def sync_from(self, state_dict: dict) -> None:
+        self.policy.load_state_dict(state_dict)
+        self.policy.eval()
+
+    def act(self, observation: Any) -> list[list[float | int]]:
+        batch = encode_turn(observation, self.cfg.env, env_index=0)
+        if batch.self_features.shape[0] == 0:
+            return []
+        with torch.inference_mode():
+            outputs = self.policy(
+                torch.from_numpy(batch.self_features).to(self.device),
+                torch.from_numpy(batch.candidate_features).to(self.device),
+                torch.from_numpy(batch.global_features).to(self.device),
+                torch.from_numpy(batch.candidate_mask).to(self.device).bool(),
+            )
+            sampled = sample_actions(outputs, deterministic=self.deterministic)
+        target_indices = sampled.target_index.detach().cpu().numpy()
+        moves: list[list[float | int]] = []
+        for row_idx, context in enumerate(batch.contexts):
+            target_idx = int(target_indices[row_idx])
+            if target_idx == 0:
+                continue
+            if target_idx >= len(context.candidate_ids):
+                continue
+            if not context.candidate_mask[target_idx]:
+                continue
+            ships = int(context.ship_counts[target_idx])
+            if ships <= 0:
+                continue
+            moves.append([context.source_id, float(context.target_angles[target_idx]), ships])
+        return moves
+
+
+class CheckpointOpponent(SelfPlayOpponent):
+    """Fixed-checkpoint opponent — loaded once from disk, never synced."""
+
+    is_live: bool = False
+
+    def __init__(self, checkpoint_path: str, cfg: TrainConfig, device: torch.device) -> None:
+        super().__init__(cfg, device, deterministic=True)
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        self.policy.load_state_dict(ckpt["policy"])
+        self.policy.eval()
+
+
+def build_opponent(
+    name: str,
+    cfg: TrainConfig | None = None,
+    device: torch.device | None = None,
+) -> Any:
+    """Build an opponent by name.
+
+    Supported names:
+    - ``"self"``       live self-play (synced each interval)
+    - ``"ckpt:PATH"``  fixed checkpoint at PATH (never synced)
+    - ``"random"``     Kaggle built-in random agent
+    - any key in AGENTS (e.g. ``"never_miss"``, ``"sub_v3"``)
+    """
+    if name == "random":
+        return KaggleRandomOpponent()
+    if name == "self":
+        if cfg is None or device is None:
+            raise ValueError("cfg and device are required for self opponent")
+        return SelfPlayOpponent(cfg, device=device, deterministic=cfg.self_play_deterministic)
+    if name.startswith("ckpt:"):
+        if cfg is None or device is None:
+            raise ValueError("cfg and device are required for checkpoint opponent")
+        return CheckpointOpponent(name[5:], cfg, device)
+    if name in AGENTS:
+        fn = AGENTS[name]
+        if callable(fn):
+            return StaticAgentOpponent(fn)
+        raise ValueError(f"Agent '{name}' is registered but not callable: {fn!r}")
+    raise ValueError(
+        f"Unknown opponent {name!r}. Available: {sorted(k for k in AGENTS if k != 'random')}"
+        " + 'self' + 'random' + 'ckpt:PATH'"
+    )
+
+
+def obs_get(observation: Any, key: str, default: Any) -> Any:
+    if isinstance(observation, dict):
+        return observation.get(key, default)
+    return getattr(observation, key, default)
+
+
+# ---------------------------------------------------------------------------
+# Result interpretation helpers
+# ---------------------------------------------------------------------------
+
+def _ranks_from_rewards(rewards: Sequence[float]) -> list[int]:
+    """Dense 1-indexed ranks from rewards (higher reward = better rank)."""
+    sorted_unique = sorted(set(rewards), reverse=True)
+    rank_of = {r: i + 1 for i, r in enumerate(sorted_unique)}
+    return [rank_of[r] for r in rewards]
+
+
+def _outcomes_from_ranks(ranks: Sequence[int]) -> list[float]:
+    """Per-slot win share in [0, 1]."""
+    n = len(ranks)
+    if n <= 1:
+        return [0.5] * n
+    out: list[float] = []
+    for r in ranks:
+        ties = ranks.count(r)
+        if ties > 1:
+            shares = [max(0.0, 1.0 - (rr - 1) / (n - 1)) for rr in range(r, r + ties)]
+            out.append(sum(shares) / ties)
+        else:
+            out.append(1.0 - (r - 1) / (n - 1))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Match runner
+# ---------------------------------------------------------------------------
+
+def run_match_raw(
+    agents: Sequence,
+    seed: int,
+    *,
+    episode_steps: int = 500,
+) -> dict:
+    """Run one match without any CSV logging."""
+    from kaggle_environments import make
+
+    fns = [AGENTS[a] if isinstance(a, str) else a for a in agents]
+    n = len(fns)
+
+    env = make(
+        "orbit_wars",
+        configuration={"seed": int(seed), "episodeSteps": int(episode_steps)},
+        debug=False,
+    )
+
+    t0 = time.perf_counter()
+    env.run(fns)
+    wall_time = time.perf_counter() - t0
+
+    final = env.steps[-1]
+    rewards: list[float] = []
+    statuses: list[str] = []
+    for s in final:
+        if isinstance(s, dict):
+            r = s.get("reward")
+            rewards.append(-1 if r is None else r)
+            statuses.append(s.get("status", "UNKNOWN"))
+        else:
+            r = getattr(s, "reward", None)
+            rewards.append(-1 if r is None else r)
+            statuses.append(getattr(s, "status", "UNKNOWN"))
+
+    if all(r == -1 for r in rewards):
+        adjusted = [0.0] * n
+    else:
+        adjusted = [float(r) for r in rewards]
+
+    ranks = _ranks_from_rewards(adjusted)
+
+    bad_slots = [i for i, st in enumerate(statuses) if st != "DONE"]
+    if bad_slots:
+        good_slots = [i for i in range(n) if i not in bad_slots]
+        if good_slots:
+            good_rewards = [adjusted[i] for i in good_slots]
+            good_ranks = _ranks_from_rewards(good_rewards)
+            ranks = [n] * n
+            for j, i in enumerate(good_slots):
+                ranks[i] = good_ranks[j]
+
+    return {
+        "rewards":     rewards,
+        "statuses":    statuses,
+        "ranks":       ranks,
+        "outcomes":    _outcomes_from_ranks(ranks),
+        "num_steps":   len(env.steps),
+        "wall_time_s": wall_time,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Head-to-head evaluation
+# ---------------------------------------------------------------------------
+
+def head_to_head(matches: Iterable[dict]) -> tuple[dict, dict]:
+    """Return (wins, games) where wins[(a, b)] = matches in which a outranked b."""
+    wins: dict[tuple[str, str], float] = defaultdict(float)
+    games: dict[tuple[str, str], int] = defaultdict(int)
+    for m in matches:
+        agents = m["agents"]
+        ranks = m["ranks"]
+        n = len(agents)
+        for i in range(n):
+            for j in range(n):
+                if i == j or agents[i] == agents[j]:
+                    continue
+                games[(agents[i], agents[j])] += 1
+                if ranks[i] < ranks[j]:
+                    wins[(agents[i], agents[j])] += 1.0
+                elif ranks[i] == ranks[j]:
+                    wins[(agents[i], agents[j])] += 0.5
+    return wins, games
+
+
+def format_head_to_head_matrix(matches: Iterable[dict], agent_order: list[str]) -> str:
+    """Format a head-to-head win-rate table as a printable string."""
+    wins, games = head_to_head(matches)
+    cell_w = 14
+    name_w = max(12, max((len(a) for a in agent_order), default=0))
+    lines = ["Head-to-head win rate (row beats col):"]
+    header = " " * name_w + "".join(f"{a:>{cell_w}}" for a in agent_order)
+    lines.append(header)
+    for a in agent_order:
+        cells = []
+        for b in agent_order:
+            if a == b:
+                cells.append(f"{'-':>{cell_w}}")
+            else:
+                g = games.get((a, b), 0)
+                if g == 0:
+                    cells.append(f"{'.':>{cell_w}}")
+                else:
+                    pct = 100.0 * wins[(a, b)] / g
+                    cells.append(f"{pct:>6.1f}% ({g:>3})".rjust(cell_w))
+        lines.append(f"{a:<{name_w}}" + "".join(cells))
+    return "\n".join(lines)

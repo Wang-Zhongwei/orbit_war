@@ -5,6 +5,7 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 
+import multiprocessing
 import numpy as np
 import torch
 
@@ -34,6 +35,8 @@ class StepGroup:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=str(default_train_config_path()))
+    parser.add_argument("--resume", type=str, default=None, metavar="CKPT",
+                        help="Path to a checkpoint to resume training from")
     return parser.parse_args()
 
 
@@ -136,6 +139,7 @@ def collect_rollout(
                 group_indices.append(len(values) - 1)
                 if not is_valid_send:
                     continue
+                # todo: merge into policy or replace with hard logic (defense, offense)
                 ships = int(context.ship_counts[tgt_idx])
                 src_planet = find_planet(batch.state.planets, context.source_id)
                 if src_planet is None or src_planet.ships < ships:
@@ -329,10 +333,12 @@ def main() -> None:
     seed_everything(cfg.seed)
     device = resolve_device(cfg.device)
 
-    vec_env = SubprocVecEnv(cfg.ppo.num_envs, cfg, cfg.opponent, worker_device="cpu")
+    num_envs = cfg.ppo.num_envs if cfg.ppo.num_envs > 0 else multiprocessing.cpu_count()
+    print(f"Using {num_envs} parallel environments")
+    vec_env = SubprocVecEnv(num_envs, cfg, cfg.opponents, worker_device="cpu")
     next_seed = cfg.seed
-    seeds = list(range(next_seed, next_seed + cfg.ppo.num_envs))
-    next_seed += cfg.ppo.num_envs
+    seeds = list(range(next_seed, next_seed + num_envs))
+    next_seed += num_envs
     batches = vec_env.reset_all(seeds)
 
     policy = PlanetPolicy(
@@ -342,13 +348,23 @@ def main() -> None:
         candidate_count=cfg.env.candidate_count,
         hidden_size=cfg.model.hidden_size,
     ).to(device)
-    if cfg.opponent == "self":
-        vec_env.sync_opponent(policy.state_dict())
     optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.ppo.lr)
+
+    start_update = 1
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        policy.load_state_dict(ckpt["policy"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_update = ckpt["update"] + 1
+        print(f"Resumed from {args.resume} (update {ckpt['update']})")
+
+    if "self" in cfg.opponents:
+        vec_env.sync_opponent(policy.state_dict())
+
     save_dir = Path(cfg.save_dir)
 
     try:
-        for update in range(1, cfg.ppo.total_updates + 1):
+        for update in range(start_update, cfg.ppo.total_updates + 1):
             batch, batches, next_seed, stats = collect_rollout(
                 vec_env, batches, policy, cfg, device, next_seed
             )
@@ -364,7 +380,7 @@ def main() -> None:
                 minibatch_size=cfg.ppo.minibatch_size,
                 device=device,
             )
-            if cfg.opponent == "self" and update % cfg.self_play_update_interval == 0:
+            if "self" in cfg.opponents and update % cfg.self_play_update_interval == 0:
                 vec_env.sync_opponent(policy.state_dict())
             if update % cfg.log_every == 0:
                 print(

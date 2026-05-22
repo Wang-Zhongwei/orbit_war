@@ -1,0 +1,33 @@
+
+seed: 42
+run_name: ppo_resume_from_2000
+device: auto
+save_dir: ./artifacts
+checkpoint_every: 100
+log_every: 1
+opponents:
+  - self
+  - sub_v3
+self_play_update_interval: 100
+self_play_deterministic: false
+alternate_player_sides: true
+
+env:
+  candidate_count: 8
+  ship_bucket_count: 8
+
+model:
+  hidden_size: 128
+
+ppo:
+  rollout_steps: 64
+  num_envs: -1
+  total_updates: 4000
+  epochs: 4
+  minibatch_size: 256
+  gamma: 0.99
+  clip_coef: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  lr: 0.0003
+  max_grad_norm: 0.5

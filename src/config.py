@@ -47,13 +47,25 @@ class TrainConfig:
     save_dir: str = "artifacts/rl_template"
     checkpoint_every: int = 10
     log_every: int = 1
-    opponent: str = "random"
+    opponents: list[str] = field(default_factory=lambda: ["self"])
     self_play_update_interval: int = 10
     self_play_deterministic: bool = False
     alternate_player_sides: bool = True
     env: EnvConfig = field(default_factory=EnvConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     ppo: PPOConfig = field(default_factory=PPOConfig)
+
+    def __setstate__(self, state) -> None:
+        # Slotted dataclasses pickle state as (dict_state, slot_state) tuple
+        slot_state: dict = state[1] if isinstance(state, tuple) else state
+        if slot_state and 'opponent' in slot_state and 'opponents' not in slot_state:
+            slot_state = dict(slot_state)
+            slot_state['opponents'] = [slot_state.pop('opponent')]
+        for key, value in (slot_state or {}).items():
+            try:
+                object.__setattr__(self, key, value)
+            except AttributeError:
+                pass  # ignore slots that no longer exist
 
 
 def default_train_config_path() -> Path:
@@ -70,7 +82,10 @@ def load_train_config(path: str | Path) -> TrainConfig:
 
 def train_config_from_dict(data: dict[str, Any]) -> TrainConfig:
     cfg = TrainConfig()
-    _update_dataclass(cfg, data, skip={"env", "model", "ppo"})
+    _update_dataclass(cfg, data, skip={"env", "model", "ppo", "opponents"})
+    if "opponents" in data:
+        raw = data["opponents"]
+        cfg.opponents = [raw] if isinstance(raw, str) else list(raw)
     _update_dataclass(cfg.env, data.get("env", {}))
     _update_dataclass(cfg.model, data.get("model", {}))
     _update_dataclass(cfg.ppo, data.get("ppo", {}))
