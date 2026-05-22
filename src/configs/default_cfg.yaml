@@ -19,10 +19,10 @@ model:
 
 ppo:
   rollout_steps: 64
-  num_envs: 2
-  total_updates: 2000
+  num_envs: -1
+  total_updates: 1000
   epochs: 4
-  minibatch_size: 256
+  minibatch_size: 2048
   gamma: 0.99
   clip_coef: 0.2
   ent_coef: 0.01

@@ -13,7 +13,7 @@
             "cwd": "${workspaceFolder}",
             "args": [
                 "--config",
-                "default_cfg.yaml"
+                "src/configs/debug.yaml",
             ]
         }
     ]

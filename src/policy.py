@@ -9,8 +9,8 @@ import torch.nn as nn
 
 @dataclass(slots=True)
 class PolicyOutput:
-    target_logits: torch.Tensor
-    value: torch.Tensor
+    target_logits: torch.Tensor  # [N, K]
+    value: torch.Tensor          # [N]
 
 
 class PlanetPolicy(nn.Module):
@@ -55,19 +55,20 @@ class PlanetPolicy(nn.Module):
 
     def forward(
         self,
-        self_features: torch.Tensor,
-        candidate_features: torch.Tensor,
-        global_features: torch.Tensor,
-        candidate_mask: torch.Tensor,
+        self_features: torch.Tensor,       # [N, self_dim]
+        candidate_features: torch.Tensor,    # [N, K, candidate_dim]
+        global_features: torch.Tensor,       # [N, global_dim]
+        candidate_mask: torch.Tensor,        # [N, K]
     ) -> PolicyOutput:
-        self_hidden = self.self_encoder(self_features)
-        global_hidden = self.global_encoder(global_features)
-        candidate_hidden = self.candidate_encoder(candidate_features)
-        expanded_self = self_hidden.unsqueeze(1).expand(-1, self.candidate_count, -1)
-        expanded_global = global_hidden.unsqueeze(1).expand(-1, self.candidate_count, -1)
-        joint = torch.cat([expanded_self, expanded_global, candidate_hidden], dim=-1)
-        target_logits = self.target_head(joint).squeeze(-1)
+        # N = planet decisions, K = candidate_count, H = hidden_size
+        self_hidden = self.self_encoder(self_features)              # [N, H]
+        global_hidden = self.global_encoder(global_features)        # [N, H]
+        candidate_hidden = self.candidate_encoder(candidate_features)  # [N, K, H]
+        expanded_self = self_hidden.unsqueeze(1).expand(-1, self.candidate_count, -1)    # [N, K, H]
+        expanded_global = global_hidden.unsqueeze(1).expand(-1, self.candidate_count, -1)  # [N, K, H]
+        joint = torch.cat([expanded_self, expanded_global, candidate_hidden], dim=-1)  # [N, K, 3H]
+        target_logits = self.target_head(joint).squeeze(-1)         # [N, K, 1] -> [N, K]
         target_logits = target_logits.masked_fill(~candidate_mask, torch.finfo(target_logits.dtype).min)
-        pooled_candidates = candidate_hidden.mean(dim=1)
-        value = self.value_head(torch.cat([self_hidden, global_hidden, pooled_candidates], dim=-1)).squeeze(-1)
+        pooled_candidates = candidate_hidden.mean(dim=1)            # [N, H]
+        value = self.value_head(torch.cat([self_hidden, global_hidden, pooled_candidates], dim=-1)).squeeze(-1)  # [N]
         return PolicyOutput(target_logits=target_logits, value=value)

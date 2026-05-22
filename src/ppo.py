@@ -79,7 +79,7 @@ def ppo_update(
     device: torch.device,
 ) -> dict[str, float]:
     if batch.self_features.shape[0] == 0:
-        return {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
+        return {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "explained_variance": 0.0}
     self_features = batch.self_features.to(device)
     candidate_features = batch.candidate_features.to(device)
     global_features = batch.global_features.to(device)
@@ -88,13 +88,16 @@ def ppo_update(
     target_index = batch.target_index.to(device)
     returns = batch.returns.to(device)
     advantages = batch.advantages.to(device)
+    explained_variance = float(
+        1.0 - advantages.var(unbiased=False) / (returns.var(unbiased=False) + 1e-8)
+    )
     # Normalize advantages across the batch for stable gradient magnitudes.
     advantages = (advantages - advantages.mean()) / (
         advantages.std(unbiased=False) + 1e-8
     )
     size = self_features.shape[0]
     minibatch_size = min(size, max(1, minibatch_size))
-    metrics = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
+    metrics = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "clip_fraction": 0.0, "kl_divergence": 0.0, "explained_variance": explained_variance}
     updates = 0
     for _ in range(epochs):
         order = torch.randperm(size, device=device)
@@ -130,9 +133,14 @@ def ppo_update(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
             optimizer.step()
+            clip_fraction = ((ratio.detach() - 1.0).abs() > clip_coef).float().mean()
+            kl = (old_log_prob[idx] - new_log_prob).detach().mean()
             metrics["loss"] += float(loss.detach().cpu())
             metrics["policy_loss"] += float(policy_loss.detach().cpu())
             metrics["value_loss"] += float(value_loss.detach().cpu())
             metrics["entropy"] += float(entropy_mean.detach().cpu())
+            metrics["clip_fraction"] += float(clip_fraction.cpu())
+            metrics["kl_divergence"] += float(kl.cpu())
             updates += 1
-    return {key: value / max(updates, 1) for key, value in metrics.items()}
+    n = max(updates, 1)
+    return {key: (value if key == "explained_variance" else value / n) for key, value in metrics.items()}

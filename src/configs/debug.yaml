@@ -1,14 +1,12 @@
 
 seed: 42
-run_name: ppo_resume_from_2000
+run_name: debug
 device: auto
 save_dir: ./artifacts
-checkpoint_every: 100
+checkpoint_every: 50
 log_every: 1
-opponents:
-  - self
-  - sub_v3
-self_play_update_interval: 100
+opponents: self
+self_play_update_interval: 50
 self_play_deterministic: false
 alternate_player_sides: true
 
@@ -21,8 +19,8 @@ model:
 
 ppo:
   rollout_steps: 64
-  num_envs: -1
-  total_updates: 4000
+  num_envs: 2
+  total_updates: 100
   epochs: 4
   minibatch_size: 256
   gamma: 0.99

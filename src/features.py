@@ -38,7 +38,7 @@ def self_feature_dim() -> int:
 
 
 def candidate_feature_dim() -> int:
-    return 14
+    return 11
 
 
 def global_feature_dim() -> int:
@@ -144,7 +144,7 @@ def build_self_features(src: PlanetState, state: GameState, env_cfg: EnvConfig) 
             src.radius / 5.0,
             min(src.ships, env_cfg.max_ships) / env_cfg.max_ships,
             src.production / env_cfg.max_production,
-            1.0 if is_rotating_planet(src) else 0.0,
+            planet_angular_velocity(src, state),
             len(my_planets) / env_cfg.max_planets,
             len(enemy_planets) / env_cfg.max_planets,
             total_ships(my_planets) / (env_cfg.max_planets * env_cfg.max_ships),
@@ -192,15 +192,12 @@ def build_candidate_features(
                 1.0 if tgt.owner == -1 else 0.0,
                 1.0 if tgt.owner == state.player else 0.0,
                 1.0 if tgt.owner not in {-1, state.player} else 0.0,
-                tgt.x / env_cfg.board_size,
-                tgt.y / env_cfg.board_size,
                 dx / env_cfg.board_size,
                 dy / env_cfg.board_size,
                 distance(src, tgt) / env_cfg.board_size,
                 min(tgt.ships, env_cfg.max_ships) / env_cfg.max_ships,
                 tgt.production / env_cfg.max_production,
-                1.0 if is_rotating_planet(tgt) else 0.0,
-                1.0 if is_blocked else 0.0,
+                planet_angular_velocity(tgt, state),
                 min(src.ships, env_cfg.max_ships) / env_cfg.max_ships,
             ],
             dtype=np.float32,
@@ -246,10 +243,18 @@ def total_ships(planets: list[PlanetState]) -> float:
     return float(sum(planet.ships for planet in planets))
 
 
+MAX_ANGULAR_VELOCITY = 0.05  # rad/turn upper bound (game samples from [0.025, 0.05])
+
+
 def is_rotating_planet(planet: PlanetState) -> bool:
     dx = planet.x - CENTER
     dy = planet.y - CENTER
     orbital_radius = math.hypot(dx, dy)
     return orbital_radius + planet.radius < ROTATION_RADIUS_LIMIT
+
+
+def planet_angular_velocity(planet: PlanetState, state: GameState) -> float:
+    """Normalized angular velocity: non-zero only for rotating planets."""
+    return state.angular_velocity / MAX_ANGULAR_VELOCITY if is_rotating_planet(planet) else 0.0
 
 

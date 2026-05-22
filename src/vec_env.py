@@ -18,10 +18,10 @@ def _worker_fn(pipe: Connection, env_idx: int, cfg: TrainConfig, opponent_name: 
     env = OrbitWarsEnv(cfg, opponent, env_index=env_idx)
     try:
         while True:
-            msg = pipe.recv()
+            msg = pipe.recv() # wait for command from parent process
             cmd = msg[0]
             if cmd == "reset":
-                pipe.send(env.reset(seed=msg[1]))
+                pipe.send(env.reset(seed=msg[1])) # send back to the parent process
             elif cmd == "step":
                 pipe.send(env.step(msg[1]))
             elif cmd == "sync":
@@ -85,7 +85,7 @@ class SubprocVecEnv:
             pipe.send(("step", moves))
 
     def step_wait(self) -> list[StepResult]:
-        return [pipe.recv() for pipe in self._pipes]
+        return [pipe.recv() for pipe in self._pipes] # receive StepResult from each child process
 
     def sync_opponent(self, state_dict: dict) -> None:
         """Push updated policy weights to live self-play workers (no-op for others)."""

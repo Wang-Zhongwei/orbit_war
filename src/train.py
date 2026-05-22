@@ -8,8 +8,10 @@ from pathlib import Path
 import multiprocessing
 import numpy as np
 import torch
+import wandb
 
 from .config import TrainConfig, default_train_config_path, load_train_config
+from .agents.rl.ppo_agent import build_move
 from .features import (
     TurnBatch,
     candidate_feature_dim,
@@ -96,7 +98,7 @@ def collect_rollout(
                 )
                 sampled = sample_actions(outputs, deterministic=False)
                 row_values = outputs.value.detach().cpu().numpy()
-                sampled_target_index = sampled.target_index.detach().cpu().numpy()
+                sampled_target_index = sampled.target_index.detach().cpu().numpy() # detach from computation graph to make it fixed in PPO update
                 sampled_log_prob = sampled.log_prob.detach().cpu().numpy()
         else:
             sampled_target_index = np.zeros((0,), dtype=np.int64)
@@ -123,13 +125,6 @@ def collect_rollout(
                     if batch.self_features.shape[0] > 0
                     else 0
                 )
-                # Only send ships if the chosen target is a real, reachable planet with ships available.
-                is_valid_send = (
-                    tgt_idx > 0
-                    and tgt_idx < len(context.candidate_ids)
-                    and context.candidate_mask[tgt_idx]
-                    and int(context.ship_counts[tgt_idx]) > 0
-                )
                 target_indices.append(tgt_idx)
                 log_probs.append(
                     float(sampled_log_prob[global_idx])
@@ -137,16 +132,14 @@ def collect_rollout(
                     else 0.0
                 )
                 group_indices.append(len(values) - 1)
-                if not is_valid_send:
+                move = build_move(context, tgt_idx)
+                if move is None:
                     continue
                 # todo: merge into policy or replace with hard logic (defense, offense)
-                ships = int(context.ship_counts[tgt_idx])
                 src_planet = find_planet(batch.state.planets, context.source_id)
-                if src_planet is None or src_planet.ships < ships:
+                if src_planet is None or src_planet.ships < move[2]:
                     continue
-                moves.append(
-                    [context.source_id, float(context.target_angles[tgt_idx]), ships]
-                )
+                moves.append(move)
             moves_per_env.append(moves)
             group_indices_per_env.append(group_indices)
 
@@ -335,6 +328,20 @@ def main() -> None:
 
     num_envs = cfg.ppo.num_envs if cfg.ppo.num_envs > 0 else multiprocessing.cpu_count()
     print(f"Using {num_envs} parallel environments")
+    import dataclasses
+    wandb.init(
+        project="orbit-war",
+        name=cfg.run_name,
+        config={
+            "seed": cfg.seed,
+            "num_envs": num_envs,
+            "opponents": cfg.opponents,
+            "self_play_update_interval": cfg.self_play_update_interval,
+            **{f"env/{k}": v for k, v in dataclasses.asdict(cfg.env).items()},
+            **{f"model/{k}": v for k, v in dataclasses.asdict(cfg.model).items()},
+            **{f"ppo/{k}": v for k, v in dataclasses.asdict(cfg.ppo).items()},
+        },
+    )
     vec_env = SubprocVecEnv(num_envs, cfg, cfg.opponents, worker_device="cpu")
     next_seed = cfg.seed
     seeds = list(range(next_seed, next_seed + num_envs))
@@ -386,12 +393,29 @@ def main() -> None:
                 print(
                     f"update={update} episode_reward_mean={stats['episode_reward_mean']:.4f} "
                     f"episodes={int(stats['episodes_finished'])} samples={int(stats['samples'])} "
-                    f"loss={metrics['loss']:.4f}"
+                    f"loss={metrics['loss']:.4f} ev={metrics['explained_variance']:.3f} "
+                    f"entropy={metrics['entropy']:.3f} clip={metrics['clip_fraction']:.3f}"
+                )
+                wandb.log(
+                    {
+                        "reward/episode_mean": stats["episode_reward_mean"],
+                        "reward/episodes_finished": stats["episodes_finished"],
+                        "train/samples": stats["samples"],
+                        "train/loss": metrics["loss"],
+                        "train/policy_loss": metrics["policy_loss"],
+                        "train/value_loss": metrics["value_loss"],
+                        "train/entropy": metrics["entropy"],
+                        "train/clip_fraction": metrics["clip_fraction"],
+                        "train/kl_divergence": metrics["kl_divergence"],
+                        "train/explained_variance": metrics["explained_variance"],
+                    },
+                    step=update,
                 )
             if update % cfg.checkpoint_every == 0 or update == cfg.ppo.total_updates:
                 save_checkpoint(save_dir, cfg.run_name, update, policy, optimizer, cfg)
     finally:
         vec_env.close()
+        wandb.finish()
 
 
 if __name__ == "__main__":

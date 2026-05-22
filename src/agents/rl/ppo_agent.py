@@ -7,6 +7,7 @@ from typing import Callable
 
 import torch
 
+from src.features import DecisionContext
 from src.policy import PlanetPolicy
 from src.ppo import sample_actions
 
@@ -36,6 +37,17 @@ def _register_checkpoint_module_aliases() -> None:
             continue
         sys.modules[f"src.rl_template.{canonical}"] = module
         sys.modules[f"src.{canonical}"] = module
+
+
+def build_move(context: DecisionContext, tgt_idx: int) -> list | None:
+    if tgt_idx == 0 or tgt_idx >= len(context.candidate_ids):
+        return None
+    if not context.candidate_mask[tgt_idx]:
+        return None
+    ships = int(context.ship_counts[tgt_idx])
+    if ships <= 0:
+        return None
+    return [context.source_id, float(context.target_angles[tgt_idx]), ships]
 
 
 def build_policy(cfg, device: torch.device) -> PlanetPolicy:
@@ -73,17 +85,9 @@ def build_moves(batch, policy: PlanetPolicy, device: torch.device, deterministic
 
     moves: list = []
     for row_idx, context in enumerate(batch.contexts):
-        target_idx = int(target_indices[row_idx])
-        if target_idx == 0:
-            continue
-        if target_idx >= len(context.candidate_ids):
-            continue
-        if not context.candidate_mask[target_idx]:
-            continue
-        ships = int(context.ship_counts[target_idx])
-        if ships <= 0:
-            continue
-        moves.append([context.source_id, float(context.target_angles[target_idx]), ships])
+        move = build_move(context, int(target_indices[row_idx]))
+        if move is not None:
+            moves.append(move)
     return moves
 
 
