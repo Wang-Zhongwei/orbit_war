@@ -2,12 +2,18 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any, Protocol
 
 from src.game_context import GameContext
 from src.helper import MAX_TICKS
 
 
-class BaseStatefulAgent(ABC):
+class OpponentPolicy(Protocol):
+    def __call__(self, observation: Any) -> list:
+        ...
+
+
+class BaseStatefulAgent(OpponentPolicy, ABC):
     """Lifecycle wrapper: reset on game start, startup delay, then delegate to _run(ctx).
 
     All state and physics queries are available through the :class:`GameContext`

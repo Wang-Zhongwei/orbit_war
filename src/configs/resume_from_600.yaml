@@ -1,0 +1,31 @@
+
+seed: 42
+run_name: resume_from_600
+device: auto
+save_dir: ./artifacts
+checkpoint_every: 50
+log_every: 1
+opponents: self
+self_play_update_interval: 50
+self_play_deterministic: false
+alternate_player_sides: true
+
+env:
+  candidate_count: 8
+  ship_bucket_count: 8
+
+model:
+  hidden_size: 128
+
+ppo:
+  rollout_steps: 64
+  num_envs: -1
+  total_updates: 1000
+  epochs: 4
+  minibatch_size: 2048
+  gamma: 0.99
+  clip_coef: 0.2
+  ent_coef: 0.05
+  vf_coef: 0.5
+  lr: 0.0003
+  max_grad_norm: 0.5

@@ -178,9 +178,9 @@ def build_candidate_features(
     for idx, tgt in enumerate(candidates, start=1):
         if idx >= env_cfg.candidate_count:
             break
-        ships_needed = fixed_ship_count(src, tgt)
+        base_ships = base_ship_count(src, tgt)
         blockers = [p for p in state.planets if p.id not in {src.id, tgt.id}]
-        angle, _tick, is_blocked = find_angle(src, tgt, ships_needed, traj_cache, blockers)
+        angle, _tick, is_blocked = find_angle(src, tgt, base_ships, traj_cache, blockers)
         if angle is None:
             angle = math.atan2(tgt.y - src.y, tgt.x - src.x)
             is_blocked = True
@@ -202,8 +202,8 @@ def build_candidate_features(
             ],
             dtype=np.float32,
         )
-        ship_counts[idx] = ships_needed
-        candidate_mask[idx] = ships_needed > 0 and not is_blocked and src.ships >= ships_needed
+        ship_counts[idx] = base_ships
+        candidate_mask[idx] = not is_blocked and src.ships >= base_ships
         candidate_ids[idx] = tgt.id
         target_angles[idx] = angle
 
@@ -231,8 +231,8 @@ def build_global_features(state: GameState, env_cfg: EnvConfig) -> np.ndarray:
     )
 
 
-def fixed_ship_count(src: PlanetState, tgt: PlanetState) -> int:
-    return max(tgt.ships + 1, 20)
+def base_ship_count(src: PlanetState, tgt: PlanetState) -> int:
+    return max(tgt.ships + 1, 13)
 
 
 def distance(a: PlanetState, b: PlanetState) -> float:

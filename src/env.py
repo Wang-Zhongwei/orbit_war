@@ -6,7 +6,7 @@ from typing import Any
 
 from .config import TrainConfig
 from .features import TurnBatch, encode_turn
-from .evaluation import OpponentPolicy
+from .agents.rule_based.base import OpponentPolicy
 
 
 @dataclass(slots=True)
@@ -58,14 +58,14 @@ class OrbitWarsEnv:
     def step(self, player_action: list[list[float | int]]) -> StepResult:
         if self.env is None:
             raise RuntimeError("Call reset() before step().")
-        opponent_action = self.opponent.act(self.last_opp_obs)
+        opponent_action = self.opponent(self.last_opp_obs)
         if self.learner_player == 0:
             joint_action = [player_action, opponent_action]
         else:
             joint_action = [opponent_action, player_action]
         states = self.env.step(joint_action)
         player_state = states[self.learner_player]
-        opp_state = states[1 - self.learner_player]
+        opp_state = states[1 - self.learner_player] # todo: 1v4
         self.last_obs = extract_observation(player_state)
         self.last_opp_obs = extract_observation(opp_state)
         done = extract_status(player_state) != "ACTIVE"

@@ -7,7 +7,7 @@ import time
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 import torch
 
@@ -15,9 +15,8 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 from .agents.rule_based import agent_1000_score, never_miss_agent, nearest_planet_sniper, roi_agent, stateful_agent
 from .config import TrainConfig
-from .features import candidate_feature_dim, encode_turn, global_feature_dim, self_feature_dim
-from .policy import PlanetPolicy
-from .ppo import sample_actions
+from .agents.rl.ppo_agent import build_moves, build_policy
+from .features import encode_turn
 
 _SUBMISSION_DIR = Path(__file__).resolve().parent.parent / "submission"
 
@@ -85,6 +84,16 @@ def sub_stateful_v52(obs) -> list:
 # ---------------------------------------------------------------------------
 # Agent registry
 # ---------------------------------------------------------------------------
+def _make_random_opponent():
+    from kaggle_environments.envs.orbit_wars.orbit_wars import random_agent
+    def _random(observation: Any) -> list:
+        return list(random_agent({
+            "player": obs_get(observation, "player", 0),
+            "planets": list(obs_get(observation, "planets", [])),
+        }))
+    return _random
+
+
 AGENTS: dict[str, object] = {
     "sniper":     nearest_planet_sniper,
     "roi":        roi_agent,
@@ -97,40 +106,9 @@ AGENTS: dict[str, object] = {
     "sub_v5":     sub_stateful_v5,
     "sub_v51":    sub_stateful_v51,
     "sub_v52":    sub_stateful_v52,
-    "random":     "random",
+    "random":     _make_random_opponent(),
 }
 
-
-# ---------------------------------------------------------------------------
-# Opponent classes
-# ---------------------------------------------------------------------------
-
-class OpponentPolicy(Protocol):
-    def act(self, observation: Any) -> list[list[float | int]]:
-        ...
-
-
-class StaticAgentOpponent:
-    """Wraps any callable agent function from the AGENTS registry."""
-
-    def __init__(self, agent_fn) -> None:
-        self._agent_fn = agent_fn
-
-    def act(self, observation: Any) -> list[list[float | int]]:
-        return list(self._agent_fn(observation))
-
-
-class KaggleRandomOpponent:
-    def __init__(self) -> None:
-        from kaggle_environments.envs.orbit_wars.orbit_wars import random_agent
-        self._agent = random_agent
-
-    def act(self, observation: Any) -> list[list[float | int]]:
-        payload = {
-            "player": obs_get(observation, "player", 0),
-            "planets": list(obs_get(observation, "planets", [])),
-        }
-        return list(self._agent(payload))
 
 
 class SelfPlayOpponent:
@@ -142,46 +120,16 @@ class SelfPlayOpponent:
         self.cfg = cfg
         self.device = device
         self.deterministic = deterministic
-        self.policy = PlanetPolicy(
-            self_dim=self_feature_dim(),
-            candidate_dim=candidate_feature_dim(),
-            global_dim=global_feature_dim(),
-            candidate_count=cfg.env.candidate_count,
-            hidden_size=cfg.model.hidden_size,
-        ).to(device)
+        self.policy = build_policy(cfg, device)
         self.policy.eval()
 
     def sync_from(self, state_dict: dict) -> None:
         self.policy.load_state_dict(state_dict)
         self.policy.eval()
 
-    def act(self, observation: Any) -> list[list[float | int]]:
+    def __call__(self, observation: Any) -> list[list[float | int]]:
         batch = encode_turn(observation, self.cfg.env, env_index=0)
-        if batch.self_features.shape[0] == 0:
-            return []
-        with torch.inference_mode():
-            outputs = self.policy(
-                torch.from_numpy(batch.self_features).to(self.device),
-                torch.from_numpy(batch.candidate_features).to(self.device),
-                torch.from_numpy(batch.global_features).to(self.device),
-                torch.from_numpy(batch.candidate_mask).to(self.device).bool(),
-            )
-            sampled = sample_actions(outputs, deterministic=self.deterministic)
-        target_indices = sampled.target_index.detach().cpu().numpy()
-        moves: list[list[float | int]] = []
-        for row_idx, context in enumerate(batch.contexts):
-            target_idx = int(target_indices[row_idx])
-            if target_idx == 0:
-                continue
-            if target_idx >= len(context.candidate_ids):
-                continue
-            if not context.candidate_mask[target_idx]:
-                continue
-            ships = int(context.ship_counts[target_idx])
-            if ships <= 0:
-                continue
-            moves.append([context.source_id, float(context.target_angles[target_idx]), ships])
-        return moves
+        return build_moves(batch, self.policy, self.device, self.deterministic)
 
 
 class CheckpointOpponent(SelfPlayOpponent):
@@ -209,8 +157,6 @@ def build_opponent(
     - ``"random"``     Kaggle built-in random agent
     - any key in AGENTS (e.g. ``"never_miss"``, ``"sub_v3"``)
     """
-    if name == "random":
-        return KaggleRandomOpponent()
     if name == "self":
         if cfg is None or device is None:
             raise ValueError("cfg and device are required for self opponent")
@@ -222,11 +168,10 @@ def build_opponent(
     if name in AGENTS:
         fn = AGENTS[name]
         if callable(fn):
-            return StaticAgentOpponent(fn)
+            return fn
         raise ValueError(f"Agent '{name}' is registered but not callable: {fn!r}")
     raise ValueError(
-        f"Unknown opponent {name!r}. Available: {sorted(k for k in AGENTS if k != 'random')}"
-        " + 'self' + 'random' + 'ckpt:PATH'"
+        f"Unknown opponent {name!r}. Available: {sorted(AGENTS)} + 'self' + 'ckpt:PATH'"
     )
 
 

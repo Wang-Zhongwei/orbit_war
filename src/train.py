@@ -11,7 +11,7 @@ import torch
 import wandb
 
 from .config import TrainConfig, default_train_config_path, load_train_config
-from .agents.rl.ppo_agent import build_move
+from .agents.rl.ppo_agent import build_move, build_policy
 from .features import (
     TurnBatch,
     candidate_feature_dim,
@@ -348,13 +348,7 @@ def main() -> None:
     next_seed += num_envs
     batches = vec_env.reset_all(seeds)
 
-    policy = PlanetPolicy(
-        self_dim=self_feature_dim(),
-        candidate_dim=candidate_feature_dim(),
-        global_dim=global_feature_dim(),
-        candidate_count=cfg.env.candidate_count,
-        hidden_size=cfg.model.hidden_size,
-    ).to(device)
+    policy = build_policy(cfg, device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.ppo.lr)
 
     start_update = 1
