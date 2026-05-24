@@ -9,8 +9,12 @@ import numpy as np
 
 from .config import EnvConfig
 from .game_types import GameState, PlanetState, parse_observation
-from .helper import find_angle, planet_trajectory, MAX_TICKS
-from kaggle_environments.envs.orbit_wars.orbit_wars import CENTER, ROTATION_RADIUS_LIMIT
+from .helper import find_angle, fleet_speed, planet_trajectory, MAX_TICKS
+from .jax_env.constants import CENTER, ROTATION_RADIUS_LIMIT
+
+
+MIN_SOURCE_SHIPS: int = 13      # only generate decisions for planets with ships strictly above this
+FLEET_ANGLE_THRESHOLD: float = 0.25  # radians — max heading deviation to count a fleet as en route to a planet
 
 
 @dataclass(slots=True)
@@ -21,6 +25,7 @@ class DecisionContext:
     candidate_mask: np.ndarray
     ship_counts: list[int]
     target_angles: list[float]
+    source_ships: int
 
 
 @dataclass(slots=True)
@@ -38,7 +43,7 @@ def self_feature_dim() -> int:
 
 
 def candidate_feature_dim() -> int:
-    return 11
+    return 15
 
 
 def global_feature_dim() -> int:
@@ -52,7 +57,10 @@ def encode_turn(
     env_index: int = 0,
 ) -> TurnBatch:
     state = observation if isinstance(observation, GameState) else parse_observation(observation)
-    my_planets = sorted((planet for planet in state.planets if planet.owner == state.player), key=lambda planet: planet.id)
+    my_planets = sorted(
+        (p for p in state.planets if p.owner == state.player and p.ships > MIN_SOURCE_SHIPS),
+        key=lambda planet: planet.id,
+    )
     if not my_planets:
         return TurnBatch(
             self_features=np.zeros((0, self_feature_dim()), dtype=np.float32),
@@ -88,6 +96,7 @@ def encode_turn(
                 candidate_mask=cand_mask,
                 ship_counts=ship_counts,
                 target_angles=target_angles,
+                source_ships=src.ships,
             )
         )
 
@@ -154,6 +163,47 @@ def build_self_features(src: PlanetState, state: GameState, env_cfg: EnvConfig) 
     )
 
 
+def fleet_arrivals_for_target(
+    tgt: PlanetState,
+    fleets: list,
+    player: int,
+) -> tuple[int, float, int, float]:
+    """
+    Returns (friendly_ships, friendly_min_arrival, enemy_ships, enemy_min_arrival).
+    A fleet is considered en route when its heading is within FLEET_ANGLE_THRESHOLD of
+    the direct angle to tgt. Arrival is estimated as (dist - tgt.radius) / fleet_speed.
+    Returns 0.0 for min_arrival when no fleet of that side is detected.
+    """
+    friendly_ships = 0
+    friendly_min_arrival = math.inf
+    enemy_ships = 0
+    enemy_min_arrival = math.inf
+    for fleet in fleets:
+        dx = tgt.x - fleet.x
+        dy = tgt.y - fleet.y
+        to_tgt_angle = math.atan2(dy, dx)
+        angle_diff = abs(math.atan2(
+            math.sin(fleet.angle - to_tgt_angle),
+            math.cos(fleet.angle - to_tgt_angle),
+        ))
+        if angle_diff > FLEET_ANGLE_THRESHOLD:
+            continue
+        dist = math.hypot(dx, dy)
+        arrival = max(1.0, (dist - tgt.radius) / fleet_speed(fleet.ships))
+        if fleet.owner == player:
+            friendly_ships += fleet.ships
+            friendly_min_arrival = min(friendly_min_arrival, arrival)
+        else:
+            enemy_ships += fleet.ships
+            enemy_min_arrival = min(enemy_min_arrival, arrival)
+    return (
+        friendly_ships,
+        friendly_min_arrival if math.isfinite(friendly_min_arrival) else 0.0,
+        enemy_ships,
+        enemy_min_arrival if math.isfinite(enemy_min_arrival) else 0.0,
+    )
+
+
 def build_candidate_features(
     src: PlanetState,
     candidates: list[PlanetState],
@@ -186,6 +236,9 @@ def build_candidate_features(
             is_blocked = True
         dx = tgt.x - src.x
         dy = tgt.y - src.y
+        f_ships, f_arrival, e_ships, e_arrival = fleet_arrivals_for_target(
+            tgt, state.fleets, state.player
+        )
         features[idx] = np.asarray(
             [
                 1.0,
@@ -199,6 +252,11 @@ def build_candidate_features(
                 tgt.production / env_cfg.max_production,
                 planet_angular_velocity(tgt, state),
                 min(src.ships, env_cfg.max_ships) / env_cfg.max_ships,
+                # fleet features
+                min(f_ships, env_cfg.max_ships) / env_cfg.max_ships,
+                f_arrival / env_cfg.episode_steps,
+                min(e_ships, env_cfg.max_ships) / env_cfg.max_ships,
+                e_arrival / env_cfg.episode_steps,
             ],
             dtype=np.float32,
         )

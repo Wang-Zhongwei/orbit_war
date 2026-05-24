@@ -1,88 +1,28 @@
+"""
+src/env.py — thin re-export shim.
+
+All environment logic now lives in src/jax_env/.  This module re-exports
+OrbitWarsEnv and StepResult so that existing imports from src.env continue to
+work without changes.
+
+Legacy helper functions (extract_observation, extract_status, extract_reward,
+terminal_reward, default_make_fn) are kept here for any code that may still
+reference them directly.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
-from .config import TrainConfig
-from .features import TurnBatch, encode_turn
-from .agents.rule_based.base import OpponentPolicy
+from .jax_env.env import OrbitWarsEnv, StepResult  # noqa: F401
 
 
-@dataclass(slots=True)
-class StepResult:
-    batch: TurnBatch
-    reward: float
-    done: bool
-    info: dict[str, Any]
-
-
-class OrbitWarsEnv:
-    def __init__(
-        self,
-        cfg: TrainConfig,
-        opponent: OpponentPolicy,
-        make_fn: Any | None = None,
-        env_index: int = 0,
-    ) -> None:
-        self.cfg = cfg
-        self.opponent = opponent
-        self.make_fn = make_fn
-        self.env_index = env_index
-        self.env: Any | None = None
-        self.last_obs: Any | None = None
-        self.last_opp_obs: Any | None = None
-        self.episode_index = 0
-        self.learner_player = 0
-
-    def reset(self, seed: int | None = None) -> TurnBatch:
-        make_fn = self.make_fn or default_make_fn()
-        configuration: dict[str, Any] = {}
-        if seed is not None:
-            configuration["seed"] = int(seed)
-            configuration["randomSeed"] = int(seed)
-        if self.cfg.alternate_player_sides:
-            self.learner_player = (self.env_index + self.episode_index) % 2
-        else:
-            self.learner_player = 0
-        self.env = make_fn("orbit_wars", configuration=configuration, debug=False)
-        self.env.reset(num_agents=2)
-        states = self.env.step([[], []])
-        learner_state = states[self.learner_player]
-        opponent_state = states[1 - self.learner_player]
-        self.last_obs = extract_observation(learner_state)
-        self.last_opp_obs = extract_observation(opponent_state)
-        self.episode_index += 1
-        return encode_turn(self.last_obs, self.cfg.env, env_index=self.env_index)
-
-    def step(self, player_action: list[list[float | int]]) -> StepResult:
-        if self.env is None:
-            raise RuntimeError("Call reset() before step().")
-        opponent_action = self.opponent(self.last_opp_obs)
-        if self.learner_player == 0:
-            joint_action = [player_action, opponent_action]
-        else:
-            joint_action = [opponent_action, player_action]
-        states = self.env.step(joint_action)
-        player_state = states[self.learner_player]
-        opp_state = states[1 - self.learner_player] # todo: 1v4
-        self.last_obs = extract_observation(player_state)
-        self.last_opp_obs = extract_observation(opp_state)
-        done = extract_status(player_state) != "ACTIVE"
-        reward = terminal_reward(player_state, opp_state) if done else 0.0
-        batch = encode_turn(self.last_obs, self.cfg.env, env_index=self.env_index)
-        info = {
-            "learner_player": self.learner_player,
-            "player_status": extract_status(player_state),
-            "opponent_status": extract_status(opp_state),
-            "reward": reward,
-        }
-        return StepResult(batch=batch, reward=reward, done=done, info=info)
-
+# ---------------------------------------------------------------------------
+# Legacy helpers — kept for backward compatibility; no longer used internally
+# ---------------------------------------------------------------------------
 
 def default_make_fn() -> Any:
     from kaggle_environments import make
-
     return make
 
 

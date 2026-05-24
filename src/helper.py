@@ -19,7 +19,7 @@ from typing import NamedTuple
 
 import numpy as np
 
-from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet, SUN_RADIUS, CENTER, ROTATION_RADIUS_LIMIT, point_to_segment_distance
+from .jax_env.constants import Planet, Fleet, SUN_RADIUS, CENTER, ROTATION_RADIUS_LIMIT, point_to_segment_distance
 
 DirectedFleet = NamedTuple("DirectedFleet", [("owner", int), ("src_id", int), ("tgt_id", int), ("angle", float), ("ships", int), ("arrive_tick", int)])
 
