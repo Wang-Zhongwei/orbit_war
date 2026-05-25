@@ -63,6 +63,7 @@ def _find_angle_single(
     all_p_y: jnp.ndarray,
     all_p_r: jnp.ndarray,
     all_p_alive: jnp.ndarray,
+    all_p_is_comet: jnp.ndarray,  # [MAX_PLANETS] bool — comets are excluded as blockers
     tgt_slot: jnp.ndarray,      # int32 — to exclude from blockers
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Return (angle float32, is_blocked bool) for this (src, tgt) pair."""
@@ -78,7 +79,7 @@ def _find_angle_single(
     init_ang = jnp.arctan2(dy0, dx0)
 
     def scan_body(carry, tick):
-        best_angle, found = carry
+        best_angle, best_tx, best_ty, found = carry
         t = tick.astype(jnp.float32)
         ang_t = init_ang + angular_velocity * t
         tx = CENTER + orb_r * jnp.cos(ang_t)
@@ -86,13 +87,18 @@ def _find_angle_single(
         dx = tx - src_x
         dy = ty - src_y
         gap = spd * t - (jnp.sqrt(dx * dx + dy * dy) - src_radius)
-        valid = (~found) & (gap > -tgt_radius)
+        valid = (~found) & (jnp.abs(gap) < tgt_radius)
         angle_t = jnp.arctan2(dy, dx)
-        return (jnp.where(valid, angle_t, best_angle), found | valid), None
+        return (
+            jnp.where(valid, angle_t, best_angle),
+            jnp.where(valid, tx, best_tx),
+            jnp.where(valid, ty, best_ty),
+            found | valid,
+        ), None
 
-    (rot_angle, rot_found), _ = jax.lax.scan(
+    (rot_angle, rot_tx, rot_ty, rot_found), _ = jax.lax.scan(
         scan_body,
-        (jnp.float32(0.0), jnp.bool_(False)),
+        (jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0), jnp.bool_(False)),
         jnp.arange(1, _MAX_TICKS + 1, dtype=jnp.int32),
     )
 
@@ -103,11 +109,17 @@ def _find_angle_single(
 
     # Use static angle when: not rotating, OR rotating but no intercept found
     no_intercept = rotating & ~rot_found
-    angle = jnp.where(rotating & rot_found, rot_angle, static_angle)
+    use_rot = rotating & rot_found
+    angle = jnp.where(use_rot, rot_angle, static_angle)
 
-    # --- Blocking: segment from src centre to current target position ---
-    seg_dx = tgt_x - src_x
-    seg_dy = tgt_y - src_y
+    # --- Blocking: segment from src centre to intercept point (not current pos) ---
+    # For rotating targets the fleet aims at the predicted future position, so the
+    # collision segment must use that endpoint — using the current target position
+    # gives a wrong-direction ray that can falsely clear sun/planet hits.
+    end_x = jnp.where(use_rot, rot_tx, tgt_x)
+    end_y = jnp.where(use_rot, rot_ty, tgt_y)
+    seg_dx = end_x - src_x
+    seg_dy = end_y - src_y
     seg_l2 = seg_dx * seg_dx + seg_dy * seg_dy + 1e-30
 
     # Sun: min-distance from (CENTER, CENTER) to segment
@@ -116,11 +128,21 @@ def _find_angle_single(
     )
     proj_x = src_x + t_sun * seg_dx
     proj_y = src_y + t_sun * seg_dy
-    sun_blocked = (proj_x - CENTER) ** 2 + (proj_y - CENTER) ** 2 < SUN_RADIUS ** 2
+    sun_blocked = (proj_x - CENTER) ** 2 + (proj_y - CENTER) ** 2 <= SUN_RADIUS ** 2
 
-    # Planets: vectorised distance from each alive blocker centre to the segment
+    # Planets: only static (non-rotating, non-comet) blockers. Moving planets are
+    # ignored — their per-tick positions can't be cheaply evaluated against the
+    # straight-line segment, and a current-snapshot check produces false positives
+    # /negatives that hurt more than they help.
     planet_slots = jnp.arange(MAX_PLANETS, dtype=jnp.int32)
-    blocker_mask = all_p_alive & (planet_slots != src_slot) & (planet_slots != tgt_slot)
+    p_orb_r = jnp.hypot(all_p_x - CENTER, all_p_y - CENTER)
+    is_static = (p_orb_r + all_p_r >= ROTATION_RADIUS_LIMIT) & ~all_p_is_comet
+    blocker_mask = (
+        all_p_alive
+        & is_static
+        & (planet_slots != src_slot)
+        & (planet_slots != tgt_slot)
+    )
     t_b = jnp.clip(
         ((all_p_x - src_x) * seg_dx + (all_p_y - src_y) * seg_dy) / seg_l2, 0.0, 1.0
     )
@@ -204,7 +226,7 @@ def _make_env_encoder(K: int, env_cfg):
             def top_k(mask, k):
                 sorted_dist = jnp.where(mask & excl_mask, dist_to_src, INF)
                 slots       = jnp.argsort(sorted_dist)[:k]
-                valid       = dist_to_src[slots] < INF
+                valid       = sorted_dist[slots] < INF
                 return slots, valid
 
             is_enemy_planet   = excl_mask & (state.p_owner != -1) & (state.p_owner != player)
@@ -223,18 +245,27 @@ def _make_env_encoder(K: int, env_cfg):
         # [MAX_SRC, K], [MAX_SRC, K]
         safe_slots = jnp.clip(all_cand_slots, 0, MAX_PLANETS - 1)  # [MAX_SRC, K]
 
+        # ── Ship counts (computed first so the scan uses the SAME value) ───
+        # The intercept angle for a rotating target depends on fleet speed, which
+        # depends on the exact ship count sent. If the scan uses a different value
+        # than the policy actually sends, the predicted intercept position is off
+        # and the fleet misses tangentially. So we derive ship_counts first and
+        # feed its float cast into the angle scan.
+        tgt_ships_2d  = state.p_ships[safe_slots]                              # [MAX_SRC, K]
+        tgt_ships_int = jnp.round(tgt_ships_2d).astype(jnp.int32)
+        ship_counts   = jnp.maximum(tgt_ships_int + 1, MIN_SOURCE_SHIPS)                     # [MAX_SRC, K]
+
         # ── Find angles (flat vmap over MAX_SRC*K pairs) ──────────────────
-        src_slots_flat   = jnp.repeat(src_slots[:, None], K, axis=1).reshape(-1)  # [MAX_SRC*K]
-        tgt_slots_flat   = safe_slots.reshape(-1)                                  # [MAX_SRC*K]
-        tgt_ships_2d     = state.p_ships[safe_slots]                               # [MAX_SRC, K]
-        launch_ships_flat = jnp.maximum(tgt_ships_2d + 1.0, 13.0).reshape(-1)     # [MAX_SRC*K]
+        src_slots_flat    = jnp.repeat(src_slots[:, None], K, axis=1).reshape(-1)  # [MAX_SRC*K]
+        tgt_slots_flat    = safe_slots.reshape(-1)                                  # [MAX_SRC*K]
+        launch_ships_flat = ship_counts.astype(jnp.float32).reshape(-1)             # [MAX_SRC*K]
 
         def _angle_pair(src_slot, tgt_slot, launch_ships):
             return _find_angle_single(
                 state.p_x[src_slot], state.p_y[src_slot], state.p_radius[src_slot], src_slot,
                 state.p_x[tgt_slot], state.p_y[tgt_slot], state.p_radius[tgt_slot], state.p_is_comet[tgt_slot],
                 launch_ships, state.angular_velocity,
-                state.p_x, state.p_y, state.p_radius, state.p_alive,
+                state.p_x, state.p_y, state.p_radius, state.p_alive, state.p_is_comet,
                 tgt_slot,
             )
 
@@ -242,13 +273,11 @@ def _make_env_encoder(K: int, env_cfg):
         angles  = angles_flat.reshape(MAX_BASE_PLANETS, K)    # [MAX_SRC, K]
         blocked = blocked_flat.reshape(MAX_BASE_PLANETS, K)   # [MAX_SRC, K]
 
-        # ── Ship counts + candidate mask ──────────────────────────────────
-        tgt_ships_int = jnp.round(tgt_ships_2d).astype(jnp.int32)
-        ship_counts   = jnp.maximum(tgt_ships_int + 1, 13)                    # [MAX_SRC, K]
-        ship_counts   = ship_counts.at[:, 0].set(0)                           # no-op slot
+        # ── No-op slot ─────────────────────────────────────────────────────
+        ship_counts = ship_counts.at[:, 0].set(0)                              # no-op sends 0 ships
 
         src_ships        = jnp.round(state.p_ships[src_slots]).astype(jnp.int32)  # [MAX_SRC]
-        has_enough_ships = src_ships[:, None] >= ship_counts                       # [MAX_SRC, K]
+        has_enough_ships = src_ships[:, None] >= MIN_SOURCE_SHIPS                 # [MAX_SRC, K]
         cand_mask = (all_cand_valid & ~blocked & has_enough_ships).at[:, 0].set(True)  # no-op always valid
 
         # ── Candidate IDs ─────────────────────────────────────────────────

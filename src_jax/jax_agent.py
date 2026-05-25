@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 
 from .bc_data import obs_to_env_state
-from .features import _make_env_encoder
+from .features import MIN_SOURCE_SHIPS, _find_angle_single, _make_env_encoder
 from .physics import MAX_BASE_PLANETS, MAX_FLEETS
 from .policy import build_policy
 from .rollout import CAND_DIM, GLOB_DIM, SELF_DIM, FLEET_DIM
@@ -46,6 +46,11 @@ def _obs_to_dict(obs) -> dict:
     return {k: getattr(obs, k) for k in keys if hasattr(obs, k)}
 
 
+def _safe_target_logits(target_logits: jax.Array) -> jax.Array:
+    invalid = ~jnp.isfinite(target_logits).any(axis=-1)
+    return jnp.where(invalid[:, None], jnp.zeros_like(target_logits), target_logits)
+
+
 def make_jax_agent(
     checkpoint_path: str | Path,
     deterministic: bool = True,
@@ -65,6 +70,7 @@ def make_jax_agent(
 
     cfg    = ckpt["config"]
     params = jax.tree_util.tree_map(jnp.asarray, ckpt["params"])
+    rng_key = jax.random.PRNGKey(int(getattr(cfg, "seed", 0)))
 
     K = cfg.env.candidate_count
     B = cfg.env.ship_bucket_count
@@ -80,7 +86,25 @@ def make_jax_agent(
     def _forward(sf, cf, gf, cm, ff, fm):
         return module.apply(params, sf, cf, gf, cm, ff, fm)
 
+    @jax.jit
+    def _reaim_all(
+        p_x, p_y, p_r, p_alive, p_is_comet, angular_velocity,
+        src_slots, selected_tgt, ships_send,
+    ):
+        def _per(src_slot, tgt_slot, n_ships):
+            angle, _ = _find_angle_single(
+                p_x[src_slot], p_y[src_slot], p_r[src_slot], src_slot,
+                p_x[tgt_slot], p_y[tgt_slot], p_r[tgt_slot],
+                p_is_comet[tgt_slot],
+                n_ships.astype(jnp.float32), angular_velocity,
+                p_x, p_y, p_r, p_alive, p_is_comet, tgt_slot,
+            )
+            return angle
+        return jax.vmap(_per)(src_slots, selected_tgt, ships_send)
+
     def agent(obs) -> list:
+        nonlocal rng_key
+
         obs_dict = _obs_to_dict(obs)
         state  = obs_to_env_state(obs_dict)
         player = jnp.array([int(obs_dict.get("player", 0))], dtype=jnp.int32)
@@ -99,18 +123,42 @@ def make_jax_agent(
 
         out = _forward(sf, cf, gf, cm, ff, fm)
 
-        # Decode: argmax for deterministic play
-        ti = jnp.argmax(out.target_logits, axis=-1)          # [MAX_SRC]
-        row_idx  = jnp.arange(MAX_SRC)
-        shp_logits = out.ships_logits[row_idx, ti]            # [MAX_SRC, B]
-        sb = jnp.argmax(shp_logits, axis=-1)                  # [MAX_SRC]
+        target_logits = _safe_target_logits(out.target_logits)
+        if deterministic:
+            ti = jnp.argmax(target_logits, axis=-1)          # [MAX_SRC]
+        else:
+            rng_key, subkey = jax.random.split(rng_key)
+            ti = jax.random.categorical(subkey, target_logits)
+
+        row_idx = jnp.arange(MAX_SRC)
+        shp_logits = out.ships_logits[row_idx, ti]           # [MAX_SRC, B]
+        if deterministic:
+            sb = jnp.argmax(shp_logits, axis=-1)             # [MAX_SRC]
+        else:
+            rng_key, subkey = jax.random.split(rng_key)
+            sb = jax.random.categorical(subkey, shp_logits)
 
         # Convert to moves
-        src_valid = enc.src_valid[0]   # [MAX_SRC]
-        src_ids   = enc.src_ids[0]     # [MAX_SRC]
-        src_ships = enc.src_ships[0]   # [MAX_SRC] int32
-        angles    = enc.angles[0]      # [MAX_SRC, K]
-        cand_mask = enc.cand_mask[0]   # [MAX_SRC, K]
+        src_valid       = enc.src_valid[0]        # [MAX_SRC]
+        src_ids         = enc.src_ids[0]          # [MAX_SRC]
+        src_ships       = enc.src_ships[0]        # [MAX_SRC] int32
+        cand_mask       = enc.cand_mask[0]        # [MAX_SRC, K]
+        src_slots       = enc.src_slots[0]        # [MAX_SRC] int32
+        cand_slots_safe = enc.cand_slots_safe[0]  # [MAX_SRC, K] int32
+
+        # Re-aim with the actual ships the policy sends: cached angles assumed
+        # `max(tgt_ships+1, 13)` ships, but the ships head can pick anything from
+        # 1..S. For rotating targets, that speed mismatch shifts the intercept
+        # point and the fleet misses. Recompute per chosen (src, tgt, ships).
+        frac       = (sb.astype(jnp.float32) + 1.0) / jnp.float32(B)
+        ships_send = jnp.maximum(MIN_SOURCE_SHIPS, jnp.floor(frac * src_ships.astype(jnp.float32)).astype(jnp.int32))
+        selected_tgt = cand_slots_safe[row_idx, ti]   # [MAX_SRC]
+
+        reaim_angles = _reaim_all(
+            state.p_x, state.p_y, state.p_radius, state.p_alive, state.p_is_comet,
+            state.angular_velocity,
+            src_slots, selected_tgt, ships_send,
+        )  # [MAX_SRC]
 
         moves: list = []
         for i in range(MAX_SRC):
@@ -121,9 +169,8 @@ def make_jax_agent(
                 continue
             if not bool(cand_mask[i, t]):
                 continue
-            S     = int(src_ships[i])
-            ships = max(1, int((int(sb[i]) + 1) * S // B))
-            angle = float(angles[i, t])
+            ships = int(ships_send[i])
+            angle = float(reaim_angles[i])
             moves.append([int(src_ids[i]), angle, ships])
 
         return moves

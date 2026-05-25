@@ -7,7 +7,6 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-import wandb
 
 from .features import _make_env_encoder
 from .config import TrainConfig, default_train_config_path, load_train_config
@@ -30,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=str(default_train_config_path()))
     parser.add_argument("--resume", type=str, default=None, metavar="CKPT")
+    parser.add_argument("--no_wandb", action="store_true")
     return parser.parse_args()
 
 
@@ -53,19 +53,23 @@ def main() -> None:
     N     = cfg.ppo.num_envs if cfg.ppo.num_envs > 0 else 10
     cfg.ppo.num_envs = N
     K     = cfg.env.candidate_count
+    use_wandb = not args.no_wandb
 
-    wandb.init(
-        project="orbit-war",
-        name=cfg.run_name,
-        config={
-            "seed": cfg.seed, "num_envs": N,
-            "n_boards": N_BOARDS,
-            "opponents": cfg.opponents,
-            **{f"env/{k}": v for k, v in dataclasses.asdict(cfg.env).items()},
-            **{f"model/{k}": v for k, v in dataclasses.asdict(cfg.model).items()},
-            **{f"ppo/{k}": v for k, v in dataclasses.asdict(cfg.ppo).items()},
-        },
-    )
+    if use_wandb:
+        import wandb
+
+        wandb.init(
+            project="orbit-war",
+            name=cfg.run_name,
+            config={
+                "seed": cfg.seed, "num_envs": N,
+                "n_boards": N_BOARDS,
+                "opponents": cfg.opponents,
+                **{f"env/{k}": v for k, v in dataclasses.asdict(cfg.env).items()},
+                **{f"model/{k}": v for k, v in dataclasses.asdict(cfg.model).items()},
+                **{f"ppo/{k}": v for k, v in dataclasses.asdict(cfg.ppo).items()},
+            },
+        )
 
     print(f"Using {N} parallel environments, board pool size {N_BOARDS}")
 
@@ -160,27 +164,33 @@ def main() -> None:
                     f" entropy={metrics['entropy']:.3f}"
                     f" clip={metrics['clip_fraction']:.3f}"
                 )
-                wandb.log(
-                    {
-                        "reward/episode_mean":      stats["episode_reward_mean"],
-                        "reward/episodes_finished": stats["episodes_finished"],
-                        "train/samples":            stats["samples"],
-                        "train/loss":               metrics["loss"],
-                        "train/policy_loss":        metrics["policy_loss"],
-                        "train/value_loss":         metrics["value_loss"],
-                        "train/entropy":            metrics["entropy"],
-                        "train/clip_fraction":      metrics["clip_fraction"],
-                        "train/kl_divergence":      metrics["kl_divergence"],
-                        "train/explained_variance": metrics["explained_variance"],
-                    },
-                    step=update,
-                )
+                if use_wandb:
+                    import wandb
+
+                    wandb.log(
+                        {
+                            "reward/episode_mean":      stats["episode_reward_mean"],
+                            "reward/episodes_finished": stats["episodes_finished"],
+                            "train/samples":            stats["samples"],
+                            "train/loss":               metrics["loss"],
+                            "train/policy_loss":        metrics["policy_loss"],
+                            "train/value_loss":         metrics["value_loss"],
+                            "train/entropy":            metrics["entropy"],
+                            "train/clip_fraction":      metrics["clip_fraction"],
+                            "train/kl_divergence":      metrics["kl_divergence"],
+                            "train/explained_variance": metrics["explained_variance"],
+                        },
+                        step=update,
+                    )
 
             if update % cfg.checkpoint_every == 0 or update == cfg.ppo.total_updates:
                 save_checkpoint(save_dir, cfg.run_name, update, train_state, cfg)
 
     finally:
-        wandb.finish()
+        if use_wandb:
+            import wandb
+
+            wandb.finish()
 
 
 if __name__ == "__main__":

@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import json
 import math
+import time
+import zipfile
 from pathlib import Path
 from typing import Iterator
 
@@ -38,7 +40,6 @@ from .physics import (
     MAX_PLANETS,
     N_COMET_GROUPS,
 )
-from .features import _make_env_encoder
 
 # Maximum angular distance (radians) to accept an angle match.
 # ~34 degrees; tight enough to avoid mis-labeling, loose enough for imperfect expert angles.
@@ -319,6 +320,27 @@ def episode_to_samples(
 # Dataset loader — lazy iterator over episode files
 # ---------------------------------------------------------------------------
 
+def _iter_episode_jsons(episodes_dir: Path):
+    """Yield (name, episode_dict) from either a zip archive or loose .json files."""
+    zips = sorted(episodes_dir.glob("*.zip"))
+    if zips:
+        zf = zipfile.ZipFile(zips[0])
+        names = sorted(n for n in zf.namelist() if n.endswith(".json"))
+        for name in names:
+            try:
+                with zf.open(name) as f:
+                    yield name, json.load(f)
+            except Exception:
+                continue
+    else:
+        for path in sorted(episodes_dir.glob("*.json")):
+            try:
+                with open(path) as f:
+                    yield path.name, json.load(f)
+            except Exception:
+                continue
+
+
 def iter_episodes(
     episodes_dir: Path,
     encode_fn,
@@ -327,14 +349,8 @@ def iter_episodes(
     min_avg_score: float = 0.0,
     winner_only: bool = False,
 ) -> Iterator[dict[str, np.ndarray]]:
-    """Yield sample dicts, one per episode, from all .json files in episodes_dir."""
-    paths = sorted(episodes_dir.glob("*.json"))
-    for path in paths:
-        try:
-            with open(path) as f:
-                episode = json.load(f)
-        except Exception:
-            continue
+    """Yield sample dicts, one per episode, from a zip archive or loose .json files."""
+    for _name, episode in _iter_episode_jsons(episodes_dir):
 
         if not isinstance(episode, dict) or "steps" not in episode:
             continue  # old format (agent logs only)
@@ -376,3 +392,91 @@ def _filter_winner(episode: dict, winner: int) -> dict:
 def concat_samples(sample_list: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
     keys = sample_list[0].keys()
     return {k: np.concatenate([s[k] for s in sample_list], axis=0) for k in keys}
+
+
+# ---------------------------------------------------------------------------
+# Shard encoding + discovery
+# ---------------------------------------------------------------------------
+
+SHARD_DIR_NAME = "shards"
+
+
+def encode_to_shards(
+    episodes_dir: Path,
+    encode_fn,
+    ship_bucket_count: int,
+    *,
+    episodes_per_shard: int = 100,
+    winner_only: bool = False,
+    force: bool = False,
+) -> Path:
+    """Encode all episodes in episodes_dir and write sharded .npz files.
+
+    Skips if shards already exist unless force=True. Returns the shard directory.
+    """
+    shard_dir = episodes_dir / SHARD_DIR_NAME
+    if not force and any(shard_dir.glob("*.npz")):
+        print(f"Shards already exist in {shard_dir} — skipping (use --force to re-encode)")
+        return shard_dir
+
+    shard_dir.mkdir(exist_ok=True)
+    buffer: list[dict[str, np.ndarray]] = []
+    shard_idx = n_episodes = n_samples = 0
+    t0 = time.time()
+
+    for _name, episode in _iter_episode_jsons(episodes_dir):
+        if not isinstance(episode, dict) or "steps" not in episode:
+            continue
+
+        if winner_only:
+            rewards  = episode.get("rewards", [])
+            statuses = episode.get("statuses", [])
+            winning_player = next(
+                (i for i, (r, s) in enumerate(zip(rewards, statuses))
+                 if r == max(rewards) and s == "DONE"),
+                None,
+            )
+            if winning_player is None:
+                continue
+            episode = _filter_winner(episode, winning_player)
+
+        samples = episode_to_samples(episode, encode_fn, ship_bucket_count)
+        if samples is None:
+            continue
+
+        buffer.append(samples)
+        n_episodes += 1
+        n_samples  += len(samples["target_idx"])
+
+        if len(buffer) >= episodes_per_shard:
+            _flush_shard(shard_dir, shard_idx, buffer)
+            shard_idx += 1
+            buffer = []
+
+        if n_episodes % 50 == 0:
+            print(f"  {n_episodes} episodes, {n_samples} samples ({time.time() - t0:.1f}s)")
+
+    if buffer:
+        _flush_shard(shard_dir, shard_idx, buffer)
+        shard_idx += 1
+
+    print(f"Encoded {n_episodes} episodes → {shard_idx} shards in {shard_dir} ({time.time() - t0:.1f}s)")
+    return shard_dir
+
+
+def _flush_shard(shard_dir: Path, idx: int, buffer: list[dict[str, np.ndarray]]) -> None:
+    np.savez(shard_dir / f"shard_{idx:04d}.npz", **concat_samples(buffer))
+
+
+def find_shards(episodes_dirs: list[Path]) -> list[Path]:
+    """Return all shard .npz paths across the given date directories."""
+    paths: list[Path] = []
+    for d in episodes_dirs:
+        shard_dir = d / SHARD_DIR_NAME
+        if not shard_dir.is_dir() or not any(shard_dir.glob("*.npz")):
+            raise FileNotFoundError(
+                f"No shards found in {shard_dir}. "
+                f"Run: python -m src_jax.bc_encode --episodes_dir {d}"
+            )
+        paths.extend(sorted(shard_dir.glob("*.npz")))
+    return paths

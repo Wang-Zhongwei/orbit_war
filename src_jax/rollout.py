@@ -23,7 +23,7 @@ from .physics import (
     MAX_ACTIONS_PA,
     N_AGENTS,
 )
-from .features import _make_env_encoder, fleet_feature_dim, _find_angle_single
+from .features import MIN_SOURCE_SHIPS, _make_env_encoder, fleet_feature_dim, _find_angle_single
 from .ppo import TrainingBatch, sample_actions
 from .env import select_boards
 
@@ -66,12 +66,8 @@ class RolloutStep(NamedTuple):
 # Pure-JAX action builder (one env, no batch dim)
 # ---------------------------------------------------------------------------
 
-def _build_actions_single(
-    src_ids: jnp.ndarray,         # [MAX_SRC] int32
+def _compute_ships_and_angles_single(
     src_ships: jnp.ndarray,       # [MAX_SRC] int32
-    angles: jnp.ndarray,          # [MAX_SRC, K] float32  (cached, used for no-op fallback)
-    cand_mask: jnp.ndarray,       # [MAX_SRC, K] bool
-    src_valid: jnp.ndarray,       # [MAX_SRC] bool
     ti: jnp.ndarray,              # [MAX_SRC] int32
     sb: jnp.ndarray,              # [MAX_SRC] int32
     ship_bucket_count: int,
@@ -83,33 +79,48 @@ def _build_actions_single(
     p_is_comet: jnp.ndarray,
     p_alive: jnp.ndarray,
     angular_velocity: jnp.ndarray,
-) -> jnp.ndarray:
-    """Return [MAX_ACTIONS_PA, 3] action tensor. Pure JAX, no Python control flow."""
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Convert (target idx, ship bucket) → (ships_send, intercept angle) per source.
+
+    The cached encoder angles assumed `max(tgt_ships+1, 13)` ships per fleet, but
+    the ships head can pick anything from 1..S. For rotating targets that speed
+    mismatch shifts the intercept point and the fleet misses, so we redo the
+    angle calc with the actual ship count here.
+    """
     row_idx = jnp.arange(MAX_SRC, dtype=jnp.int32)
 
-    tgt_ok    = (ti != 0) & cand_mask[row_idx, ti]
-    action_ok = src_valid & tgt_ok                               # [MAX_SRC]
-
     frac       = (sb.astype(jnp.float32) + 1.0) / jnp.float32(ship_bucket_count)
-    ships_send = jnp.maximum(1, jnp.floor(frac * src_ships.astype(jnp.float32)).astype(jnp.int32))
+    ships_send = jnp.maximum(MIN_SOURCE_SHIPS, jnp.floor(frac * src_ships.astype(jnp.float32)).astype(jnp.int32))
 
-    # Recompute intercept angles using the actual ships_send speed.
-    # The cached angles were computed with (tgt_ships+1) ships; the actual fleet
-    # may be faster, causing it to arrive before a rotating planet reaches the
-    # intercept point.  Recomputing here eliminates that mismatch.
     selected_tgt = cand_slots_safe[row_idx, ti]  # [MAX_SRC]
 
-    def _recompute(src_slot, tgt_slot, n_ships):
+    def _reaim(src_slot, tgt_slot, n_ships):
         angle, _ = _find_angle_single(
             p_x[src_slot], p_y[src_slot], p_r[src_slot], src_slot,
             p_x[tgt_slot], p_y[tgt_slot], p_r[tgt_slot],
             p_is_comet[tgt_slot],
             n_ships.astype(jnp.float32), angular_velocity,
-            p_x, p_y, p_r, p_alive, tgt_slot,
+            p_x, p_y, p_r, p_alive, p_is_comet, tgt_slot,
         )
         return angle
 
-    tgt_angles = jax.vmap(_recompute)(src_slots, selected_tgt, ships_send)  # [MAX_SRC]
+    tgt_angles = jax.vmap(_reaim)(src_slots, selected_tgt, ships_send)  # [MAX_SRC]
+    return ships_send, tgt_angles
+
+
+def _build_actions_single(
+    src_ids: jnp.ndarray,         # [MAX_SRC] int32
+    cand_mask: jnp.ndarray,       # [MAX_SRC, K] bool
+    src_valid: jnp.ndarray,       # [MAX_SRC] bool
+    ti: jnp.ndarray,              # [MAX_SRC] int32
+    ships_send: jnp.ndarray,      # [MAX_SRC] int32
+    tgt_angles: jnp.ndarray,      # [MAX_SRC] float32
+) -> jnp.ndarray:
+    """Assemble [MAX_ACTIONS_PA, 3] action tensor from precomputed ships + angles."""
+    row_idx = jnp.arange(MAX_SRC, dtype=jnp.int32)
+
+    tgt_ok    = (ti != 0) & cand_mask[row_idx, ti]
+    action_ok = src_valid & tgt_ok                               # [MAX_SRC]
 
     n_act = min(MAX_SRC, MAX_ACTIONS_PA)
     rows  = jnp.stack([
@@ -194,17 +205,20 @@ def make_rollout_fn(
 
     def _enc_to_actions(enc, state, ti, sb):
         def one_env(
-            src_ids, src_ships, angles, cand_mask, valid, ti_i, sb_i,
+            src_ids, src_ships, cand_mask, valid, ti_i, sb_i,
             src_slots, cand_slots_safe,
-            p_x, p_y, p_r, p_init_x, p_init_y, p_is_comet, p_alive, angular_velocity,
+            p_x, p_y, p_r, p_is_comet, p_alive, angular_velocity,
         ):
-            return _build_actions_single(
-                src_ids, src_ships, angles, cand_mask, valid, ti_i, sb_i, ship_bucket_count,
+            ships_send, tgt_angles = _compute_ships_and_angles_single(
+                src_ships, ti_i, sb_i, ship_bucket_count,
                 src_slots, cand_slots_safe,
                 p_x, p_y, p_r, p_is_comet, p_alive, angular_velocity,
             )
+            return _build_actions_single(
+                src_ids, cand_mask, valid, ti_i, ships_send, tgt_angles,
+            )
         return jax.vmap(one_env)(
-            enc.src_ids, enc.src_ships, enc.angles,
+            enc.src_ids, enc.src_ships,
             enc.cand_mask, enc.src_valid, ti, sb,
             enc.src_slots, enc.cand_slots_safe,
             state.p_x, state.p_y, state.p_radius, state.p_is_comet, state.p_alive,
