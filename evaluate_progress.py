@@ -13,11 +13,9 @@ import json
 import re
 from pathlib import Path
 
-import torch
-
 from src.config import load_train_config, default_train_config_path
-from src.agents.rl import make_ppo_agent
-from evaluation import AGENTS, run_match_raw
+from src.kaggle_adapter import make_ppo_agent
+from src.evaluation import AGENTS, run_match_raw
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,7 +28,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--base-seed", type=int, default=1000)
     p.add_argument("--step", type=int, default=100,
                    help="Evaluate every N checkpoints (default 100).")
-    p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--out", type=Path, default=Path("results/progress.json"))
     return p.parse_args()
 
@@ -47,12 +44,11 @@ def find_checkpoints(ckpt_dir: Path, step: int) -> list[tuple[int, Path]]:
 def eval_checkpoint(
     ckpt_path: Path,
     cfg,
-    device: torch.device,
     opponent_fns: dict[str, object],
     rounds: int,
     base_seed: int,
 ) -> dict[str, float]:
-    agent = make_ppo_agent(cfg, str(ckpt_path), device)
+    agent = make_ppo_agent(cfg, str(ckpt_path))
     win_rates: dict[str, float] = {}
     for name, opp_fn in opponent_fns.items():
         wins = draws = total = 0
@@ -75,7 +71,6 @@ def main() -> None:
     args = parse_args()
     cfg_path = args.config or str(default_train_config_path())
     cfg = load_train_config(cfg_path)
-    device = torch.device(args.device)
 
     for opp in args.opponents:
         if opp not in AGENTS:
@@ -92,7 +87,7 @@ def main() -> None:
     records: list[dict] = []
     for i, (update, ckpt_path) in enumerate(checkpoints):
         print(f"[{i+1}/{len(checkpoints)}] {ckpt_path.name}", end="  ", flush=True)
-        win_rates = eval_checkpoint(ckpt_path, cfg, device, opponent_fns, args.rounds, args.base_seed)
+        win_rates = eval_checkpoint(ckpt_path, cfg, opponent_fns, args.rounds, args.base_seed)
         records.append({"update": update, "checkpoint": ckpt_path.name, **win_rates})
         print("  ".join(f"{opp}={win_rates[opp]:.2f}" for opp in args.opponents))
 

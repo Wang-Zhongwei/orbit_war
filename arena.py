@@ -37,8 +37,8 @@ import uuid
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 
-from evaluation import AGENTS, run_match_raw, format_head_to_head_matrix
-from src.agents.rl.ppo_agent import make_ppo_agent
+from src.evaluation import AGENTS, run_match_raw, format_head_to_head_matrix
+from src.kaggle_adapter.ppo_agent import make_ppo_agent
 
 
 CSV_HEADER: list[str] = [
@@ -57,18 +57,13 @@ DEFAULT_CSV = Path(__file__).parent / "results" / "matches.csv"
 def _register_ppo_agent(
     cfg_path: str,
     checkpoint: str | None,
-    device: str,
     deterministic: bool,
     name: str = "ppo",
 ) -> None:
     """Build a PPO agent from checkpoint and register it in AGENTS under ``name``."""
-    import torch
     from src.config import load_train_config
     cfg = load_train_config(cfg_path)
-    dev_name = device if device != "auto" else cfg.device
-    dev = torch.device("cuda" if dev_name == "auto" and torch.cuda.is_available() else
-                       "cuda" if dev_name == "cuda" else "cpu")
-    AGENTS[name] = make_ppo_agent(cfg, checkpoint, dev, deterministic=deterministic)
+    AGENTS[name] = make_ppo_agent(cfg, checkpoint, deterministic=deterministic)
 
 
 def _resolve_agents(names: Sequence[str]) -> None:
@@ -295,7 +290,6 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="Path to a .pt checkpoint. Registers a 'ppo' agent (or --ppo-name).")
         g.add_argument("--config", type=str, default=None,
                        help="Path to train config YAML (default: src default).")
-        g.add_argument("--device", type=str, default="auto")
         g.add_argument("--deterministic", action="store_true")
         g.add_argument("--ppo-name", type=str, default="ppo",
                        help="Registry key used for the loaded RL agent (default: ppo).")
@@ -349,7 +343,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     if getattr(args, "checkpoint", None) is not None:
         from src.config import default_train_config_path
         cfg_path = args.config or str(default_train_config_path())
-        _register_ppo_agent(cfg_path, args.checkpoint, args.device, args.deterministic, args.ppo_name)
+        _register_ppo_agent(cfg_path, args.checkpoint, args.deterministic, args.ppo_name)
 
     if args._handler == "match":
         if len(args.agents) not in (2, 4):

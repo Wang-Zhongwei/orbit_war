@@ -10,7 +10,7 @@ import numpy as np
 from .config import EnvConfig
 from .game_types import GameState, PlanetState, parse_observation
 from .helper import find_angle, fleet_speed, planet_trajectory, MAX_TICKS
-from .jax_env.constants import CENTER, ROTATION_RADIUS_LIMIT
+from kaggle_environments.envs.orbit_wars.orbit_wars import CENTER, ROTATION_RADIUS_LIMIT
 
 
 MIN_SOURCE_SHIPS: int = 13      # only generate decisions for planets with ships strictly above this

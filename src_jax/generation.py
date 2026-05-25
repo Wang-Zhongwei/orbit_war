@@ -1,10 +1,8 @@
 """
 Procedural generation for Orbit Wars: planet layouts and comet paths.
 
-Ported verbatim from kaggle_environments/envs/orbit_wars/orbit_wars.py so
-training has no dependency on the kaggle package.
+Ported from src/jax_env/generation.py with imports updated for src_jax isolation.
 """
-
 from __future__ import annotations
 
 import math
@@ -20,24 +18,20 @@ from .constants import (
     PLANET_CLEARANCE,
     ROTATION_RADIUS_LIMIT,
     SUN_RADIUS,
-    distance,
 )
 
 
-def generate_planets(rng: _stdlib_random.Random | None = None) -> list[list]:
-    """Return a list of planet rows ``[id, owner, x, y, radius, ships, production]``.
+def _dist(a, b) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
 
-    Planets are generated in groups of 4 with 4-fold rotational symmetry so that
-    every player starts in a symmetric position.  Owner is -1 (neutral) for all
-    returned planets; home-planet assignment happens in ``init_game``.
-    """
+
+def generate_planets(rng: _stdlib_random.Random | None = None) -> list[list]:
     if rng is None:
         rng = _stdlib_random
     planets: list[list] = []
     num_q1 = rng.randint(MIN_PLANET_GROUPS, MAX_PLANET_GROUPS)
     id_counter = 0
 
-    # Phase 1: guaranteed static-planet groups (orbital_r + r >= ROTATION_RADIUS_LIMIT)
     static_groups = 0
     for _ in range(5000):
         if static_groups >= MIN_STATIC_GROUPS:
@@ -71,7 +65,7 @@ def generate_planets(rng: _stdlib_random.Random | None = None) -> list[list]:
         valid = True
         for tp in temp:
             for p in planets:
-                if distance((p[2], p[3]), (tp[2], tp[3])) < p[4] + tp[4] + PLANET_CLEARANCE:
+                if _dist((p[2], p[3]), (tp[2], tp[3])) < p[4] + tp[4] + PLANET_CLEARANCE:
                     valid = False
                     break
             if not valid:
@@ -81,7 +75,6 @@ def generate_planets(rng: _stdlib_random.Random | None = None) -> list[list]:
             id_counter += 4
             static_groups += 1
 
-    # Phase 2: fill remaining planet groups with the normal random loop
     attempts = 0
     max_attempts = 5000
     has_orbiting = False
@@ -95,7 +88,7 @@ def generate_planets(rng: _stdlib_random.Random | None = None) -> list[list]:
         x = rng.uniform(CENTER + 15, BOARD_SIZE - r - 5)
         y = rng.uniform(CENTER + 15, BOARD_SIZE - r - 5)
 
-        orbital_radius = distance((x, y), (CENTER, CENTER))
+        orbital_radius = _dist((x, y), (CENTER, CENTER))
         if orbital_radius < SUN_RADIUS + r + 10:
             continue
         if orbital_radius + r >= ROTATION_RADIUS_LIMIT:
@@ -112,12 +105,12 @@ def generate_planets(rng: _stdlib_random.Random | None = None) -> list[list]:
 
         valid = True
         for tp in temp:
-            tp_orbital = distance((tp[2], tp[3]), (CENTER, CENTER))
+            tp_orbital = _dist((tp[2], tp[3]), (CENTER, CENTER))
             tp_rotating = tp_orbital + tp[4] < ROTATION_RADIUS_LIMIT
             for p in planets:
-                p_orbital = distance((p[2], p[3]), (CENTER, CENTER))
+                p_orbital = _dist((p[2], p[3]), (CENTER, CENTER))
                 p_rotating = p_orbital + p[4] < ROTATION_RADIUS_LIMIT
-                if distance((p[2], p[3]), (tp[2], tp[3])) < p[4] + tp[4] + PLANET_CLEARANCE:
+                if _dist((p[2], p[3]), (tp[2], tp[3])) < p[4] + tp[4] + PLANET_CLEARANCE:
                     valid = False
                     break
                 if tp_rotating != p_rotating:
@@ -144,11 +137,6 @@ def generate_comet_paths(
     comet_speed: float = 4.0,
     rng: _stdlib_random.Random | None = None,
 ) -> list[list[list[float]]] | None:
-    """Generate 4 symmetric comet paths or return None on failure.
-
-    Returns a list of 4 paths (one per quadrant), each path being a list of
-    ``[x, y]`` waypoints at *comet_speed* units per turn.
-    """
     if rng is None:
         rng = _stdlib_random
     comet_pid_set: set[int] = set(comet_planet_ids) if comet_planet_ids else set()
@@ -164,7 +152,6 @@ def generate_comet_paths(
         c_val = a * e
         phi = rng.uniform(math.pi / 6, math.pi / 3)
 
-        # Dense parametric sample — 5000 points, arc 0.3π to 1.7π
         dense: list[tuple[float, float]] = []
         num = 5000
         for i in range(num):
@@ -175,17 +162,15 @@ def generate_comet_paths(
             y = CENTER + ex * math.sin(phi) + ey * math.cos(phi)
             dense.append((x, y))
 
-        # Re-sample at constant arc-length intervals
         path: list[tuple[float, float]] = [dense[0]]
         cum = 0.0
         target = comet_speed
         for i in range(1, len(dense)):
-            cum += distance(dense[i], dense[i - 1])
+            cum += _dist(dense[i], dense[i - 1])
             if cum >= target:
                 path.append(dense[i])
                 target += comet_speed
 
-        # Extract contiguous on-board segment
         board_start: int | None = None
         board_end: int | None = None
         for i, (x, y) in enumerate(path):
@@ -199,7 +184,6 @@ def generate_comet_paths(
         if not (5 <= len(visible) <= 40):
             continue
 
-        # Build 4 rotationally symmetric paths
         paths = [
             [[y, x] for x, y in visible],
             [[BOARD_SIZE - x, y] for x, y in visible],
@@ -209,15 +193,15 @@ def generate_comet_paths(
 
         static_planets = [p for p in initial_planets
                           if p[0] not in comet_pid_set
-                          and distance((p[2], p[3]), (CENTER, CENTER)) + p[4] >= ROTATION_RADIUS_LIMIT]
+                          and _dist((p[2], p[3]), (CENTER, CENTER)) + p[4] >= ROTATION_RADIUS_LIMIT]
         orbiting_planets = [p for p in initial_planets
                             if p[0] not in comet_pid_set
-                            and distance((p[2], p[3]), (CENTER, CENTER)) + p[4] < ROTATION_RADIUS_LIMIT]
+                            and _dist((p[2], p[3]), (CENTER, CENTER)) + p[4] < ROTATION_RADIUS_LIMIT]
 
         buf = COMET_RADIUS + 0.5
         valid = True
         for k, (cx, cy) in enumerate(visible):
-            if distance((cx, cy), (CENTER, CENTER)) < SUN_RADIUS + COMET_RADIUS:
+            if _dist((cx, cy), (CENTER, CENTER)) < SUN_RADIUS + COMET_RADIUS:
                 valid = False
                 break
             sym_pts = [
@@ -228,7 +212,7 @@ def generate_comet_paths(
             ]
             for planet in static_planets:
                 for sp in sym_pts:
-                    if distance(sp, (planet[2], planet[3])) < planet[4] + buf:
+                    if _dist(sp, (planet[2], planet[3])) < planet[4] + buf:
                         valid = False
                         break
                 if not valid:
@@ -246,7 +230,7 @@ def generate_comet_paths(
                 px = CENTER + orb_r * math.cos(cur_angle)
                 py = CENTER + orb_r * math.sin(cur_angle)
                 for sp in sym_pts:
-                    if distance(sp, (px, py)) < planet[4] + COMET_RADIUS:
+                    if _dist(sp, (px, py)) < planet[4] + COMET_RADIUS:
                         valid = False
                         break
                 if not valid:

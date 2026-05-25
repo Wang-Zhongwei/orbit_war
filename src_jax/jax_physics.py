@@ -29,14 +29,11 @@ pre-computed at episode init because:
 
 from __future__ import annotations
 
-import math
 import random as _stdlib_random
-from functools import partial
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 from .constants import (
     BOARD_SIZE,
@@ -46,7 +43,9 @@ from .constants import (
     COMET_SPAWN_STEPS,
     COMET_SPEED,
     EPISODE_STEPS,
+    MAX_ANGULAR_VELOCITY,
     MAX_SHIP_SPEED,
+    MIN_ANGULAR_VELOCITY,
     ROTATION_RADIUS_LIMIT,
     SUN_RADIUS,
 )
@@ -63,7 +62,7 @@ MAX_PLANETS: int = MAX_BASE_PLANETS + N_COMET_GROUPS * COMET_PER_GROUP  # 64
 MAX_FLEETS: int = 256
 MAX_PATH_LEN: int = 42        # comet visible path ≤40 waypoints
 MAX_ACTIONS_PA: int = 24      # max actions per agent per tick
-N_AGENTS: int = 2
+N_AGENTS: int = 4             # maximum players supported (JIT array dimension)
 
 # Comet group i occupies planet slots COMET_SLOT_BASE + i*4 .. +3
 COMET_SLOT_BASE: int = MAX_BASE_PLANETS
@@ -189,7 +188,7 @@ def init_jax_state(seed: int | None = None, num_agents: int = 2) -> JaxState:
     if seed is None:
         seed = _stdlib_random.randrange(2 ** 31)
     rng = _stdlib_random.Random(seed)
-    angular_velocity = rng.uniform(0.025, 0.05)
+    angular_velocity = rng.uniform(MIN_ANGULAR_VELOCITY, MAX_ANGULAR_VELOCITY)
     raw_planets = generate_planets(rng)
     initial_planets = [p[:] for p in raw_planets]
 
@@ -212,43 +211,38 @@ def init_jax_state(seed: int | None = None, num_agents: int = 2) -> JaxState:
     assert n <= MAX_BASE_PLANETS, f"Too many base planets: {n} > {MAX_BASE_PLANETS}"
 
     # ---- Planet arrays ----
-    p_id         = np.full(MAX_PLANETS, -1, dtype=np.int32)
-    p_owner      = np.full(MAX_PLANETS, -1, dtype=np.int32)
-    p_x          = np.zeros(MAX_PLANETS, dtype=np.float32)
-    p_y          = np.zeros(MAX_PLANETS, dtype=np.float32)
-    p_radius     = np.zeros(MAX_PLANETS, dtype=np.float32)
-    p_ships      = np.zeros(MAX_PLANETS, dtype=np.float32)
-    p_production = np.zeros(MAX_PLANETS, dtype=np.float32)
-    p_alive      = np.zeros(MAX_PLANETS, dtype=bool)
-    p_init_x     = np.zeros(MAX_PLANETS, dtype=np.float32)
-    p_init_y     = np.zeros(MAX_PLANETS, dtype=np.float32)
-    p_is_comet   = np.zeros(MAX_PLANETS, dtype=bool)
-
-    for i, p in enumerate(raw_planets):
-        p_id[i]         = p[0]
-        p_owner[i]      = p[1]
-        p_x[i]          = p[2]
-        p_y[i]          = p[3]
-        p_radius[i]     = p[4]
-        p_ships[i]      = p[5]
-        p_production[i] = p[6]
-        p_alive[i]      = True
-        p_init_x[i]     = initial_planets[i][2]
-        p_init_y[i]     = initial_planets[i][3]
+    pad = MAX_PLANETS - n
+    p_id = jnp.asarray([p[0] for p in raw_planets] + [-1] * pad, dtype=jnp.int32)
+    p_owner = jnp.asarray([p[1] for p in raw_planets] + [-1] * pad, dtype=jnp.int32)
+    p_x = jnp.asarray([p[2] for p in raw_planets] + [0.0] * pad, dtype=jnp.float32)
+    p_y = jnp.asarray([p[3] for p in raw_planets] + [0.0] * pad, dtype=jnp.float32)
+    p_radius = jnp.asarray([p[4] for p in raw_planets] + [0.0] * pad, dtype=jnp.float32)
+    p_ships = jnp.asarray([p[5] for p in raw_planets] + [0.0] * pad, dtype=jnp.float32)
+    p_production = jnp.asarray([p[6] for p in raw_planets] + [0.0] * pad, dtype=jnp.float32)
+    p_alive = jnp.asarray([True] * n + [False] * pad, dtype=jnp.bool_)
+    p_init_x = jnp.asarray([p[2] for p in initial_planets] + [0.0] * pad, dtype=jnp.float32)
+    p_init_y = jnp.asarray([p[3] for p in initial_planets] + [0.0] * pad, dtype=jnp.float32)
+    p_is_comet = jnp.zeros(MAX_PLANETS, dtype=jnp.bool_)
 
     # ---- Fleet arrays (empty at start) ----
-    f_owner = np.zeros(MAX_FLEETS, dtype=np.int32)
-    f_x     = np.zeros(MAX_FLEETS, dtype=np.float32)
-    f_y     = np.zeros(MAX_FLEETS, dtype=np.float32)
-    f_angle = np.zeros(MAX_FLEETS, dtype=np.float32)
-    f_ships = np.zeros(MAX_FLEETS, dtype=np.float32)
-    f_alive = np.zeros(MAX_FLEETS, dtype=bool)
+    f_owner = jnp.zeros(MAX_FLEETS, dtype=jnp.int32)
+    f_x     = jnp.zeros(MAX_FLEETS, dtype=jnp.float32)
+    f_y     = jnp.zeros(MAX_FLEETS, dtype=jnp.float32)
+    f_angle = jnp.zeros(MAX_FLEETS, dtype=jnp.float32)
+    f_ships = jnp.zeros(MAX_FLEETS, dtype=jnp.float32)
+    f_alive = jnp.zeros(MAX_FLEETS, dtype=jnp.bool_)
 
     # ---- Pre-compute all comet paths ----
-    cg_paths  = np.zeros((N_COMET_GROUPS, COMET_PER_GROUP, MAX_PATH_LEN, 2), dtype=np.float32)
-    cg_lens   = np.zeros((N_COMET_GROUPS, COMET_PER_GROUP), dtype=np.int32)
-    cg_ships  = np.zeros(N_COMET_GROUPS, dtype=np.float32)
-    cg_idx    = np.full(N_COMET_GROUPS, -2, dtype=np.int32)   # -2 = never spawned
+    cg_paths = [
+        [
+            [[0.0, 0.0] for _ in range(MAX_PATH_LEN)]
+            for _ in range(COMET_PER_GROUP)
+        ]
+        for _ in range(N_COMET_GROUPS)
+    ]
+    cg_lens = [[0 for _ in range(COMET_PER_GROUP)] for _ in range(N_COMET_GROUPS)]
+    cg_ships = [0.0 for _ in range(N_COMET_GROUPS)]
+    cg_idx = [-2 for _ in range(N_COMET_GROUPS)]   # -2 = never spawned
 
     for gi, spawn_step in enumerate(COMET_SPAWN_STEPS):
         comet_rng = _stdlib_random.Random(f"orbit_wars-comet-{seed}-{spawn_step}")
@@ -268,33 +262,33 @@ def init_jax_state(seed: int | None = None, num_agents: int = 2) -> JaxState:
         if paths is not None:
             for j, path in enumerate(paths):
                 L = min(len(path), MAX_PATH_LEN)
-                cg_lens[gi, j] = L
+                cg_lens[gi][j] = L
                 for k in range(L):
-                    cg_paths[gi, j, k, 0] = path[k][0]
-                    cg_paths[gi, j, k, 1] = path[k][1]
+                    cg_paths[gi][j][k][0] = path[k][0]
+                    cg_paths[gi][j][k][1] = path[k][1]
 
     return JaxState(
-        p_id          = jnp.asarray(p_id),
-        p_owner       = jnp.asarray(p_owner),
-        p_x           = jnp.asarray(p_x),
-        p_y           = jnp.asarray(p_y),
-        p_radius      = jnp.asarray(p_radius),
-        p_ships       = jnp.asarray(p_ships),
-        p_production  = jnp.asarray(p_production),
-        p_alive       = jnp.asarray(p_alive),
-        p_init_x      = jnp.asarray(p_init_x),
-        p_init_y      = jnp.asarray(p_init_y),
-        p_is_comet    = jnp.asarray(p_is_comet),
-        f_owner       = jnp.asarray(f_owner),
-        f_x           = jnp.asarray(f_x),
-        f_y           = jnp.asarray(f_y),
-        f_angle       = jnp.asarray(f_angle),
-        f_ships       = jnp.asarray(f_ships),
-        f_alive       = jnp.asarray(f_alive),
-        comet_paths     = jnp.asarray(cg_paths),
-        comet_path_lens = jnp.asarray(cg_lens),
-        comet_ships     = jnp.asarray(cg_ships),
-        comet_path_idx  = jnp.asarray(cg_idx),
+        p_id            = p_id,
+        p_owner         = p_owner,
+        p_x             = p_x,
+        p_y             = p_y,
+        p_radius        = p_radius,
+        p_ships         = p_ships,
+        p_production    = p_production,
+        p_alive         = p_alive,
+        p_init_x        = p_init_x,
+        p_init_y        = p_init_y,
+        p_is_comet      = p_is_comet,
+        f_owner         = f_owner,
+        f_x             = f_x,
+        f_y             = f_y,
+        f_angle         = f_angle,
+        f_ships         = f_ships,
+        f_alive         = f_alive,
+        comet_paths     = jnp.asarray(cg_paths, dtype=jnp.float32),
+        comet_path_lens = jnp.asarray(cg_lens, dtype=jnp.int32),
+        comet_ships     = jnp.asarray(cg_ships, dtype=jnp.float32),
+        comet_path_idx  = jnp.asarray(cg_idx, dtype=jnp.int32),
         step             = jnp.int32(0),
         angular_velocity = jnp.float32(angular_velocity),
         num_agents       = jnp.int32(num_agents),
@@ -413,7 +407,7 @@ def _phase_spawn_comets(state: JaxState) -> JaxState:
 def _phase_process_moves(state: JaxState, actions: jnp.ndarray) -> JaxState:
     """Launch fleets for all agents.
 
-    actions: float32[N_AGENTS, MAX_ACTIONS_PA, 3]
+    actions: float32[num_agents, MAX_ACTIONS_PA, 3]  (num_agents ≤ N_AGENTS)
              [..., 0]=from_planet_id  [..., 1]=angle  [..., 2]=ships
     """
     # Compact fleets first so alive fleets are at 0..num_alive-1
@@ -482,10 +476,12 @@ def _phase_process_moves(state: JaxState, actions: jnp.ndarray) -> JaxState:
         new_carry = (new_p_ships, new_f_owner, new_f_x, new_f_y, new_f_angle, new_f_ships, new_f_alive, new_next)
         return new_carry, None
 
-    # Flatten actions: [N_AGENTS, MAX_ACTIONS_PA, 3] → [N*MAX_A, 4] (player_id, from_id, angle, ships)
-    agent_ids = jnp.arange(N_AGENTS, dtype=jnp.float32)[:, None] * jnp.ones((1, MAX_ACTIONS_PA))
-    actions_flat = jnp.concatenate([agent_ids[:, :, None], actions], axis=-1)  # [N, MAX_A, 4]
-    actions_flat = actions_flat.reshape(-1, 4)  # [N*MAX_A, 4]
+    # Flatten actions: [n_agents, MAX_ACTIONS_PA, 3] → [n*MAX_A, 4] (player_id, from_id, angle, ships)
+    # actions.shape[0] is the actual number of agents (may be < N_AGENTS)
+    n_act = actions.shape[0]
+    agent_ids = jnp.arange(n_act, dtype=jnp.float32)[:, None] * jnp.ones((1, MAX_ACTIONS_PA))
+    actions_flat = jnp.concatenate([agent_ids[:, :, None], actions], axis=-1)  # [n, MAX_A, 4]
+    actions_flat = actions_flat.reshape(-1, 4)  # [n*MAX_A, 4]
 
     (p_ships_, f_owner, f_x, f_y, f_angle, f_ships, f_alive, _), _ = jax.lax.scan(
         launch_one, carry, actions_flat
@@ -633,6 +629,7 @@ def _phase_resolve_combat(
     """
     # For each fleet that hit a planet, sum ships by (planet_slot, owner)
     # combat_ships[MAX_P, N_AGENTS]: total fleet ships arriving from each agent
+    # N_AGENTS is the array capacity; actual player count lives in state.num_agents
     hit_valid  = fleet_hit_planet >= 0    # [MAX_F] bool (hit something)
     p_slot     = jnp.clip(fleet_hit_planet, 0, MAX_PLANETS - 1)   # safe index
     owner_clp  = jnp.clip(state.f_owner, 0, N_AGENTS - 1)
@@ -646,6 +643,9 @@ def _phase_resolve_combat(
         jnp.where(hit_valid, state.f_ships, 0.0)
     )
     combat_ships = cs_flat[:MAX_PLANETS * N_AGENTS].reshape(MAX_PLANETS, N_AGENTS)
+    # Mask out slots beyond actual player count so phantom agents don't win combat
+    agent_mask = jnp.arange(N_AGENTS) < state.num_agents   # [N_AGENTS]
+    combat_ships = combat_ships * agent_mask[None, :]
     # [MAX_P, N_AGENTS]: ships arriving from each agent at each planet
 
     has_combat  = jnp.any(combat_ships > 0.0, axis=1)         # [MAX_P]
@@ -682,39 +682,40 @@ def _phase_check_termination(
 
     statuses: 0=ACTIVE, 1=DONE
     rewards:  +1.0=win, -1.0=lose, 0.0=draw / not yet terminated
+    Slots beyond state.num_agents always return DONE with reward 0.
     """
     time_up = state.step >= episode_steps - 1
 
-    # Count alive players (from planets + fleets)
-    alive_from_planets = jnp.zeros(N_AGENTS)
-    for a in range(N_AGENTS):
-        alive_from_planets = alive_from_planets.at[a].set(
-            jnp.any(state.p_alive & (state.p_owner == a)).astype(jnp.float32)
-        )
-    alive_from_fleets = jnp.zeros(N_AGENTS)
-    for a in range(N_AGENTS):
-        alive_from_fleets = alive_from_fleets.at[a].set(
-            jnp.any(state.f_alive & (state.f_owner == a)).astype(jnp.float32)
-        )
-    has_presence = jnp.clip(alive_from_planets + alive_from_fleets, 0, 1)  # [N_AGENTS]
+    # Which agent indices are actually participating
+    agent_active = jnp.arange(N_AGENTS) < state.num_agents   # [N_AGENTS]
+
+    # Presence: owns a planet or has a fleet in flight
+    p_owner_eq = jax.vmap(lambda a: jnp.any(state.p_alive & (state.p_owner == a)))(jnp.arange(N_AGENTS))
+    f_owner_eq = jax.vmap(lambda a: jnp.any(state.f_alive & (state.f_owner == a)))(jnp.arange(N_AGENTS))
+    has_presence = (p_owner_eq | f_owner_eq) & agent_active   # [N_AGENTS]
     num_alive_players = jnp.sum(has_presence).astype(jnp.int32)
 
     elimination = num_alive_players <= 1
     terminated  = time_up | elimination
 
-    # Compute scores
-    scores = jnp.zeros(N_AGENTS)
-    for a in range(N_AGENTS):
-        p_score = jnp.sum(jnp.where(state.p_alive & (state.p_owner == a), state.p_ships, 0.0))
-        f_score = jnp.sum(jnp.where(state.f_alive & (state.f_owner == a), state.f_ships, 0.0))
-        scores  = scores.at[a].set(p_score + f_score)
+    # Scores: total ships controlled (planets + fleets)
+    p_scores = jax.vmap(
+        lambda a: jnp.sum(jnp.where(state.p_alive & (state.p_owner == a), state.p_ships, 0.0))
+    )(jnp.arange(N_AGENTS))
+    f_scores = jax.vmap(
+        lambda a: jnp.sum(jnp.where(state.f_alive & (state.f_owner == a), state.f_ships, 0.0))
+    )(jnp.arange(N_AGENTS))
+    scores = (p_scores + f_scores) * agent_active   # zero-out phantom agents
 
-    max_score  = jnp.max(scores)
-    is_winner  = (scores == max_score) & (max_score > 0.0)
-    rewards    = jnp.where(terminated,
-                           jnp.where(is_winner, 1.0, -1.0),
-                           0.0)
-    statuses   = jnp.where(terminated, jnp.ones(N_AGENTS, dtype=jnp.int32), jnp.zeros(N_AGENTS, dtype=jnp.int32))
+    max_score = jnp.max(scores)
+    is_winner = (scores == max_score) & (max_score > 0.0) & agent_active
+
+    rewards  = jnp.where(agent_active,
+                  jnp.where(terminated, jnp.where(is_winner, 1.0, -1.0), 0.0),
+                  0.0)
+    statuses = jnp.where(agent_active,
+                  jnp.where(terminated, 1, 0),
+                  1).astype(jnp.int32)   # phantom agents are always "done"
     return statuses, rewards
 
 
@@ -878,19 +879,22 @@ def encode_actions(raw_actions: list[list], player: int) -> jnp.ndarray:
     raw_actions: [[from_planet_id, angle, ships], ...]
     Returns a padded array suitable for jax_step.
     """
-    arr = np.full((MAX_ACTIONS_PA, 3), -1.0, dtype=np.float32)
+    rows = [[-1.0, -1.0, -1.0] for _ in range(MAX_ACTIONS_PA)]
     for i, move in enumerate(raw_actions):
         if i >= MAX_ACTIONS_PA:
             break
-        arr[i, 0] = float(move[0])  # planet id
-        arr[i, 1] = float(move[1])  # angle
-        arr[i, 2] = float(move[2])  # ships
-    return jnp.asarray(arr)
+        rows[i][0] = float(move[0])  # planet id
+        rows[i][1] = float(move[1])  # angle
+        rows[i][2] = float(move[2])  # ships
+    return jnp.asarray(rows, dtype=jnp.float32)
 
 
 def encode_joint_actions(actions_per_agent: list[list[list]]) -> jnp.ndarray:
-    """Stack per-agent encoded actions → float32[N_AGENTS, MAX_ACTIONS_PA, 3]."""
+    """Stack per-agent encoded actions → float32[num_agents, MAX_ACTIONS_PA, 3].
+
+    num_agents is inferred from len(actions_per_agent); may be 2 or 4.
+    """
     rows = []
     for player, acts in enumerate(actions_per_agent):
         rows.append(encode_actions(acts, player))
-    return jnp.stack(rows, axis=0)
+    return jnp.stack(rows, axis=0)  # [num_agents, MAX_ACTIONS_PA, 3]

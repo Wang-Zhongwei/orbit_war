@@ -86,7 +86,7 @@ import optuna
 # Suppress TF/kaggle import noise before heavy imports.
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
-from evaluation import AGENTS, run_match_raw
+from src.evaluation import AGENTS, run_match_raw
 from src.agents.rule_based import AgentConfig, run_agent, StatefulAgentConfig, make_stateful_agent, Agent1000ScoreConfig, make_agent_1000_score
 
 RESULTS_DIR = Path(__file__).parent / "results"
