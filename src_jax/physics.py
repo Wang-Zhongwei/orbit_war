@@ -69,10 +69,10 @@ COMET_SLOT_BASE: int = MAX_BASE_PLANETS
 
 
 # ---------------------------------------------------------------------------
-# JaxState
+# EnvState
 # ---------------------------------------------------------------------------
 
-class JaxState(NamedTuple):
+class EnvState(NamedTuple):
     """Fixed-size game state as JAX arrays.  All shapes written [dim] or [a,b,...]."""
 
     # ---- Planets [MAX_PLANETS] ----
@@ -157,29 +157,11 @@ def _swept_pair_hit_batch(
         c <= 0.0,
     )
 
-
-def _pt_seg_dist_sq_batch(
-    px: jnp.ndarray, py: jnp.ndarray,   # [MAX_F]
-    vx: float, vy: float,
-    wx: jnp.ndarray, wy: jnp.ndarray,   # [MAX_F]
-) -> jnp.ndarray:
-    """Squared distance from each point to segment (v→w)."""
-    l2 = (wx - vx) ** 2 + (wy - vy) ** 2
-    t  = jnp.where(
-        l2 > 0.0,
-        jnp.clip(((px - vx) * (wx - vx) + (py - vy) * (wy - vy)) / (l2 + 1e-30), 0.0, 1.0),
-        0.0,
-    )
-    proj_x = vx + t * (wx - vx)
-    proj_y = vy + t * (wy - vy)
-    return (px - proj_x) ** 2 + (py - proj_y) ** 2
-
-
 # ---------------------------------------------------------------------------
 # Initialisation — Python side (called once per episode)
 # ---------------------------------------------------------------------------
 
-def init_jax_state(seed: int | None = None, num_agents: int = 2) -> JaxState:
+def init_jax_state(seed: int | None = None, num_agents: int = 2) -> EnvState:
     """Build a fresh JaxState from a seed.
 
     Calls Python generation code once, then converts everything to fixed-size
@@ -267,7 +249,7 @@ def init_jax_state(seed: int | None = None, num_agents: int = 2) -> JaxState:
                     cg_paths[gi][j][k][0] = path[k][0]
                     cg_paths[gi][j][k][1] = path[k][1]
 
-    return JaxState(
+    return EnvState(
         p_id            = p_id,
         p_owner         = p_owner,
         p_x             = p_x,
@@ -324,8 +306,8 @@ def _deactivate_comet_slots(
 
 def _spawn_comet_group(
     gi: int,
-    state: JaxState,
-) -> JaxState:
+    state: EnvState,
+) -> EnvState:
     """Activate comet group *gi* into its pre-assigned planet slots."""
     slot_base = COMET_SLOT_BASE + gi * COMET_PER_GROUP
     ships = state.comet_ships[gi]
@@ -375,7 +357,7 @@ def _spawn_comet_group(
 # Step sub-phases (pure JAX)
 # ---------------------------------------------------------------------------
 
-def _phase_remove_expired(state: JaxState) -> JaxState:
+def _phase_remove_expired(state: EnvState) -> EnvState:
     """Deactivate comet groups whose path is exhausted."""
     p_alive, p_is_comet, p_ships, p_owner = _deactivate_comet_slots(
         state.p_alive, state.p_is_comet, state.p_ships, state.p_owner,
@@ -385,7 +367,7 @@ def _phase_remove_expired(state: JaxState) -> JaxState:
                           p_ships=p_ships, p_owner=p_owner)
 
 
-def _phase_spawn_comets(state: JaxState) -> JaxState:
+def _phase_spawn_comets(state: EnvState) -> EnvState:
     """Spawn a comet group if next completed step is a spawn tick."""
     next_step = state.step + 1
     for gi, spawn_step in enumerate(COMET_SPAWN_STEPS):
@@ -404,7 +386,7 @@ def _phase_spawn_comets(state: JaxState) -> JaxState:
     return state
 
 
-def _phase_process_moves(state: JaxState, actions: jnp.ndarray) -> JaxState:
+def _phase_process_moves(state: EnvState, actions: jnp.ndarray) -> EnvState:
     """Launch fleets for all agents.
 
     actions: float32[num_agents, MAX_ACTIONS_PA, 3]  (num_agents ≤ N_AGENTS)
@@ -494,12 +476,12 @@ def _phase_process_moves(state: JaxState, actions: jnp.ndarray) -> JaxState:
     )
 
 
-def _phase_production(state: JaxState) -> JaxState:
+def _phase_production(state: EnvState) -> EnvState:
     gain = jnp.where(state.p_alive & (state.p_owner >= 0), state.p_production, 0.0)
     return state._replace(p_ships=state.p_ships + gain)
 
 
-def _compute_planet_new_positions(state: JaxState):
+def _compute_planet_new_positions(state: EnvState):
     """Compute (old_x, old_y, new_x, new_y, check_col, is_comet_first) per planet.
 
     Also advances comet_path_idx.  Returns updated state + position arrays.
@@ -547,11 +529,11 @@ def _compute_planet_new_positions(state: JaxState):
 
 
 def _phase_move_fleets(
-    state: JaxState,
+    state: EnvState,
     new_p_x: jnp.ndarray,
     new_p_y: jnp.ndarray,
     check_col: jnp.ndarray,
-) -> tuple[JaxState, jnp.ndarray]:
+) -> tuple[EnvState, jnp.ndarray]:
     """Move all fleets; detect collisions.
 
     Returns (state with updated fleet positions and alive flags,
@@ -589,11 +571,6 @@ def _phase_move_fleets(
             (0.0 <= new_fy) & (new_fy <= BOARD_SIZE))
 
     # ---- Sun collision (point-to-segment) ----
-    dist_sq = _pt_seg_dist_sq_batch(
-        jnp.full(MAX_FLEETS, CENTER), jnp.full(MAX_FLEETS, CENTER),
-        CENTER, CENTER,  # segment is just the sun center point (static)
-        new_fx, new_fy,
-    )
     # point_to_segment_distance for static point: just distance from sun to fleet segment
     # We need: min dist from (CENTER,CENTER) to segment (old_f, new_f)
     # Compute properly:
@@ -618,9 +595,9 @@ def _phase_move_fleets(
 
 
 def _phase_resolve_combat(
-    state: JaxState,
+    state: EnvState,
     fleet_hit_planet: jnp.ndarray,
-) -> JaxState:
+) -> EnvState:
     """Resolve combat at each planet.
 
     fleet_hit_planet[i] = planet slot that fleet i hit (-1 = none).
@@ -675,7 +652,7 @@ def _phase_resolve_combat(
 
 
 def _phase_check_termination(
-    state: JaxState,
+    state: EnvState,
     episode_steps: int = EPISODE_STEPS,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Return (statuses [N_AGENTS] int32, rewards [N_AGENTS] float32).
@@ -724,10 +701,10 @@ def _phase_check_termination(
 # ---------------------------------------------------------------------------
 
 def jax_step(
-    state: JaxState,
+    state: EnvState,
     actions: jnp.ndarray,
     episode_steps: int = EPISODE_STEPS,
-) -> tuple[JaxState, jnp.ndarray, jnp.ndarray]:
+) -> tuple[EnvState, jnp.ndarray, jnp.ndarray]:
     """Advance state by one tick.  Pure function — returns new state.
 
     Parameters
@@ -782,95 +759,6 @@ def jax_step(
 
 # Pre-JIT for single-env use
 jax_step_jit = jax.jit(jax_step, static_argnums=(2,))
-
-
-# ---------------------------------------------------------------------------
-# Utility: convert JaxState ↔ Python GameState
-# ---------------------------------------------------------------------------
-
-def jax_state_to_game_state(js: JaxState, seed: int | None = None):
-    """Convert JaxState to GameState for testing/interop (not used in hot path)."""
-    from .state import GameState
-
-    js_np = jax.device_get(js)  # pull to host
-
-    planets = []
-    initial_planets = []
-    comet_planet_ids = []
-    comets = []
-    for i in range(MAX_PLANETS):
-        if not bool(js_np.p_alive[i]):
-            continue
-        planet = [
-            int(js_np.p_id[i]),
-            int(js_np.p_owner[i]),
-            float(js_np.p_x[i]),
-            float(js_np.p_y[i]),
-            float(js_np.p_radius[i]),
-            int(round(float(js_np.p_ships[i]))),
-            int(round(float(js_np.p_production[i]))),
-        ]
-        planets.append(planet)
-        initial_planets.append([
-            int(js_np.p_id[i]),
-            int(js_np.p_owner[i]),
-            float(js_np.p_init_x[i]),
-            float(js_np.p_init_y[i]),
-            float(js_np.p_radius[i]),
-            int(round(float(js_np.p_ships[i]))),
-            int(round(float(js_np.p_production[i]))),
-        ])
-        if bool(js_np.p_is_comet[i]):
-            comet_planet_ids.append(int(js_np.p_id[i]))
-
-    fleets = []
-    fid = 0
-    for i in range(MAX_FLEETS):
-        if not bool(js_np.f_alive[i]):
-            continue
-        fleet = [
-            fid,
-            int(js_np.f_owner[i]),
-            float(js_np.f_x[i]),
-            float(js_np.f_y[i]),
-            float(js_np.f_angle[i]),
-            -1,  # from_planet_id not tracked in JaxState
-            int(round(float(js_np.f_ships[i]))),
-        ]
-        fleets.append(fleet)
-        fid += 1
-
-    # Rebuild comet groups
-    for gi in range(N_COMET_GROUPS):
-        idx = int(js_np.comet_path_idx[gi])
-        if idx < -1:
-            continue
-        pids = []
-        for sj in range(COMET_PER_GROUP):
-            slot = COMET_SLOT_BASE + gi * COMET_PER_GROUP + sj
-            if bool(js_np.p_alive[slot]):
-                pids.append(int(js_np.p_id[slot]))
-        if not pids:
-            continue
-        paths = []
-        for sj in range(COMET_PER_GROUP):
-            L    = int(js_np.comet_path_lens[gi, sj])
-            path = js_np.comet_paths[gi, sj, :L].tolist()
-            paths.append(path)
-        comets.append({"planet_ids": pids, "paths": paths, "path_index": idx})
-
-    return GameState(
-        planets=planets,
-        fleets=fleets,
-        next_fleet_id=fid,
-        step=int(js_np.step),
-        angular_velocity=float(js_np.angular_velocity),
-        initial_planets=initial_planets,
-        comets=comets,
-        comet_planet_ids=comet_planet_ids,
-        num_agents=int(js_np.num_agents),
-        seed=seed,
-    )
 
 
 def encode_actions(raw_actions: list[list], player: int) -> jnp.ndarray:

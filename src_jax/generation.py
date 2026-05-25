@@ -1,7 +1,5 @@
 """
 Procedural generation for Orbit Wars: planet layouts and comet paths.
-
-Ported from src/jax_env/generation.py with imports updated for src_jax isolation.
 """
 from __future__ import annotations
 

@@ -1,9 +1,112 @@
-from src.config import (
-    TrainConfig, EnvConfig, ModelConfig, PPOConfig,
-    load_train_config, default_train_config_path,
-)
+from __future__ import annotations
 
-__all__ = [
-    "TrainConfig", "EnvConfig", "ModelConfig", "PPOConfig",
-    "load_train_config", "default_train_config_path",
-]
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+@dataclass(slots=True)
+class EnvConfig:
+    board_size: float = 100.0
+    episode_steps: int = 500
+    candidate_count: int = 8
+    ship_bucket_count: int = 8
+    max_planets: int = 48
+    max_ships: float = 400.0
+    max_production: float = 5.0
+
+
+@dataclass(slots=True)
+class ModelConfig:
+    hidden_size: int = 128
+
+
+@dataclass(slots=True)
+class PPOConfig:
+    rollout_steps: int = 32
+    num_envs: int = 4
+    total_updates: int = 200
+    epochs: int = 4
+    minibatch_size: int = 512
+    gamma: float = 0.99
+    clip_coef: float = 0.2
+    ent_coef: float = 0.01
+    vf_coef: float = 0.5
+    lr: float = 3e-4
+    max_grad_norm: float = 0.5
+
+
+@dataclass(slots=True)
+class TrainConfig:
+    seed: int = 42
+    run_name: str = "orbit_wars_jax_ppo"
+    save_dir: str = "artifacts/jax"
+    checkpoint_every: int = 50
+    log_every: int = 1
+    opponents: list[str] = field(default_factory=lambda: ["self"])
+    self_play_update_interval: int = 50
+    self_play_deterministic: bool = False
+    alternate_player_sides: bool = True
+    env: EnvConfig = field(default_factory=EnvConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
+    ppo: PPOConfig = field(default_factory=PPOConfig)
+
+    def __setstate__(self, state) -> None:
+        slot_state: dict = state[1] if isinstance(state, tuple) else state
+        if slot_state and "opponent" in slot_state and "opponents" not in slot_state:
+            slot_state = dict(slot_state)
+            slot_state["opponents"] = [slot_state.pop("opponent")]
+        for key, value in (slot_state or {}).items():
+            try:
+                object.__setattr__(self, key, value)
+            except AttributeError:
+                pass
+
+
+def default_train_config_path() -> Path:
+    return Path(__file__).resolve().parent / "configs" / "default_cfg.yaml"
+
+
+def load_train_config(path: str | Path) -> TrainConfig:
+    config_path = Path(path)
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"YAML config must be a mapping: {config_path}")
+    return _config_from_dict(data)
+
+
+def _config_from_dict(data: dict[str, Any]) -> TrainConfig:
+    cfg = TrainConfig()
+    _apply(cfg, data, skip={"env", "model", "ppo", "opponents"})
+    if "opponents" in data:
+        raw = data["opponents"]
+        cfg.opponents = [raw] if isinstance(raw, str) else list(raw)
+    _apply(cfg.env, data.get("env", {}))
+    _apply(cfg.model, data.get("model", {}))
+    _apply(cfg.ppo, data.get("ppo", {}))
+    return cfg
+
+
+def _apply(instance: Any, values: dict[str, Any], skip: set[str] | None = None) -> None:
+    if not isinstance(values, dict):
+        return
+    skip = skip or set()
+    for key, value in values.items():
+        if key in skip or not hasattr(instance, key):
+            continue
+        default = getattr(instance, key)
+        setattr(instance, key, _coerce(value, default))
+
+
+def _coerce(value: Any, default: Any) -> Any:
+    if isinstance(default, bool):
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+    if isinstance(default, int) and not isinstance(default, bool):
+        return int(value)
+    if isinstance(default, float):
+        return float(value)
+    return value

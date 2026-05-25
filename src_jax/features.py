@@ -1,12 +1,10 @@
 """
-JAX-accelerated feature encoding, operating directly on JaxState.
+JAX-accelerated feature encoding, operating directly on EnvState.
 
-Replaces the Python-loop encode_turn for the training hot path.
-
-Key differences from features.py:
-  - No observation dict or GameState conversion — reads JaxState arrays directly.
+Encodes observations for all envs in one JIT+vmap call:
+  - Reads EnvState arrays directly (no dict conversion).
   - find_angle via JAX vmap over all (src, tgt) pairs simultaneously.
-  - Blocking check: sun collision + static planet positions (no per-tick moving blocker).
+  - Blocking check: sun collision + planet positions.
   - Comet intercept: falls back to direct angle (no waypoint extrapolation).
 """
 from __future__ import annotations
@@ -16,13 +14,34 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from .jax_physics import (
-    JaxState, MAX_PLANETS, MAX_BASE_PLANETS,
+from .physics import (
+    EnvState, MAX_PLANETS, MAX_BASE_PLANETS, MAX_FLEETS,
     _fleet_speed,
 )
 from .constants import CENTER, ROTATION_RADIUS_LIMIT, SUN_RADIUS
 
+MIN_SOURCE_SHIPS: int = 13
 _MAX_TICKS: int = 25
+
+
+def self_feature_dim() -> int:
+    return 11
+
+
+def candidate_feature_dim() -> int:
+    return 10
+
+
+def global_feature_dim() -> int:
+    return 8
+
+
+def fleet_feature_dim() -> int:
+    return 6
+
+
+def fleet_count() -> int:
+    return MAX_FLEETS
 
 
 # ---------------------------------------------------------------------------
@@ -37,8 +56,6 @@ def _find_angle_single(
     tgt_x: jnp.ndarray,         # scalar (current position)
     tgt_y: jnp.ndarray,
     tgt_radius: jnp.ndarray,
-    tgt_init_x: jnp.ndarray,    # initial position, used for rotation
-    tgt_init_y: jnp.ndarray,
     tgt_is_comet: jnp.ndarray,  # bool
     ships: jnp.ndarray,         # scalar — for speed
     angular_velocity: jnp.ndarray,
@@ -52,8 +69,10 @@ def _find_angle_single(
     spd = _fleet_speed(ships)
 
     # --- Rotating target: binary-search intercept via fixed scan ---
-    dx0 = tgt_init_x - CENTER
-    dy0 = tgt_init_y - CENTER
+    # Use current position for init_ang so ang_t = init_ang + av*t predicts
+    # where the planet will be t ticks from NOW, not t ticks from game start.
+    dx0 = tgt_x - CENTER
+    dy0 = tgt_y - CENTER
     orb_r = jnp.sqrt(dx0 * dx0 + dy0 * dy0)
     rotating = (orb_r + tgt_radius < ROTATION_RADIUS_LIMIT) & ~tgt_is_comet
     init_ang = jnp.arctan2(dy0, dx0)
@@ -125,6 +144,7 @@ class _EncodedTurn(NamedTuple):
     src_ids:         jnp.ndarray  # [MAX_SRC]       int32
     src_ships:       jnp.ndarray  # [MAX_SRC]       int32
     self_feats:      jnp.ndarray  # [MAX_SRC, 11]
+    src_slots:       jnp.ndarray  # [MAX_SRC]       int32 — planet slot for each source
     cand_slots_safe: jnp.ndarray  # [MAX_SRC, K]    int32 (no-op clamped to 0)
     cand_ids:        jnp.ndarray  # [MAX_SRC, K]    int32 (-1 for no-op/invalid)
     cand_mask:       jnp.ndarray  # [MAX_SRC, K]    bool
@@ -132,6 +152,8 @@ class _EncodedTurn(NamedTuple):
     angles:          jnp.ndarray  # [MAX_SRC, K]    float32
     cand_feats:      jnp.ndarray  # [MAX_SRC, K, 10]
     global_feat:     jnp.ndarray  # [8]
+    fleet_feats:     jnp.ndarray  # [MAX_FLEETS, 6]
+    fleet_mask:      jnp.ndarray  # [MAX_FLEETS]    bool
     step:            jnp.ndarray  # []              int32
 
 
@@ -140,21 +162,20 @@ def _make_env_encoder(K: int, env_cfg):
 
     Call once at JaxVecEnv init; reuse every tick.
     """
-    from .obs_schema import MIN_SOURCE_SHIPS
     from .constants import MAX_ANGULAR_VELOCITY
 
-    K_e     = K // 3
-    K_n     = K // 3
-    K_f_eff = K - 1 - K_e - K_n   # friendly quota; total non-noop slots = K-1
+    K_enemy    = K // 3
+    K_neutral  = K // 3
+    K_friendly = K - 1 - K_enemy - K_neutral   # friendly quota; total non-noop slots = K-1
 
-    bs  = jnp.float32(env_cfg.board_size)
-    ms  = jnp.float32(env_cfg.max_ships)
-    mp  = jnp.float32(env_cfg.max_production)
-    mp_ = jnp.float32(env_cfg.max_planets)
-    es  = jnp.float32(env_cfg.episode_steps)
-    max_av = jnp.float32(MAX_ANGULAR_VELOCITY)
+    board_size           = jnp.float32(env_cfg.board_size)
+    max_ships            = jnp.float32(env_cfg.max_ships)
+    max_production       = jnp.float32(env_cfg.max_production)
+    max_planets          = jnp.float32(env_cfg.max_planets)
+    episode_steps        = jnp.float32(env_cfg.episode_steps)
+    max_angular_velocity = jnp.float32(MAX_ANGULAR_VELOCITY)
 
-    def _encode_single(state: JaxState, player: jnp.ndarray) -> _EncodedTurn:
+    def _encode_single(state: EnvState, player: jnp.ndarray) -> _EncodedTurn:
         planet_idx = jnp.arange(MAX_PLANETS, dtype=jnp.int32)
         INF = jnp.float32(1e30)
 
@@ -172,61 +193,63 @@ def _make_env_encoder(K: int, env_cfg):
 
         # ── Candidate selection (vmapped over sources) ────────────────────
         def _select_cands(src_slot):
-            sx_   = state.p_x[src_slot]
-            sy_   = state.p_y[src_slot]
-            dist_ = jnp.hypot(state.p_x - sx_, state.p_y - sy_)
-            excl_ = state.p_alive & (planet_idx != src_slot)
+            src_x       = state.p_x[src_slot]
+            src_y       = state.p_y[src_slot]
+            dist_to_src = jnp.hypot(state.p_x - src_x, state.p_y - src_y)
+            # Exclude comets: the static-angle fallback aims at the comet's
+            # current position, which it will have left by arrival time, so
+            # fleets typically miss and may continue into the sun.
+            excl_mask   = state.p_alive & (planet_idx != src_slot) & ~state.p_is_comet
 
-            def top_k_(mask, k):
-                d_     = jnp.where(mask & excl_, dist_, INF)
-                slots_ = jnp.argsort(d_)[:k]
-                valid_ = dist_[slots_] < INF
-                return slots_, valid_
+            def top_k(mask, k):
+                sorted_dist = jnp.where(mask & excl_mask, dist_to_src, INF)
+                slots       = jnp.argsort(sorted_dist)[:k]
+                valid       = dist_to_src[slots] < INF
+                return slots, valid
 
-            is_enem_ = excl_ & (state.p_owner != -1) & (state.p_owner != player)
-            is_neut_ = excl_ & (state.p_owner == -1)
-            is_frd_  = excl_ & (state.p_owner == player)
+            is_enemy_planet   = excl_mask & (state.p_owner != -1) & (state.p_owner != player)
+            is_neutral_planet = excl_mask & (state.p_owner == -1)
+            is_friendly_planet = excl_mask & (state.p_owner == player)
 
-            e_s, e_v = top_k_(is_enem_, K_e)
-            n_s, n_v = top_k_(is_neut_, K_n)
-            f_s, f_v = top_k_(is_frd_,  K_f_eff)
+            enemy_slots,   enemy_valid   = top_k(is_enemy_planet,   K_enemy)
+            neutral_slots, neutral_valid = top_k(is_neutral_planet, K_neutral)
+            friendly_slots, friendly_valid = top_k(is_friendly_planet, K_friendly)
 
-            cands_  = jnp.concatenate([jnp.array([-1], jnp.int32), e_s, n_s, f_s])
-            valids_ = jnp.concatenate([jnp.array([True], bool),    e_v, n_v, f_v])
-            return cands_, valids_
+            cand_slots = jnp.concatenate([jnp.array([-1], jnp.int32), enemy_slots, neutral_slots, friendly_slots])
+            cand_valid = jnp.concatenate([jnp.array([True], bool),     enemy_valid, neutral_valid, friendly_valid])
+            return cand_slots, cand_valid
 
         all_cand_slots, all_cand_valid = jax.vmap(_select_cands)(src_slots)
         # [MAX_SRC, K], [MAX_SRC, K]
         safe_slots = jnp.clip(all_cand_slots, 0, MAX_PLANETS - 1)  # [MAX_SRC, K]
 
         # ── Find angles (flat vmap over MAX_SRC*K pairs) ──────────────────
-        src_rep      = jnp.repeat(src_slots[:, None], K, axis=1).reshape(-1)  # [MAX_SRC*K]
-        tgt_flat     = safe_slots.reshape(-1)                                  # [MAX_SRC*K]
-        tgt_ships_2d = state.p_ships[safe_slots]                               # [MAX_SRC, K]
-        ships_flat   = jnp.maximum(tgt_ships_2d + 1.0, 13.0).reshape(-1)      # [MAX_SRC*K]
+        src_slots_flat   = jnp.repeat(src_slots[:, None], K, axis=1).reshape(-1)  # [MAX_SRC*K]
+        tgt_slots_flat   = safe_slots.reshape(-1)                                  # [MAX_SRC*K]
+        tgt_ships_2d     = state.p_ships[safe_slots]                               # [MAX_SRC, K]
+        launch_ships_flat = jnp.maximum(tgt_ships_2d + 1.0, 13.0).reshape(-1)     # [MAX_SRC*K]
 
-        def _angle_pair(ss, ts, sh):
+        def _angle_pair(src_slot, tgt_slot, launch_ships):
             return _find_angle_single(
-                state.p_x[ss], state.p_y[ss], state.p_radius[ss], ss,
-                state.p_x[ts], state.p_y[ts], state.p_radius[ts],
-                state.p_init_x[ts], state.p_init_y[ts], state.p_is_comet[ts],
-                sh, state.angular_velocity,
+                state.p_x[src_slot], state.p_y[src_slot], state.p_radius[src_slot], src_slot,
+                state.p_x[tgt_slot], state.p_y[tgt_slot], state.p_radius[tgt_slot], state.p_is_comet[tgt_slot],
+                launch_ships, state.angular_velocity,
                 state.p_x, state.p_y, state.p_radius, state.p_alive,
-                ts,
+                tgt_slot,
             )
 
-        angles_flat, blocked_flat = jax.vmap(_angle_pair)(src_rep, tgt_flat, ships_flat)
+        angles_flat, blocked_flat = jax.vmap(_angle_pair)(src_slots_flat, tgt_slots_flat, launch_ships_flat)
         angles  = angles_flat.reshape(MAX_BASE_PLANETS, K)    # [MAX_SRC, K]
         blocked = blocked_flat.reshape(MAX_BASE_PLANETS, K)   # [MAX_SRC, K]
 
         # ── Ship counts + candidate mask ──────────────────────────────────
-        tgt_ships_i = jnp.round(tgt_ships_2d).astype(jnp.int32)
-        ship_counts = jnp.maximum(tgt_ships_i + 1, 13)                     # [MAX_SRC, K]
-        ship_counts = ship_counts.at[:, 0].set(0)                          # no-op slot
+        tgt_ships_int = jnp.round(tgt_ships_2d).astype(jnp.int32)
+        ship_counts   = jnp.maximum(tgt_ships_int + 1, 13)                    # [MAX_SRC, K]
+        ship_counts   = ship_counts.at[:, 0].set(0)                           # no-op slot
 
-        src_ships = jnp.round(state.p_ships[src_slots]).astype(jnp.int32)  # [MAX_SRC]
-        enough    = src_ships[:, None] >= ship_counts                       # [MAX_SRC, K]
-        cand_mask = (all_cand_valid & ~blocked & enough).at[:, 0].set(True) # no-op always valid
+        src_ships        = jnp.round(state.p_ships[src_slots]).astype(jnp.int32)  # [MAX_SRC]
+        has_enough_ships = src_ships[:, None] >= ship_counts                       # [MAX_SRC, K]
+        cand_mask = (all_cand_valid & ~blocked & has_enough_ships).at[:, 0].set(True)  # no-op always valid
 
         # ── Candidate IDs ─────────────────────────────────────────────────
         cand_ids = jnp.where(
@@ -235,93 +258,117 @@ def _make_env_encoder(K: int, env_cfg):
             jnp.int32(-1),
         )  # [MAX_SRC, K]
 
-        # ── Global features ───────────────────────────────────────────────
-        my_p_  = state.p_alive & (state.p_owner == player)
-        en_p_  = state.p_alive & (state.p_owner != -1) & (state.p_owner != player)
-        ne_p_  = state.p_alive & (state.p_owner == -1)
-        my_f_  = state.f_alive & (state.f_owner == player)
-        en_f_  = state.f_alive & (state.f_owner != player)
+        # ── Global features  [8] ─────────────────────────────────────────
+        my_planet_mask      = state.p_alive & (state.p_owner == player)
+        enemy_planet_mask   = state.p_alive & (state.p_owner != -1) & (state.p_owner != player)
+        neutral_planet_mask = state.p_alive & (state.p_owner == -1)
+        my_fleet_mask       = state.f_alive & (state.f_owner == player)
+        enemy_fleet_mask    = state.f_alive & (state.f_owner != player)
 
-        n_my = my_p_.sum().astype(jnp.float32)
-        n_en = en_p_.sum().astype(jnp.float32)
-        n_ne = ne_p_.sum().astype(jnp.float32)
-        my_ps  = (state.p_ships * my_p_).sum()
-        en_ps  = (state.p_ships * en_p_).sum()
-        my_fs  = (state.f_ships * my_f_).sum()
-        en_fs  = (state.f_ships * en_f_).sum()
-        norm_  = mp_ * ms
+        n_my_planets   = my_planet_mask.sum().astype(jnp.float32)
+        n_enemy_planets = enemy_planet_mask.sum().astype(jnp.float32)
+        n_neutral_planets = neutral_planet_mask.sum().astype(jnp.float32)
+        my_planet_ships   = (state.p_ships * my_planet_mask).sum()
+        enemy_planet_ships = (state.p_ships * enemy_planet_mask).sum()
+        my_fleet_ships    = (state.f_ships * my_fleet_mask).sum()
+        enemy_fleet_ships = (state.f_ships * enemy_fleet_mask).sum()
+        ship_norm         = max_planets * max_ships
 
         global_feat = jnp.stack([
-            state.step / es,
-            n_my / mp_,
-            n_en / mp_,
-            n_ne / mp_,
-            my_ps / norm_,
-            en_ps / norm_,
-            my_fs / norm_,
-            en_fs / norm_,
+            state.step / episode_steps,           # [0] game-time fraction — late-game urgency signal
+            n_my_planets / max_planets,           # [1] friendly planet fraction — macro board control
+            n_enemy_planets / max_planets,        # [2] enemy planet fraction
+            n_neutral_planets / max_planets,      # [3] unclaimed planets remaining — expansion opportunity
+            my_planet_ships / ship_norm,          # [4] total ships sitting on friendly planets
+            enemy_planet_ships / ship_norm,       # [5] total ships sitting on enemy planets
+            my_fleet_ships / ship_norm,           # [6] friendly ships currently in flight
+            enemy_fleet_ships / ship_norm,        # [7] enemy ships currently in flight — inbound threat
         ]).astype(jnp.float32)
 
         # ── Self features  [MAX_SRC, 11] ──────────────────────────────────
-        sx_  = state.p_x[src_slots]
-        sy_  = state.p_y[src_slots]
-        ix_  = state.p_init_x[src_slots]
-        iy_  = state.p_init_y[src_slots]
-        orb_ = jnp.hypot(ix_ - CENTER, iy_ - CENTER)
-        rot_ = (orb_ + state.p_radius[src_slots]) < ROTATION_RADIUS_LIMIT
-        av_s = jnp.where(rot_, state.angular_velocity / max_av, jnp.float32(0.0))
+        src_x         = state.p_x[src_slots]
+        src_y         = state.p_y[src_slots]
+        src_init_x    = state.p_init_x[src_slots]
+        src_init_y    = state.p_init_y[src_slots]
+        src_orb_radius = jnp.hypot(src_init_x - CENTER, src_init_y - CENTER)
+        src_rotating  = (src_orb_radius + state.p_radius[src_slots]) < ROTATION_RADIUS_LIMIT
+        src_angular_vel = jnp.where(src_rotating, state.angular_velocity / max_angular_velocity, jnp.float32(0.0))
 
-        per_src = jnp.stack([
-            jnp.ones(MAX_BASE_PLANETS, jnp.float32),
-            sx_ / bs,
-            sy_ / bs,
-            state.p_radius[src_slots] / 5.0,
-            jnp.clip(state.p_ships[src_slots], 0.0, ms) / ms,
-            state.p_production[src_slots] / mp,
-            av_s,
+        src_per_planet_feats = jnp.stack([
+            jnp.ones(MAX_BASE_PLANETS, jnp.float32),                              # [0] bias term
+            src_x / board_size,                                                    # [1] normalized board-x position
+            src_y / board_size,                                                    # [2] normalized board-y position
+            state.p_radius[src_slots] / 5.0,                                      # [3] planet size (larger = more ships to capture)
+            jnp.clip(state.p_ships[src_slots], 0.0, max_ships) / max_ships,      # [4] current garrison — ships available to send
+            state.p_production[src_slots] / max_production,                       # [5] ships-per-tick income — high-production planets are worth defending
+            src_angular_vel,                                                       # [6] orbital speed (0 for static outer planets); affects fleet intercept geometry
         ], axis=1)  # [MAX_SRC, 7]
 
-        stats_row = jnp.array([
-            n_my / mp_, n_en / mp_,
-            my_ps / norm_, en_ps / norm_,
+        src_global_stats = jnp.array([
+            n_my_planets / max_planets,     # [7] friendly planet count — proxy for board control
+            n_enemy_planets / max_planets,  # [8] enemy planet count — pressure indicator
+            my_planet_ships / ship_norm,    # [9] total friendly fleet strength — overall offensive/defensive capacity
+            enemy_planet_ships / ship_norm, # [10] total enemy fleet strength — threat level
         ], jnp.float32)
         self_feats = jnp.concatenate(
-            [per_src, jnp.broadcast_to(stats_row[None, :], (MAX_BASE_PLANETS, 4))],
+            [src_per_planet_feats, jnp.broadcast_to(src_global_stats[None, :], (MAX_BASE_PLANETS, 4))],
             axis=1,
         )  # [MAX_SRC, 11]
 
         # ── Candidate features  [MAX_SRC, K, 10] ─────────────────────────
-        tx_   = state.p_x[safe_slots]         # [MAX_SRC, K]
-        ty_   = state.p_y[safe_slots]
-        dx_   = tx_ - sx_[:, None]
-        dy_   = ty_ - sy_[:, None]
-        dist_ = jnp.hypot(dx_, dy_)
+        # NOTE: 10 dims vs 15 in src/features.py — fleet arrival signals omitted
+        # because per-fleet vmap over variable-length lists is incompatible with JAX tracing.
+        tgt_x   = state.p_x[safe_slots]         # [MAX_SRC, K]
+        tgt_y   = state.p_y[safe_slots]
+        delta_x = tgt_x - src_x[:, None]
+        delta_y = tgt_y - src_y[:, None]
+        tgt_dist = jnp.hypot(delta_x, delta_y)
 
-        t_own_  = state.p_owner[safe_slots]
-        is_ne_c = (t_own_ == -1).astype(jnp.float32)
-        is_fr_c = (t_own_ == player).astype(jnp.float32)
-        is_en_c = ((t_own_ != -1) & (t_own_ != player)).astype(jnp.float32)
+        tgt_owner  = state.p_owner[safe_slots]
+        is_neutral = (tgt_owner == -1).astype(jnp.float32)
+        is_friendly = (tgt_owner == player).astype(jnp.float32)
+        is_enemy   = ((tgt_owner != -1) & (tgt_owner != player)).astype(jnp.float32)
 
-        tix_ = state.p_init_x[safe_slots]
-        tiy_ = state.p_init_y[safe_slots]
-        torb_ = jnp.hypot(tix_ - CENTER, tiy_ - CENTER)
-        trot_ = (torb_ + state.p_radius[safe_slots]) < ROTATION_RADIUS_LIMIT
-        av_t  = jnp.where(trot_, state.angular_velocity / max_av, jnp.float32(0.0))
+        tgt_init_x    = state.p_init_x[safe_slots]
+        tgt_init_y    = state.p_init_y[safe_slots]
+        tgt_orb_radius = jnp.hypot(tgt_init_x - CENTER, tgt_init_y - CENTER)
+        tgt_rotating  = (tgt_orb_radius + state.p_radius[safe_slots]) < ROTATION_RADIUS_LIMIT
+        tgt_angular_vel = jnp.where(tgt_rotating, state.angular_velocity / max_angular_velocity, jnp.float32(0.0))
 
         cand_feats = jnp.stack([
-            jnp.ones((MAX_BASE_PLANETS, K), jnp.float32),
-            is_ne_c, is_fr_c, is_en_c,
-            dx_ / bs, dy_ / bs, dist_ / bs,
-            jnp.clip(tgt_ships_2d, 0.0, ms) / ms,
-            state.p_production[safe_slots] / mp,
-            av_t,
+            jnp.ones((MAX_BASE_PLANETS, K), jnp.float32),             # [0] bias / valid-slot indicator (0 = padding/no-op)
+            is_neutral,                                                 # [1] target is neutral — cheap to capture, no retaliation
+            is_friendly,                                                # [2] target is friendly — reinforcement candidate
+            is_enemy,                                                   # [3] target is enemy — offensive strike
+            delta_x / board_size,                                       # [4] signed x-offset from src → encodes direction
+            delta_y / board_size,                                       # [5] signed y-offset from src → encodes direction
+            tgt_dist / board_size,                                      # [6] Euclidean distance — longer = more ticks in flight
+            jnp.clip(tgt_ships_2d, 0.0, max_ships) / max_ships,       # [7] target garrison — ships needed to capture / reinforce
+            state.p_production[safe_slots] / max_production,           # [8] target income rate — strategic value of capture
+            tgt_angular_vel,                                            # [9] orbital speed of target; rotating targets are harder to hit
         ], axis=2).at[:, 0, :].set(0.0)  # [MAX_SRC, K, 10]; no-op slot = zeros
+
+        # ── Fleet features  [MAX_FLEETS, 6] ──────────────────────────────
+        # Velocity (not pure heading) so the cross-attention can extrapolate
+        # "fleet_pos + t·vel" geometrically without re-learning _fleet_speed.
+        f_is_enemy = (state.f_owner != player).astype(jnp.float32)
+        f_spd      = _fleet_speed(state.f_ships)                              # [MAX_FLEETS]
+        fleet_feats = jnp.stack([
+            f_is_enemy,                                                       # [0] 1 if enemy fleet, else 0
+            jnp.clip(state.f_ships, 0.0, max_ships) / max_ships,             # [1] fleet size — damage potential
+            state.f_x / board_size,                                           # [2] normalized x position
+            state.f_y / board_size,                                           # [3] normalized y position
+            f_spd * jnp.cos(state.f_angle) / board_size,                      # [4] vx per tick, board-normalized
+            f_spd * jnp.sin(state.f_angle) / board_size,                      # [5] vy per tick, board-normalized
+        ], axis=1).astype(jnp.float32)                                        # [MAX_FLEETS, 6]
+        fleet_mask = state.f_alive                                            # [MAX_FLEETS]
 
         return _EncodedTurn(
             src_valid       = src_valid,
             src_ids         = state.p_id[src_slots],
             src_ships       = src_ships,
             self_feats      = self_feats,
+            src_slots       = src_slots,
             cand_slots_safe = safe_slots,
             cand_ids        = cand_ids,
             cand_mask       = cand_mask,
@@ -329,6 +376,8 @@ def _make_env_encoder(K: int, env_cfg):
             angles          = angles,
             cand_feats      = cand_feats,
             global_feat     = global_feat,
+            fleet_feats     = fleet_feats,
+            fleet_mask      = fleet_mask,
             step            = state.step,
         )
 

@@ -22,7 +22,7 @@ import sys
 
 from kaggle_environments import make as kaggle_make
 
-from src_jax.jax_physics import (
+from src_jax.physics import (
     MAX_ACTIONS_PA,
     MAX_FLEETS,
     MAX_PLANETS,

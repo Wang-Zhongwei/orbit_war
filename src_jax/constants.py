@@ -8,8 +8,6 @@ kaggle package at training time.
 
 from __future__ import annotations
 
-from collections import namedtuple
-
 # ---------------------------------------------------------------------------
 # Board / physics constants (match kaggle orbit_wars.py verbatim)
 # ---------------------------------------------------------------------------
@@ -34,13 +32,3 @@ COMET_SPEED: float = 4.0
 MIN_ANGULAR_VELOCITY: float = 0.025
 MAX_ANGULAR_VELOCITY: float = 0.05
 
-# ---------------------------------------------------------------------------
-# Named tuples (same field layout as kaggle — rule-based agents use these)
-# ---------------------------------------------------------------------------
-
-Planet = namedtuple(
-    "Planet", ["id", "owner", "x", "y", "radius", "ships", "production"]
-)
-Fleet = namedtuple(
-    "Fleet", ["id", "owner", "x", "y", "angle", "from_planet_id", "ships"]
-)

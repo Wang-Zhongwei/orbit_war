@@ -7,7 +7,8 @@ import jax.numpy as jnp
 import optax
 from flax.training import train_state
 
-from .policy import PlanetPolicy, PolicyOutput, build_module, init_params
+from .policy import PolicyOutput, build_policy, init_params
+from .features import fleet_count as _fleet_count
 
 
 # ---------------------------------------------------------------------------
@@ -19,8 +20,8 @@ class TrainState(train_state.TrainState):
 
 
 def build_train_state(cfg, seed: int = 0) -> TrainState:
-    module = build_module(cfg)
-    params = init_params(module, seed)
+    module = build_policy(cfg)
+    params = init_params(module, seed, fleet_count=_fleet_count())
     tx = optax.chain(
         optax.clip_by_global_norm(cfg.ppo.max_grad_norm),
         optax.adam(cfg.ppo.lr),
@@ -28,16 +29,14 @@ def build_train_state(cfg, seed: int = 0) -> TrainState:
     return TrainState.create(apply_fn=module.apply, params=params, tx=tx)
 
 
-# ---------------------------------------------------------------------------
-# Transition buffer (JAX arrays from rollout through PPO update)
-# ---------------------------------------------------------------------------
-
 @dataclass(slots=True)
-class TransitionBatch:
+class TrainingBatch:
     self_features: jax.Array        # [N, self_dim]
     candidate_features: jax.Array   # [N, K, cand_dim]
     global_features: jax.Array      # [N, global_dim]
     candidate_mask: jax.Array       # [N, K]  bool
+    fleet_features: jax.Array       # [N, MAX_FLEETS, fleet_dim]
+    fleet_mask: jax.Array           # [N, MAX_FLEETS] bool
     target_index: jax.Array         # [N]     int32
     ships_bucket: jax.Array         # [N]     int32
     log_prob: jax.Array             # [N]     float32
@@ -122,6 +121,8 @@ def _minibatch_update(
     cf: jax.Array,
     gf: jax.Array,
     cm: jax.Array,
+    ff: jax.Array,
+    fm: jax.Array,
     old_lp: jax.Array,
     ti: jax.Array,
     sb: jax.Array,
@@ -132,7 +133,7 @@ def _minibatch_update(
     vf_coef: jax.Array,
 ) -> tuple[TrainState, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     def loss_fn(params):
-        outputs = state.apply_fn(params, sf, cf, gf, cm)
+        outputs = state.apply_fn(params, sf, cf, gf, cm, ff, fm)
         new_lp, ent = action_log_prob_and_entropy(outputs, ti, sb)
         ratio = jnp.exp(new_lp - old_lp)
         pg = jnp.maximum(
@@ -154,7 +155,7 @@ def _minibatch_update(
 
 def ppo_update(
     state: TrainState,
-    batch: TransitionBatch,
+    batch: TrainingBatch,
     *,
     clip_coef: float,
     ent_coef: float,
@@ -174,6 +175,8 @@ def ppo_update(
     cf      = batch.candidate_features
     gf      = batch.global_features
     cm      = batch.candidate_mask
+    ff      = batch.fleet_features
+    fm      = batch.fleet_mask
     old_lp  = batch.log_prob
     ti      = batch.target_index
     sb      = batch.ships_bucket
@@ -201,7 +204,7 @@ def ppo_update(
             idx = order[start : start + mb]
             state, loss, pg, vl, em, ratio, new_lp = _minibatch_update(
                 state,
-                sf[idx], cf[idx], gf[idx], cm[idx],
+                sf[idx], cf[idx], gf[idx], cm[idx], ff[idx], fm[idx],
                 old_lp[idx], ti[idx], sb[idx], ret[idx], adv[idx],
                 cc, ec, vc,
             )

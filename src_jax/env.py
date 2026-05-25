@@ -9,48 +9,47 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-from .jax_physics import (
-    JaxState,
+from .physics import (
+    EnvState,
     init_jax_state,
     jax_step_jit,
-    MAX_BASE_PLANETS,
     MAX_ACTIONS_PA,
 )
 
 _EMPTY_ACTIONS = jnp.full((4, MAX_ACTIONS_PA, 3), -1.0, dtype=jnp.float32)
 
 
-def _init_one(seed: int) -> JaxState:
+def _init_one(seed: int) -> EnvState:
     """Generate one board and apply the kaggle init-tick."""
     state = init_jax_state(seed, num_agents=2)
     state, _, _ = jax_step_jit(state, _EMPTY_ACTIONS)
     return state
 
 
-def _stack_states(states: list[JaxState]) -> JaxState:
+def _stack_states(states: list[EnvState]) -> EnvState:
     return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *states)
 
 
-def make_board_pool(n_boards: int, seed: int) -> JaxState:
+def make_board_pool(n_boards: int, seed: int) -> EnvState:
     """Return a stacked JaxState[n_boards, ...] of pre-generated boards."""
     print(f"Generating {n_boards} board layouts …", flush=True)
     states = [_init_one(seed + i) for i in range(n_boards)]
     return _stack_states(states)
 
 
-def select_boards(board_pool: JaxState, indices: jnp.ndarray, n_boards: int) -> JaxState:
+def select_boards(board_pool: EnvState, indices: jnp.ndarray, n_boards: int) -> EnvState:
     """Index board_pool with [N] indices → JaxState[N, ...]."""
     safe = indices % n_boards
     return jax.tree_util.tree_map(lambda x: x[safe], board_pool)
 
 
 def make_initial_carry_state(
-    board_pool: JaxState,
+    board_pool: EnvState,
     n_boards: int,
     n_envs: int,
     seed: int,
     alternate_sides: bool,
-) -> tuple[JaxState, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> tuple[EnvState, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Return (batched_state, board_indices, ep_rewards, learner_players)."""
     indices = jnp.arange(n_envs, dtype=jnp.int32)
     batched = select_boards(board_pool, indices, n_boards)

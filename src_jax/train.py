@@ -12,11 +12,11 @@ import wandb
 from .features import _make_env_encoder
 from .config import TrainConfig, default_train_config_path, load_train_config
 from .env import make_board_pool, make_initial_carry_state
-from .policy import build_module, init_params
+from .policy import build_policy
 from .ppo import TrainState, build_train_state, ppo_update
 from .rollout import (
     RolloutCarry,
-    build_transition_batch,
+    build_training_batch,
     compute_bootstrap_val,
     compute_returns,
     episode_stats,
@@ -50,7 +50,7 @@ def save_checkpoint(save_dir: Path, run_name: str, update: int, train_state: Tra
 def main() -> None:
     args  = parse_args()
     cfg   = load_train_config(args.config)
-    N     = cfg.ppo.num_envs if cfg.ppo.num_envs > 0 else 8
+    N     = cfg.ppo.num_envs if cfg.ppo.num_envs > 0 else 10
     cfg.ppo.num_envs = N
     K     = cfg.env.candidate_count
 
@@ -76,7 +76,7 @@ def main() -> None:
     encode_batch = _make_env_encoder(K, cfg.env)
 
     # ── Policy module + train state ───────────────────────────────────────────
-    module      = build_module(cfg)
+    policy      = build_policy(cfg)
     train_state = build_train_state(cfg, seed=cfg.seed)
     key         = jax.random.PRNGKey(cfg.seed)
 
@@ -96,7 +96,7 @@ def main() -> None:
         board_pool    = board_pool,
         n_boards      = N_BOARDS,
         cfg           = cfg,
-        module        = module,
+        module        = policy,
         rollout_steps = cfg.ppo.rollout_steps,
     )
 
@@ -119,7 +119,7 @@ def main() -> None:
 
             # ── Bootstrap value from last carry state ─────────────────────────
             boot_val = compute_bootstrap_val(
-                module, train_state.params,
+                policy, train_state.params,
                 carry.state, carry.learner_players,
                 encode_batch, K, N,
             )
@@ -129,8 +129,8 @@ def main() -> None:
                 steps.reward, steps.done, boot_val, cfg.ppo.gamma
             )
 
-            # ── Build TransitionBatch ─────────────────────────────────────────
-            batch = build_transition_batch(steps, step_returns)
+            # ── Build TrainingBatch ───────────────────────────────────────────
+            batch = build_training_batch(steps, step_returns)
 
             # ── PPO update ────────────────────────────────────────────────────
             train_state, metrics, key = ppo_update(

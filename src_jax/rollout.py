@@ -15,21 +15,23 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from .jax_physics import (
-    JaxState,
+from .physics import (
+    EnvState,
     jax_step,
     MAX_BASE_PLANETS,
+    MAX_FLEETS,
     MAX_ACTIONS_PA,
     N_AGENTS,
 )
-from .features import _make_env_encoder
-from .ppo import TransitionBatch, sample_actions
+from .features import _make_env_encoder, fleet_feature_dim, _find_angle_single
+from .ppo import TrainingBatch, sample_actions
 from .env import select_boards
 
 MAX_SRC = MAX_BASE_PLANETS   # alias for clarity
 SELF_DIM = 11
 CAND_DIM = 10
 GLOB_DIM = 8
+FLEET_DIM = fleet_feature_dim()
 
 
 # ---------------------------------------------------------------------------
@@ -37,22 +39,24 @@ GLOB_DIM = 8
 # ---------------------------------------------------------------------------
 
 class RolloutCarry(NamedTuple):
-    state: JaxState               # [N, ...]
+    state: EnvState               # [N, ...]
     board_indices: jnp.ndarray    # [N] int32
-    ep_reward: jnp.ndarray        # [N] float32
+    episode_rewards: jnp.ndarray        # [N] float32
     learner_players: jnp.ndarray  # [N] int32
     key: jnp.ndarray
 
 
 class RolloutStep(NamedTuple):
-    sf: jnp.ndarray        # [N, MAX_SRC, SELF_DIM]
-    cf: jnp.ndarray        # [N, MAX_SRC, K, CAND_DIM]
-    gf: jnp.ndarray        # [N, GLOB_DIM]
-    cm: jnp.ndarray        # [N, MAX_SRC, K] bool
-    ti: jnp.ndarray        # [N, MAX_SRC] int32
-    sb: jnp.ndarray        # [N, MAX_SRC] int32
-    lp: jnp.ndarray        # [N, MAX_SRC] float32
-    val: jnp.ndarray       # [N, MAX_SRC] float32
+    self_features: jnp.ndarray        # [N, MAX_SRC, SELF_DIM]
+    candidate_features: jnp.ndarray        # [N, MAX_SRC, K, CAND_DIM]
+    global_features: jnp.ndarray        # [N, GLOB_DIM]
+    candidate_masks: jnp.ndarray        # [N, MAX_SRC, K] bool
+    fleet_features: jnp.ndarray        # [N, MAX_FLEETS, FLEET_DIM]
+    fleet_masks: jnp.ndarray        # [N, MAX_FLEETS] bool
+    target_indices: jnp.ndarray        # [N, MAX_SRC] int32
+    ships_buckets: jnp.ndarray        # [N, MAX_SRC] int32
+    log_probs: jnp.ndarray        # [N, MAX_SRC] float32
+    values: jnp.ndarray       # [N, MAX_SRC] float32
     src_valid: jnp.ndarray # [N, MAX_SRC] bool
     reward: jnp.ndarray    # [N] float32
     done: jnp.ndarray      # [N] bool
@@ -63,31 +67,56 @@ class RolloutStep(NamedTuple):
 # ---------------------------------------------------------------------------
 
 def _build_actions_single(
-    src_ids: jnp.ndarray,    # [MAX_SRC] int32
-    src_ships: jnp.ndarray,  # [MAX_SRC] int32
-    angles: jnp.ndarray,     # [MAX_SRC, K] float32
-    cand_mask: jnp.ndarray,  # [MAX_SRC, K] bool
-    src_valid: jnp.ndarray,  # [MAX_SRC] bool
-    ti: jnp.ndarray,         # [MAX_SRC] int32
-    sb: jnp.ndarray,         # [MAX_SRC] int32
+    src_ids: jnp.ndarray,         # [MAX_SRC] int32
+    src_ships: jnp.ndarray,       # [MAX_SRC] int32
+    angles: jnp.ndarray,          # [MAX_SRC, K] float32  (cached, used for no-op fallback)
+    cand_mask: jnp.ndarray,       # [MAX_SRC, K] bool
+    src_valid: jnp.ndarray,       # [MAX_SRC] bool
+    ti: jnp.ndarray,              # [MAX_SRC] int32
+    sb: jnp.ndarray,              # [MAX_SRC] int32
     ship_bucket_count: int,
+    src_slots: jnp.ndarray,       # [MAX_SRC] int32
+    cand_slots_safe: jnp.ndarray, # [MAX_SRC, K] int32
+    p_x: jnp.ndarray,             # [MAX_PLANETS]
+    p_y: jnp.ndarray,
+    p_r: jnp.ndarray,
+    p_is_comet: jnp.ndarray,
+    p_alive: jnp.ndarray,
+    angular_velocity: jnp.ndarray,
 ) -> jnp.ndarray:
     """Return [MAX_ACTIONS_PA, 3] action tensor. Pure JAX, no Python control flow."""
     row_idx = jnp.arange(MAX_SRC, dtype=jnp.int32)
 
-    tgt_angles  = angles[row_idx, ti]                           # [MAX_SRC]
-    tgt_ok      = (ti != 0) & cand_mask[row_idx, ti]
-    action_ok   = src_valid & tgt_ok                            # [MAX_SRC]
+    tgt_ok    = (ti != 0) & cand_mask[row_idx, ti]
+    action_ok = src_valid & tgt_ok                               # [MAX_SRC]
 
-    frac        = (sb.astype(jnp.float32) + 1.0) / jnp.float32(ship_bucket_count)
-    ships_send  = jnp.maximum(1, jnp.floor(frac * src_ships.astype(jnp.float32)).astype(jnp.int32))
+    frac       = (sb.astype(jnp.float32) + 1.0) / jnp.float32(ship_bucket_count)
+    ships_send = jnp.maximum(1, jnp.floor(frac * src_ships.astype(jnp.float32)).astype(jnp.int32))
+
+    # Recompute intercept angles using the actual ships_send speed.
+    # The cached angles were computed with (tgt_ships+1) ships; the actual fleet
+    # may be faster, causing it to arrive before a rotating planet reaches the
+    # intercept point.  Recomputing here eliminates that mismatch.
+    selected_tgt = cand_slots_safe[row_idx, ti]  # [MAX_SRC]
+
+    def _recompute(src_slot, tgt_slot, n_ships):
+        angle, _ = _find_angle_single(
+            p_x[src_slot], p_y[src_slot], p_r[src_slot], src_slot,
+            p_x[tgt_slot], p_y[tgt_slot], p_r[tgt_slot],
+            p_is_comet[tgt_slot],
+            n_ships.astype(jnp.float32), angular_velocity,
+            p_x, p_y, p_r, p_alive, tgt_slot,
+        )
+        return angle
+
+    tgt_angles = jax.vmap(_recompute)(src_slots, selected_tgt, ships_send)  # [MAX_SRC]
 
     n_act = min(MAX_SRC, MAX_ACTIONS_PA)
     rows  = jnp.stack([
         src_ids[:n_act].astype(jnp.float32),
         tgt_angles[:n_act],
         ships_send[:n_act].astype(jnp.float32),
-    ], axis=1)                                                   # [n_act, 3]
+    ], axis=1)                                                    # [n_act, 3]
     rows  = jnp.where(action_ok[:n_act, None], rows, jnp.full((3,), -1.0))
 
     if n_act < MAX_ACTIONS_PA:
@@ -102,7 +131,7 @@ def _build_actions_single(
 # ---------------------------------------------------------------------------
 
 def make_rollout_fn(
-    board_pool: JaxState,
+    board_pool: EnvState,
     n_boards: int,
     cfg,
     module,
@@ -140,6 +169,10 @@ def make_rollout_fn(
         cf = enc.cand_feats   # [N, MAX_SRC, K, CAND_DIM]
         gf = jnp.broadcast_to(enc.global_feat[:, None, :], (N_ENVS, MAX_SRC, GLOB_DIM))
         cm = enc.cand_mask    # [N, MAX_SRC, K]
+        # Fleet features are per-env; broadcast over MAX_SRC since every source
+        # planet in an env shares the same fleet observation.
+        ff = jnp.broadcast_to(enc.fleet_feats[:, None, :, :], (N_ENVS, MAX_SRC, MAX_FLEETS, FLEET_DIM))
+        fm = jnp.broadcast_to(enc.fleet_mask[:,  None, :],    (N_ENVS, MAX_SRC, MAX_FLEETS))
 
         outputs = module.apply(
             params,
@@ -147,6 +180,8 @@ def make_rollout_fn(
             cf.reshape(N_ENVS * MAX_SRC, K, CAND_DIM),
             gf.reshape(N_ENVS * MAX_SRC, GLOB_DIM),
             cm.reshape(N_ENVS * MAX_SRC, K),
+            ff.reshape(N_ENVS * MAX_SRC, MAX_FLEETS, FLEET_DIM),
+            fm.reshape(N_ENVS * MAX_SRC, MAX_FLEETS),
         )
         key, subkey = jax.random.split(key)
         ti_f, sb_f, lp_f, _, _ = sample_actions(outputs, subkey, deterministic=deterministic)
@@ -157,14 +192,23 @@ def make_rollout_fn(
         val = outputs.value.reshape(N_ENVS, MAX_SRC)
         return ti, sb, lp, val, key
 
-    def _enc_to_actions(enc, ti, sb):
-        def one_env(src_ids, src_ships, angles, cand_mask, valid, ti_i, sb_i):
+    def _enc_to_actions(enc, state, ti, sb):
+        def one_env(
+            src_ids, src_ships, angles, cand_mask, valid, ti_i, sb_i,
+            src_slots, cand_slots_safe,
+            p_x, p_y, p_r, p_init_x, p_init_y, p_is_comet, p_alive, angular_velocity,
+        ):
             return _build_actions_single(
-                src_ids, src_ships, angles, cand_mask, valid, ti_i, sb_i, ship_bucket_count
+                src_ids, src_ships, angles, cand_mask, valid, ti_i, sb_i, ship_bucket_count,
+                src_slots, cand_slots_safe,
+                p_x, p_y, p_r, p_is_comet, p_alive, angular_velocity,
             )
         return jax.vmap(one_env)(
             enc.src_ids, enc.src_ships, enc.angles,
             enc.cand_mask, enc.src_valid, ti, sb,
+            enc.src_slots, enc.cand_slots_safe,
+            state.p_x, state.p_y, state.p_radius, state.p_is_comet, state.p_alive,
+            state.angular_velocity,
         )  # [N, MAX_ACTIONS_PA, 3]
 
     def _joint_actions(learner_players, l_acts, o_acts):
@@ -195,13 +239,13 @@ def make_rollout_fn(
         # Encode and run learner policy
         l_enc = encode_batch(state, learner_players)
         ti, sb, lp, val, key = _run_policy(params, l_enc, key, deterministic=False)
-        l_acts = _enc_to_actions(l_enc, ti, sb)
+        l_acts = _enc_to_actions(l_enc, state, ti, sb)
 
         # Encode and run opponent policy
         opp_players = 1 - learner_players
         o_enc  = encode_batch(state, opp_players)
         oti, osb, _, _, key = _run_policy(opp_params, o_enc, key, deterministic=opp_deterministic)
-        o_acts = _enc_to_actions(o_enc, oti, osb)
+        o_acts = _enc_to_actions(o_enc, state, oti, osb)
 
         # Physics step
         joint = _joint_actions(learner_players, l_acts, o_acts)
@@ -232,11 +276,13 @@ def make_rollout_fn(
         next_ep_reward = jnp.where(done, jnp.zeros_like(ep_reward), ep_reward)
 
         step = RolloutStep(
-            sf=l_enc.self_feats,
-            cf=l_enc.cand_feats,
-            gf=l_enc.global_feat,
-            cm=l_enc.cand_mask,
-            ti=ti, sb=sb, lp=lp, val=val,
+            self_features=l_enc.self_feats,
+            candidate_features=l_enc.cand_feats,
+            global_features=l_enc.global_feat,
+            candidate_masks=l_enc.cand_mask,
+            fleet_features=l_enc.fleet_feats,
+            fleet_masks=l_enc.fleet_mask,
+            target_indices=ti, ships_buckets=sb, log_probs=lp, values=val,
             src_valid=l_enc.src_valid,
             reward=reward, done=done,
         )
@@ -257,9 +303,9 @@ def make_rollout_fn(
 # ---------------------------------------------------------------------------
 
 def compute_bootstrap_val(
-    module,
+    policy,
     params,
-    state: JaxState,          # [N, ...]
+    state: EnvState,          # [N, ...]
     learner_players: jnp.ndarray,  # [N]
     encode_batch,
     K: int,
@@ -268,12 +314,16 @@ def compute_bootstrap_val(
     """Average critic value over valid source planets for each env. Returns [N]."""
     enc = encode_batch(state, learner_players)
     gf  = jnp.broadcast_to(enc.global_feat[:, None, :], (N_ENVS, MAX_SRC, GLOB_DIM))
-    outputs = module.apply(
+    ff  = jnp.broadcast_to(enc.fleet_feats[:, None, :, :], (N_ENVS, MAX_SRC, MAX_FLEETS, FLEET_DIM))
+    fm  = jnp.broadcast_to(enc.fleet_mask[:,  None, :],    (N_ENVS, MAX_SRC, MAX_FLEETS))
+    outputs = policy.apply(
         params,
         enc.self_feats.reshape(N_ENVS * MAX_SRC, SELF_DIM),
         enc.cand_feats.reshape(N_ENVS * MAX_SRC, K, CAND_DIM),
         gf.reshape(N_ENVS * MAX_SRC, GLOB_DIM),
         enc.cand_mask.reshape(N_ENVS * MAX_SRC, K),
+        ff.reshape(N_ENVS * MAX_SRC, MAX_FLEETS, FLEET_DIM),
+        fm.reshape(N_ENVS * MAX_SRC, MAX_FLEETS),
     )
     val   = outputs.value.reshape(N_ENVS, MAX_SRC)
     valid = enc.src_valid.astype(jnp.float32)
@@ -303,26 +353,28 @@ def compute_returns(
 
 
 # ---------------------------------------------------------------------------
-# Build TransitionBatch for PPO — keep rollout tensors as JAX arrays
+# Build TrainingBatch for PPO — keep rollout tensors as JAX arrays
 # ---------------------------------------------------------------------------
 
-def build_transition_batch(steps: RolloutStep, step_returns: jnp.ndarray) -> TransitionBatch:
+def build_training_batch(steps: RolloutStep, step_returns: jnp.ndarray) -> TrainingBatch:
     """
-    Filter padded rows and pack into TransitionBatch.
+    Filter padded rows and pack into TrainingBatch.
 
     steps.* : [T, N, MAX_SRC, ...] (or [T, N] for scalars)
     step_returns : [T, N]  (from compute_returns)
     """
     T, N = step_returns.shape
 
-    sf_all    = steps.sf          # [T, N, MAX_SRC, SELF_DIM]
-    cf_all    = steps.cf          # [T, N, MAX_SRC, K, CAND_DIM]
-    gf_env    = steps.gf          # [T, N, GLOB_DIM]
-    cm_all    = steps.cm          # [T, N, MAX_SRC, K]
-    ti_all    = steps.ti          # [T, N, MAX_SRC]
-    sb_all    = steps.sb
-    lp_all    = steps.lp
-    val_all   = steps.val
+    sf_all    = steps.self_features          # [T, N, MAX_SRC, SELF_DIM]
+    cf_all    = steps.candidate_features          # [T, N, MAX_SRC, K, CAND_DIM]
+    gf_env    = steps.global_features          # [T, N, GLOB_DIM]
+    cm_all    = steps.candidate_masks          # [T, N, MAX_SRC, K]
+    ff_env    = steps.fleet_features         # [T, N, MAX_FLEETS, FLEET_DIM]
+    fm_env    = steps.fleet_masks            # [T, N, MAX_FLEETS]
+    ti_all    = steps.target_indices          # [T, N, MAX_SRC]
+    sb_all    = steps.ships_buckets
+    lp_all    = steps.log_probs
+    val_all   = steps.values
     valid_all = steps.src_valid   # [T, N, MAX_SRC] bool
     rets_all  = step_returns      # [T, N]
 
@@ -338,18 +390,22 @@ def build_transition_batch(steps: RolloutStep, step_returns: jnp.ndarray) -> Tra
     lp_f  = lp_all.reshape(-1)[idx]
     val_f = val_all.reshape(-1)[idx]
 
-    # For each valid (t, n, s), global feat is gf_env[t, n] and return is rets_all[t, n].
+    # For each valid (t, n, s): global / fleet feats and return are env-level (per t, n).
     # tn_idx maps flat decision index → flat (t*N + n) index.
     tn_idx = idx // sf_all.shape[2]              # [N_valid] in [0, T*N)
-    gf_f   = gf_env.reshape(T * N, -1)[tn_idx]  # [N_valid, GLOB_DIM]
+    gf_f   = gf_env.reshape(T * N, -1)[tn_idx]                                   # [N_valid, GLOB_DIM]
+    ff_f   = ff_env.reshape(T * N, ff_env.shape[-2], ff_env.shape[-1])[tn_idx]  # [N_valid, MAX_FLEETS, FLEET_DIM]
+    fm_f   = fm_env.reshape(T * N, fm_env.shape[-1])[tn_idx]                    # [N_valid, MAX_FLEETS]
     ret_f  = rets_all.reshape(-1)[tn_idx]        # [N_valid]
     adv_f  = ret_f - val_f
 
-    return TransitionBatch(
+    return TrainingBatch(
         self_features      = sf_f,
         candidate_features = cf_f,
         global_features    = gf_f,
         candidate_mask     = cm_f,
+        fleet_features     = ff_f,
+        fleet_mask         = fm_f,
         target_index       = ti_f.astype(jnp.int32),
         ships_bucket       = sb_f.astype(jnp.int32),
         log_prob           = lp_f,
