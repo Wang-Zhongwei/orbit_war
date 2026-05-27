@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 
 from .bc_data import obs_to_env_state
-from .features import MIN_SOURCE_SHIPS, _find_angle_single, _make_env_encoder
+from .features import MIN_SOURCE_SHIPS, _make_env_encoder, aim_fleets
 from .physics import MAX_BASE_PLANETS, MAX_FLEETS
 from .policy import build_policy
 from .rollout import CAND_DIM, GLOB_DIM, SELF_DIM, FLEET_DIM
@@ -86,21 +86,7 @@ def make_jax_agent(
     def _forward(sf, cf, gf, cm, ff, fm):
         return module.apply(params, sf, cf, gf, cm, ff, fm)
 
-    @jax.jit
-    def _reaim_all(
-        p_x, p_y, p_r, p_alive, p_is_comet, angular_velocity,
-        src_slots, selected_tgt, ships_send,
-    ):
-        def _per(src_slot, tgt_slot, n_ships):
-            angle, _ = _find_angle_single(
-                p_x[src_slot], p_y[src_slot], p_r[src_slot], src_slot,
-                p_x[tgt_slot], p_y[tgt_slot], p_r[tgt_slot],
-                p_is_comet[tgt_slot],
-                n_ships.astype(jnp.float32), angular_velocity,
-                p_x, p_y, p_r, p_alive, p_is_comet, tgt_slot,
-            )
-            return angle
-        return jax.vmap(_per)(src_slots, selected_tgt, ships_send)
+    _reaim_all = jax.jit(aim_fleets)
 
     def agent(obs) -> list:
         nonlocal rng_key
@@ -146,19 +132,22 @@ def make_jax_agent(
         src_slots       = enc.src_slots[0]        # [MAX_SRC] int32
         cand_slots_safe = enc.cand_slots_safe[0]  # [MAX_SRC, K] int32
 
-        # Re-aim with the actual ships the policy sends: cached angles assumed
-        # `max(tgt_ships+1, 13)` ships, but the ships head can pick anything from
-        # 1..S. For rotating targets, that speed mismatch shifts the intercept
-        # point and the fleet misses. Recompute per chosen (src, tgt, ships).
+        # Re-aim with the actual ships the policy sends and re-verify sun
+        # clearance with that exact intercept geometry. The encoder's cand_mask
+        # used src_ships//2 as a speed estimate; the policy can pick any bucket
+        # and the resulting fleet speed shifts the intercept point. If the
+        # sun-block check disagrees here, drop the fleet rather than send it
+        # into the sun.
         frac       = (sb.astype(jnp.float32) + 1.0) / jnp.float32(B)
         ships_send = jnp.maximum(MIN_SOURCE_SHIPS, jnp.floor(frac * src_ships.astype(jnp.float32)).astype(jnp.int32))
         selected_tgt = cand_slots_safe[row_idx, ti]   # [MAX_SRC]
 
-        reaim_angles = _reaim_all(
-            state.p_x, state.p_y, state.p_radius, state.p_alive, state.p_is_comet,
+        reaim_angles, is_blocked = _reaim_all(
+            state.p_x, state.p_y, state.p_radius,
+            state.p_alive, state.p_is_comet,
             state.angular_velocity,
             src_slots, selected_tgt, ships_send,
-        )  # [MAX_SRC]
+        )  # both [MAX_SRC]
 
         moves: list = []
         for i in range(MAX_SRC):
@@ -168,6 +157,8 @@ def make_jax_agent(
             if t == 0:           # no-op chosen
                 continue
             if not bool(cand_mask[i, t]):
+                continue
+            if bool(is_blocked[i]):
                 continue
             ships = int(ships_send[i])
             angle = float(reaim_angles[i])

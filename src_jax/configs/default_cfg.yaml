@@ -23,7 +23,7 @@ ppo:
   minibatch_size: 2048
   gamma: 0.99
   clip_coef: 0.2
-  ent_coef: 0.01
+  ent_coef: 0.05
   vf_coef: 0.5
   lr: 0.0003
   max_grad_norm: 0.5

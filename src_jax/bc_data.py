@@ -13,8 +13,11 @@ Each training sample = one source-planet decision at one timestep:
 
 Label extraction:
   - source planet: matched by planet_id in encoder's src_ids
-  - target candidate: matched by finding the encoder's precomputed angle
-    (enc.angles[src_idx, k]) closest to the action's launch angle
+  - target candidate: matched by recomputing the intercept angle to each candidate
+    using the expert's ACTUAL ship count (act_ships), then finding the candidate
+    whose recomputed angle is closest to the action's launch angle.
+    Using actual ships (vs the encoder's estimated src_ships//2) matters for
+    rotating targets whose lead angle depends on fleet speed.
   - ship bucket: bucket b sends floor((b+1)/B * src_ships) ships;
     pick the bucket whose ships_count is closest to the expert's choice
 """
@@ -32,6 +35,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from .constants import CENTER, MAX_SHIP_SPEED, ROTATION_RADIUS_LIMIT
 from .physics import (
     EnvState,
     MAX_BASE_PLANETS,
@@ -44,6 +48,51 @@ from .physics import (
 # Maximum angular distance (radians) to accept an angle match.
 # ~34 degrees; tight enough to avoid mis-labeling, loose enough for imperfect expert angles.
 _ANGLE_MATCH_THRESHOLD: float = 0.6
+
+_MAX_TICKS_PY: int = 25  # must match features.py's _MAX_TICKS
+
+
+def _find_angles_for_action(
+    src_x: float, src_y: float, src_radius: float,
+    tgt_x: np.ndarray, tgt_y: np.ndarray, tgt_radius: np.ndarray,  # [K]
+    ships: float, angular_velocity: float,
+    valid_mask: np.ndarray,  # [K] bool — which candidates to process
+) -> np.ndarray:
+    """Compute intercept angles to all K candidates in one vectorized sweep.
+
+    The 25-tick scan stays in a Python loop but operates on K-wide numpy arrays,
+    replacing K separate Python calls with 25 numpy operations over K elements.
+    """
+    s = max(ships, 1.0)
+    spd = 1.0 + (MAX_SHIP_SPEED - 1.0) * (math.log(s) / math.log(1000.0)) ** 1.5
+
+    dx0 = tgt_x - CENTER
+    dy0 = tgt_y - CENTER
+    orb_r = np.sqrt(dx0 * dx0 + dy0 * dy0)
+    rotating  = (orb_r + tgt_radius) < ROTATION_RADIUS_LIMIT  # [K]
+    init_ang  = np.arctan2(dy0, dx0)                           # [K]
+
+    # Static fallback — non-rotating targets and rotating ones with no intercept
+    angles = np.arctan2(tgt_y - src_y, tgt_x - src_x)         # [K]
+    found      = np.zeros(len(tgt_x), dtype=bool)
+    needs_scan = rotating & valid_mask
+
+    for tick in range(1, _MAX_TICKS_PY + 1):
+        remaining = needs_scan & ~found
+        if not remaining.any():
+            break
+        t    = float(tick)
+        ang_t = init_ang + angular_velocity * t
+        tx   = CENTER + orb_r * np.cos(ang_t)
+        ty   = CENTER + orb_r * np.sin(ang_t)
+        dx   = tx - src_x
+        dy   = ty - src_y
+        gap  = spd * t - (np.sqrt(dx * dx + dy * dy) - src_radius)
+        hit  = remaining & (np.abs(gap) < tgt_radius)
+        angles = np.where(hit, np.arctan2(dy, dx), angles)
+        found |= hit
+
+    return angles  # [K]
 
 
 # ---------------------------------------------------------------------------
@@ -163,10 +212,6 @@ def obs_to_env_state(obs: dict) -> EnvState:
 # Label extraction
 # ---------------------------------------------------------------------------
 
-def _angle_diff(a: float, b: float) -> float:
-    d = a - b
-    return abs(math.atan2(math.sin(d), math.cos(d)))
-
 
 def _ships_to_bucket(act_ships: int, src_ships: int, B: int) -> int:
     """Return the bucket index whose decoded ship count is closest to act_ships."""
@@ -177,15 +222,26 @@ def _ships_to_bucket(act_ships: int, src_ships: int, B: int) -> int:
 def extract_labels(
     action: list,
     *,
-    src_ids: np.ndarray,    # [MAX_BASE_PLANETS] int32
-    src_valid: np.ndarray,  # [MAX_BASE_PLANETS] bool
-    src_ships: np.ndarray,  # [MAX_BASE_PLANETS] int32
-    cand_mask: np.ndarray,  # [MAX_BASE_PLANETS, K] bool
-    angles: np.ndarray,     # [MAX_BASE_PLANETS, K] float32
+    src_ids: np.ndarray,        # [MAX_BASE_PLANETS] int32
+    src_valid: np.ndarray,      # [MAX_BASE_PLANETS] bool
+    src_ships: np.ndarray,      # [MAX_BASE_PLANETS] int32
+    cand_mask: np.ndarray,      # [MAX_BASE_PLANETS, K] bool
     B: int,
+    # State geometry — needed to recompute angles with the expert's actual ship count
+    p_x: np.ndarray,            # [MAX_PLANETS] float32
+    p_y: np.ndarray,            # [MAX_PLANETS] float32
+    p_radius: np.ndarray,       # [MAX_PLANETS] float32
+    angular_velocity: float,
+    src_slots: np.ndarray,      # [MAX_BASE_PLANETS] int32 — planet slot per source
+    cand_slots: np.ndarray,     # [MAX_BASE_PLANETS, K] int32 — planet slot per candidate
 ) -> list[tuple[int, int, int]]:
-    """Return (src_slot_idx, cand_idx, ship_bucket) for each matched action entry."""
-    K = cand_mask.shape[1]
+    """Return (src_slot_idx, cand_idx, ship_bucket) for each matched action entry.
+
+    If the expert's launch angle is beyond _ANGLE_MATCH_THRESHOLD from every candidate
+    (i.e. the target was outside the candidate pool), the action is labelled as no-op
+    (cand_idx=0, ships_bucket=0) rather than dropped — preserving the training signal
+    that this state called for inaction within the modelled action space.
+    """
     labels: list[tuple[int, int, int]] = []
 
     for act in action:
@@ -202,22 +258,37 @@ def extract_labels(
         if src_idx == -1:
             continue  # planet not in encoder's source set (< MIN_SOURCE_SHIPS)
 
-        # Find closest candidate by angle — skip no-op (k=0)
-        best_k    = -1
-        best_dist = float("inf")
-        for k in range(1, K):
-            if not cand_mask[src_idx, k]:
-                continue
-            dist = _angle_diff(float(angles[src_idx, k]), act_angle)
-            if dist < best_dist:
-                best_dist = dist
-                best_k    = k
-
-        if best_k == -1 or best_dist > _ANGLE_MATCH_THRESHOLD:
-            continue  # no valid candidate or angle too far from any candidate
-
         S = int(src_ships[src_idx])
         if S <= 0:
+            continue
+
+        src_slot  = int(src_slots[src_idx])
+        cslots    = cand_slots[src_idx]          # [K]
+
+        # Exclude the no-op slot (k=0) from angle matching
+        valid_mask = cand_mask[src_idx].copy()
+        valid_mask[0] = False
+
+        # Recompute intercept angles to all K candidates at once with actual act_ships.
+        # This vectorises the per-candidate scan: 25 numpy ops over K instead of K×25 calls.
+        angles_k = _find_angles_for_action(
+            float(p_x[src_slot]), float(p_y[src_slot]), float(p_radius[src_slot]),
+            p_x[cslots], p_y[cslots], p_radius[cslots],
+            float(act_ships), angular_velocity,
+            valid_mask,
+        )
+
+        # Vectorised angular distance; masked candidates get inf
+        diff  = angles_k - act_angle
+        dists = np.abs(np.arctan2(np.sin(diff), np.cos(diff)))
+        dists = np.where(valid_mask, dists, np.inf)
+
+        best_k    = int(np.argmin(dists))
+        best_dist = float(dists[best_k])
+
+        if best_dist > _ANGLE_MATCH_THRESHOLD:
+            # Expert targeted a planet outside the candidate pool → label as no-op
+            labels.append((src_idx, 0, 0))
             continue
 
         bucket = _ships_to_bucket(act_ships, S, B)
@@ -275,7 +346,8 @@ def episode_to_samples(
     batched = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *batch_states)
     players_arr = jnp.array(batch_players, dtype=jnp.int32)
     enc = encode_fn(batched, players_arr)
-    enc_np = jax.tree_util.tree_map(np.asarray, enc)
+    enc_np     = jax.tree_util.tree_map(np.asarray, enc)
+    batched_np = jax.tree_util.tree_map(np.asarray, batched)
 
     rows_sf, rows_cf, rows_gf, rows_cm = [], [], [], []
     rows_ff, rows_fm, rows_ti, rows_sb = [], [], [], []
@@ -284,12 +356,17 @@ def episode_to_samples(
     for i in range(N):
         labels = extract_labels(
             batch_actions[i],
-            src_ids   = enc_np.src_ids[i],
-            src_valid = enc_np.src_valid[i],
-            src_ships = enc_np.src_ships[i],
-            cand_mask = enc_np.cand_mask[i],
-            angles    = enc_np.angles[i],
-            B         = ship_bucket_count,
+            src_ids          = enc_np.src_ids[i],
+            src_valid        = enc_np.src_valid[i],
+            src_ships        = enc_np.src_ships[i],
+            cand_mask        = enc_np.cand_mask[i],
+            B                = ship_bucket_count,
+            p_x              = batched_np.p_x[i],
+            p_y              = batched_np.p_y[i],
+            p_radius         = batched_np.p_radius[i],
+            angular_velocity = float(batched_np.angular_velocity[i]),
+            src_slots        = enc_np.src_slots[i],
+            cand_slots       = enc_np.cand_slots_safe[i],
         )
         for src_idx, cand_idx, ship_bucket in labels:
             rows_sf.append(enc_np.self_feats[i,   src_idx])
@@ -339,39 +416,6 @@ def _iter_episode_jsons(episodes_dir: Path):
                     yield path.name, json.load(f)
             except Exception:
                 continue
-
-
-def iter_episodes(
-    episodes_dir: Path,
-    encode_fn,
-    ship_bucket_count: int,
-    *,
-    min_avg_score: float = 0.0,
-    winner_only: bool = False,
-) -> Iterator[dict[str, np.ndarray]]:
-    """Yield sample dicts, one per episode, from a zip archive or loose .json files."""
-    for _name, episode in _iter_episode_jsons(episodes_dir):
-
-        if not isinstance(episode, dict) or "steps" not in episode:
-            continue  # old format (agent logs only)
-
-        if winner_only:
-            rewards = episode.get("rewards", [])
-            statuses = episode.get("statuses", [])
-            # Keep only actions from the player who won (+1 reward)
-            winning_player = next(
-                (i for i, (r, s) in enumerate(zip(rewards, statuses))
-                 if r == max(rewards) and s == "DONE"),
-                None,
-            )
-            if winning_player is None:
-                continue
-            # Mask out the losing agent's steps
-            episode = _filter_winner(episode, winning_player)
-
-        samples = episode_to_samples(episode, encode_fn, ship_bucket_count)
-        if samples is not None:
-            yield samples
 
 
 def _filter_winner(episode: dict, winner: int) -> dict:

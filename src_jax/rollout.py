@@ -23,7 +23,7 @@ from .physics import (
     MAX_ACTIONS_PA,
     N_AGENTS,
 )
-from .features import MIN_SOURCE_SHIPS, _make_env_encoder, fleet_feature_dim, _find_angle_single
+from .features import MIN_SOURCE_SHIPS, _make_env_encoder, fleet_feature_dim, aim_fleets
 from .ppo import TrainingBatch, sample_actions
 from .env import select_boards
 
@@ -76,16 +76,17 @@ def _compute_ships_and_angles_single(
     p_x: jnp.ndarray,             # [MAX_PLANETS]
     p_y: jnp.ndarray,
     p_r: jnp.ndarray,
-    p_is_comet: jnp.ndarray,
     p_alive: jnp.ndarray,
+    p_is_comet: jnp.ndarray,
     angular_velocity: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Convert (target idx, ship bucket) → (ships_send, intercept angle) per source.
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Convert (target idx, ship bucket) → (ships_send, intercept angle, is_blocked).
 
-    The cached encoder angles assumed `max(tgt_ships+1, 13)` ships per fleet, but
-    the ships head can pick anything from 1..S. For rotating targets that speed
-    mismatch shifts the intercept point and the fleet misses, so we redo the
-    angle calc with the actual ship count here.
+    Called once per selected dispatch with the policy's actual ship count.
+    Computes the lead-corrected angle for rotating targets (the encoder's
+    cand_mask used a coarser src_ships//2 speed estimate, so a residual
+    intercept-angle drift is fixed up here) and re-checks sun + static-planet
+    blocking on the actual chord — if blocked, the fleet is dropped at action assembly.
     """
     row_idx = jnp.arange(MAX_SRC, dtype=jnp.int32)
 
@@ -94,18 +95,11 @@ def _compute_ships_and_angles_single(
 
     selected_tgt = cand_slots_safe[row_idx, ti]  # [MAX_SRC]
 
-    def _reaim(src_slot, tgt_slot, n_ships):
-        angle, _ = _find_angle_single(
-            p_x[src_slot], p_y[src_slot], p_r[src_slot], src_slot,
-            p_x[tgt_slot], p_y[tgt_slot], p_r[tgt_slot],
-            p_is_comet[tgt_slot],
-            n_ships.astype(jnp.float32), angular_velocity,
-            p_x, p_y, p_r, p_alive, p_is_comet, tgt_slot,
-        )
-        return angle
-
-    tgt_angles = jax.vmap(_reaim)(src_slots, selected_tgt, ships_send)  # [MAX_SRC]
-    return ships_send, tgt_angles
+    tgt_angles, is_blocked = aim_fleets(
+        p_x, p_y, p_r, p_alive, p_is_comet, angular_velocity,
+        src_slots, selected_tgt, ships_send,
+    )
+    return ships_send, tgt_angles, is_blocked
 
 
 def _build_actions_single(
@@ -115,11 +109,12 @@ def _build_actions_single(
     ti: jnp.ndarray,              # [MAX_SRC] int32
     ships_send: jnp.ndarray,      # [MAX_SRC] int32
     tgt_angles: jnp.ndarray,      # [MAX_SRC] float32
+    is_blocked: jnp.ndarray,      # [MAX_SRC] bool — drop fleet if True
 ) -> jnp.ndarray:
     """Assemble [MAX_ACTIONS_PA, 3] action tensor from precomputed ships + angles."""
     row_idx = jnp.arange(MAX_SRC, dtype=jnp.int32)
 
-    tgt_ok    = (ti != 0) & cand_mask[row_idx, ti]
+    tgt_ok    = (ti != 0) & cand_mask[row_idx, ti] & ~is_blocked
     action_ok = src_valid & tgt_ok                               # [MAX_SRC]
 
     n_act = min(MAX_SRC, MAX_ACTIONS_PA)
@@ -207,21 +202,22 @@ def make_rollout_fn(
         def one_env(
             src_ids, src_ships, cand_mask, valid, ti_i, sb_i,
             src_slots, cand_slots_safe,
-            p_x, p_y, p_r, p_is_comet, p_alive, angular_velocity,
+            p_x, p_y, p_r, p_alive, p_is_comet, angular_velocity,
         ):
-            ships_send, tgt_angles = _compute_ships_and_angles_single(
+            ships_send, tgt_angles, is_blocked = _compute_ships_and_angles_single(
                 src_ships, ti_i, sb_i, ship_bucket_count,
                 src_slots, cand_slots_safe,
-                p_x, p_y, p_r, p_is_comet, p_alive, angular_velocity,
+                p_x, p_y, p_r, p_alive, p_is_comet, angular_velocity,
             )
             return _build_actions_single(
-                src_ids, cand_mask, valid, ti_i, ships_send, tgt_angles,
+                src_ids, cand_mask, valid, ti_i, ships_send, tgt_angles, is_blocked,
             )
         return jax.vmap(one_env)(
             enc.src_ids, enc.src_ships,
             enc.cand_mask, enc.src_valid, ti, sb,
             enc.src_slots, enc.cand_slots_safe,
-            state.p_x, state.p_y, state.p_radius, state.p_is_comet, state.p_alive,
+            state.p_x, state.p_y, state.p_radius,
+            state.p_alive, state.p_is_comet,
             state.angular_velocity,
         )  # [N, MAX_ACTIONS_PA, 3]
 
