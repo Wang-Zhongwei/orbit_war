@@ -23,15 +23,17 @@ from .physics import (
     MAX_ACTIONS_PA,
     N_AGENTS,
 )
-from .features import MIN_SOURCE_SHIPS, _make_env_encoder, fleet_feature_dim, aim_fleets
+from .features import (
+    MIN_SOURCE_SHIPS, _make_env_encoder, aim_fleets,
+    self_feature_dim, candidate_feature_dim, global_feature_dim,
+)
 from .ppo import TrainingBatch, sample_actions
 from .env import select_boards
 
-MAX_SRC = MAX_BASE_PLANETS   # alias for clarity
-SELF_DIM = 11
-CAND_DIM = 10
-GLOB_DIM = 8
-FLEET_DIM = fleet_feature_dim()
+MAX_SRC  = MAX_BASE_PLANETS   # alias for clarity
+SELF_DIM = self_feature_dim()
+CAND_DIM = candidate_feature_dim()
+GLOB_DIM = global_feature_dim()
 
 
 # ---------------------------------------------------------------------------
@@ -48,12 +50,10 @@ class RolloutCarry(NamedTuple):
 
 class RolloutStep(NamedTuple):
     self_features: jnp.ndarray        # [N, MAX_SRC, SELF_DIM]
-    candidate_features: jnp.ndarray        # [N, MAX_SRC, K, CAND_DIM]
-    global_features: jnp.ndarray        # [N, GLOB_DIM]
-    candidate_masks: jnp.ndarray        # [N, MAX_SRC, K] bool
-    fleet_features: jnp.ndarray        # [N, MAX_FLEETS, FLEET_DIM]
-    fleet_masks: jnp.ndarray        # [N, MAX_FLEETS] bool
-    target_indices: jnp.ndarray        # [N, MAX_SRC] int32
+    candidate_features: jnp.ndarray   # [N, MAX_SRC, K, CAND_DIM]
+    global_features: jnp.ndarray      # [N, GLOB_DIM]
+    candidate_masks: jnp.ndarray      # [N, MAX_SRC, K] bool
+    target_indices: jnp.ndarray       # [N, MAX_SRC] int32
     ships_buckets: jnp.ndarray        # [N, MAX_SRC] int32
     log_probs: jnp.ndarray        # [N, MAX_SRC] float32
     values: jnp.ndarray       # [N, MAX_SRC] float32
@@ -175,10 +175,6 @@ def make_rollout_fn(
         cf = enc.cand_feats   # [N, MAX_SRC, K, CAND_DIM]
         gf = jnp.broadcast_to(enc.global_feat[:, None, :], (N_ENVS, MAX_SRC, GLOB_DIM))
         cm = enc.cand_mask    # [N, MAX_SRC, K]
-        # Fleet features are per-env; broadcast over MAX_SRC since every source
-        # planet in an env shares the same fleet observation.
-        ff = jnp.broadcast_to(enc.fleet_feats[:, None, :, :], (N_ENVS, MAX_SRC, MAX_FLEETS, FLEET_DIM))
-        fm = jnp.broadcast_to(enc.fleet_mask[:,  None, :],    (N_ENVS, MAX_SRC, MAX_FLEETS))
 
         outputs = module.apply(
             params,
@@ -186,8 +182,6 @@ def make_rollout_fn(
             cf.reshape(N_ENVS * MAX_SRC, K, CAND_DIM),
             gf.reshape(N_ENVS * MAX_SRC, GLOB_DIM),
             cm.reshape(N_ENVS * MAX_SRC, K),
-            ff.reshape(N_ENVS * MAX_SRC, MAX_FLEETS, FLEET_DIM),
-            fm.reshape(N_ENVS * MAX_SRC, MAX_FLEETS),
         )
         key, subkey = jax.random.split(key)
         ti_f, sb_f, lp_f, _, _ = sample_actions(outputs, subkey, deterministic=deterministic)
@@ -290,8 +284,6 @@ def make_rollout_fn(
             candidate_features=l_enc.cand_feats,
             global_features=l_enc.global_feat,
             candidate_masks=l_enc.cand_mask,
-            fleet_features=l_enc.fleet_feats,
-            fleet_masks=l_enc.fleet_mask,
             target_indices=ti, ships_buckets=sb, log_probs=lp, values=val,
             src_valid=l_enc.src_valid,
             reward=reward, done=done,
@@ -324,16 +316,12 @@ def compute_bootstrap_val(
     """Average critic value over valid source planets for each env. Returns [N]."""
     enc = encode_batch(state, learner_players)
     gf  = jnp.broadcast_to(enc.global_feat[:, None, :], (N_ENVS, MAX_SRC, GLOB_DIM))
-    ff  = jnp.broadcast_to(enc.fleet_feats[:, None, :, :], (N_ENVS, MAX_SRC, MAX_FLEETS, FLEET_DIM))
-    fm  = jnp.broadcast_to(enc.fleet_mask[:,  None, :],    (N_ENVS, MAX_SRC, MAX_FLEETS))
     outputs = policy.apply(
         params,
         enc.self_feats.reshape(N_ENVS * MAX_SRC, SELF_DIM),
         enc.cand_feats.reshape(N_ENVS * MAX_SRC, K, CAND_DIM),
         gf.reshape(N_ENVS * MAX_SRC, GLOB_DIM),
         enc.cand_mask.reshape(N_ENVS * MAX_SRC, K),
-        ff.reshape(N_ENVS * MAX_SRC, MAX_FLEETS, FLEET_DIM),
-        fm.reshape(N_ENVS * MAX_SRC, MAX_FLEETS),
     )
     val   = outputs.value.reshape(N_ENVS, MAX_SRC)
     valid = enc.src_valid.astype(jnp.float32)
@@ -375,13 +363,11 @@ def build_training_batch(steps: RolloutStep, step_returns: jnp.ndarray) -> Train
     """
     T, N = step_returns.shape
 
-    sf_all    = steps.self_features          # [T, N, MAX_SRC, SELF_DIM]
-    cf_all    = steps.candidate_features          # [T, N, MAX_SRC, K, CAND_DIM]
-    gf_env    = steps.global_features          # [T, N, GLOB_DIM]
-    cm_all    = steps.candidate_masks          # [T, N, MAX_SRC, K]
-    ff_env    = steps.fleet_features         # [T, N, MAX_FLEETS, FLEET_DIM]
-    fm_env    = steps.fleet_masks            # [T, N, MAX_FLEETS]
-    ti_all    = steps.target_indices          # [T, N, MAX_SRC]
+    sf_all    = steps.self_features      # [T, N, MAX_SRC, SELF_DIM]
+    cf_all    = steps.candidate_features # [T, N, MAX_SRC, K, CAND_DIM]
+    gf_env    = steps.global_features   # [T, N, GLOB_DIM]
+    cm_all    = steps.candidate_masks   # [T, N, MAX_SRC, K]
+    ti_all    = steps.target_indices    # [T, N, MAX_SRC]
     sb_all    = steps.ships_buckets
     lp_all    = steps.log_probs
     val_all   = steps.values
@@ -400,12 +386,10 @@ def build_training_batch(steps: RolloutStep, step_returns: jnp.ndarray) -> Train
     lp_f  = lp_all.reshape(-1)[idx]
     val_f = val_all.reshape(-1)[idx]
 
-    # For each valid (t, n, s): global / fleet feats and return are env-level (per t, n).
+    # For each valid (t, n, s): global feats and return are env-level (per t, n).
     # tn_idx maps flat decision index → flat (t*N + n) index.
     tn_idx = idx // sf_all.shape[2]              # [N_valid] in [0, T*N)
-    gf_f   = gf_env.reshape(T * N, -1)[tn_idx]                                   # [N_valid, GLOB_DIM]
-    ff_f   = ff_env.reshape(T * N, ff_env.shape[-2], ff_env.shape[-1])[tn_idx]  # [N_valid, MAX_FLEETS, FLEET_DIM]
-    fm_f   = fm_env.reshape(T * N, fm_env.shape[-1])[tn_idx]                    # [N_valid, MAX_FLEETS]
+    gf_f   = gf_env.reshape(T * N, -1)[tn_idx]  # [N_valid, GLOB_DIM]
     ret_f  = rets_all.reshape(-1)[tn_idx]        # [N_valid]
     adv_f  = ret_f - val_f
 
@@ -414,8 +398,6 @@ def build_training_batch(steps: RolloutStep, step_returns: jnp.ndarray) -> Train
         candidate_features = cf_f,
         global_features    = gf_f,
         candidate_mask     = cm_f,
-        fleet_features     = ff_f,
-        fleet_mask         = fm_f,
         target_index       = ti_f.astype(jnp.int32),
         ships_bucket       = sb_f.astype(jnp.int32),
         log_prob           = lp_f,

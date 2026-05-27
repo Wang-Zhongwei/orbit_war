@@ -52,13 +52,11 @@ def _bc_step(
     cf: jax.Array,   # [N, K, cand_dim]
     gf: jax.Array,   # [N, global_dim]
     cm: jax.Array,   # [N, K]
-    ff: jax.Array,   # [N, MAX_FLEETS, fleet_dim]
-    fm: jax.Array,   # [N, MAX_FLEETS]
     ti: jax.Array,   # [N]  int32  target index
     sb: jax.Array,   # [N]  int32  ship bucket
 ) -> tuple[TrainState, jax.Array, jax.Array, jax.Array]:
     def loss_fn(params):
-        out = state.apply_fn(params, sf, cf, gf, cm, ff, fm)
+        out = state.apply_fn(params, sf, cf, gf, cm)
         N   = ti.shape[0]
 
         # Target cross-entropy
@@ -171,8 +169,6 @@ def train(
             cf = jnp.asarray(data["cand_feats"][perm])
             gf = jnp.asarray(data["global_feats"][perm])
             cm = jnp.asarray(data["cand_mask"][perm])
-            ff = jnp.asarray(data["fleet_feats"][perm])
-            fm = jnp.asarray(data["fleet_mask"][perm])
             ti = jnp.asarray(data["target_idx"][perm])
             sb = jnp.asarray(data["ships_bucket"][perm])
 
@@ -181,7 +177,7 @@ def train(
                 state, loss, tgt_l, shp_l = _bc_step(
                     state,
                     sf[start:end], cf[start:end], gf[start:end], cm[start:end],
-                    ff[start:end], fm[start:end], ti[start:end], sb[start:end],
+                    ti[start:end], sb[start:end],
                 )
                 losses.append(float(loss))
                 tgt_losses.append(float(tgt_l))

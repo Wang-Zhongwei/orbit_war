@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 
-from .features import self_feature_dim, candidate_feature_dim, global_feature_dim, fleet_feature_dim
+from .features import self_feature_dim, candidate_feature_dim, global_feature_dim
 
 
 class PolicyOutput(NamedTuple):
@@ -15,14 +15,122 @@ class PolicyOutput(NamedTuple):
     value: jax.Array           # [N]
 
 
+class _PolicyHead(nn.Module):
+    """Policy network: target_logits and ships_logits. No shared weights with _ValueNet."""
+    hidden_size: int
+    candidate_count: int
+    ship_bucket_count: int
+    n_heads: int
+
+    @nn.compact
+    def __call__(
+        self,
+        self_features: jax.Array,       # [N, self_dim]
+        candidate_features: jax.Array,  # [N, K, cand_dim]
+        global_features: jax.Array,     # [N, global_dim]
+        candidate_mask: jax.Array,      # [N, K] bool
+    ) -> tuple[jax.Array, jax.Array]:
+        H, K = self.hidden_size, self.candidate_count
+        N = self_features.shape[0]
+
+        # 2-layer GELU MLP encoders (GELU per RLIAYN)
+        self_h   = nn.gelu(nn.Dense(H)(nn.gelu(nn.Dense(H)(self_features))))
+        global_h = nn.gelu(nn.Dense(H)(nn.gelu(nn.Dense(H)(global_features))))
+        cand_flat = candidate_features.reshape(N * K, candidate_features.shape[-1])
+        cand_h   = nn.gelu(nn.Dense(H)(nn.gelu(nn.Dense(H)(cand_flat)))).reshape(N, K, H)
+
+        # Inject source + global context into candidate tokens before attention.
+        ctx = (
+            nn.Dense(H)(jnp.broadcast_to(self_h[:, None, :],   (N, K, H)))
+            + nn.Dense(H)(jnp.broadcast_to(global_h[:, None, :], (N, K, H)))
+        )
+        cand_h = cand_h + ctx                                                   # [N, K, H]
+
+        # Full transformer block: Pre-LN attention + Pre-LN FFN.
+        # Pre-LN (LN before sub-layer) is more stable than post-LN during
+        # early training when gradients can be large.
+        attn_mask = candidate_mask[:, None, None, :]                            # [N, 1, 1, K]
+        normed    = nn.LayerNorm()(cand_h)
+        attn      = nn.MultiHeadDotProductAttention(
+            num_heads=self.n_heads, out_features=H,
+        )(normed, mask=attn_mask)
+        cand_h    = cand_h + attn                                               # attention residual
+
+        normed2   = nn.LayerNorm()(cand_h)
+        ffn       = nn.Dense(H)(nn.gelu(nn.Dense(4 * H)(normed2)))
+        cand_h    = cand_h + ffn                                                # FFN residual [N, K, H]
+
+        # Score each candidate using the full joint context.
+        joint = jnp.concatenate([
+            jnp.broadcast_to(self_h[:, None, :],   (N, K, H)),
+            jnp.broadcast_to(global_h[:, None, :], (N, K, H)),
+            cand_h,
+        ], axis=-1)                                                             # [N, K, 3H]
+
+        target_logits = nn.Dense(1)(nn.gelu(nn.Dense(H)(joint))).squeeze(-1)   # [N, K]
+        target_logits = jnp.where(
+            candidate_mask, target_logits, jnp.finfo(jnp.float32).min
+        )
+        ships_logits  = nn.Dense(self.ship_bucket_count)(
+            nn.gelu(nn.Dense(H)(joint))
+        )                                                                       # [N, K, B]
+
+        return target_logits, ships_logits
+
+
+class _ValueNet(nn.Module):
+    """Value network: fully separate parameters from _PolicyHead.
+    Receives stop_gradient inputs so value gradients cannot reach policy weights."""
+    hidden_size: int
+    candidate_count: int
+    n_heads: int
+
+    @nn.compact
+    def __call__(
+        self,
+        self_features: jax.Array,       # [N, self_dim]
+        candidate_features: jax.Array,  # [N, K, cand_dim]
+        global_features: jax.Array,     # [N, global_dim]
+        candidate_mask: jax.Array,      # [N, K] bool
+    ) -> jax.Array:
+        H, K = self.hidden_size, self.candidate_count
+        N = self_features.shape[0]
+
+        self_h   = nn.gelu(nn.Dense(H)(nn.gelu(nn.Dense(H)(self_features))))
+        global_h = nn.gelu(nn.Dense(H)(nn.gelu(nn.Dense(H)(global_features))))
+        cand_flat = candidate_features.reshape(N * K, candidate_features.shape[-1])
+        cand_h   = nn.gelu(nn.Dense(H)(nn.gelu(nn.Dense(H)(cand_flat)))).reshape(N, K, H)
+
+        ctx = (
+            nn.Dense(H)(jnp.broadcast_to(self_h[:, None, :],   (N, K, H)))
+            + nn.Dense(H)(jnp.broadcast_to(global_h[:, None, :], (N, K, H)))
+        )
+        cand_h = cand_h + ctx
+
+        attn_mask = candidate_mask[:, None, None, :]
+        normed    = nn.LayerNorm()(cand_h)
+        attn      = nn.MultiHeadDotProductAttention(
+            num_heads=self.n_heads, out_features=H,
+        )(normed, mask=attn_mask)
+        cand_h    = cand_h + attn
+
+        normed2   = nn.LayerNorm()(cand_h)
+        ffn       = nn.Dense(H)(nn.gelu(nn.Dense(4 * H)(normed2)))
+        cand_h    = cand_h + ffn                                                # [N, K, H]
+
+        pooled   = cand_h.mean(axis=1)                                          # [N, H]
+        value_in = jnp.concatenate([self_h, global_h, pooled], axis=-1)        # [N, 3H]
+        return nn.Dense(1)(nn.gelu(nn.Dense(H)(value_in))).squeeze(-1)          # [N]
+
+
 class PlanetPolicy(nn.Module):
     self_dim: int
     candidate_dim: int
     global_dim: int
-    fleet_dim: int
     candidate_count: int
     ship_bucket_count: int = 8
     hidden_size: int = 128
+    n_heads: int = 4
 
     @nn.compact
     def __call__(
@@ -31,68 +139,52 @@ class PlanetPolicy(nn.Module):
         candidate_features: jax.Array,  # [N, K, candidate_dim]
         global_features: jax.Array,     # [N, global_dim]
         candidate_mask: jax.Array,      # [N, K] bool
-        fleet_features: jax.Array,      # [N, F, fleet_dim]
-        fleet_mask: jax.Array,          # [N, F] bool
     ) -> PolicyOutput:
-        H = self.hidden_size
-        K = self.candidate_count
-        N = self_features.shape[0]
+        target_logits, ships_logits = _PolicyHead(
+            hidden_size      = self.hidden_size,
+            candidate_count  = self.candidate_count,
+            ship_bucket_count= self.ship_bucket_count,
+            n_heads          = self.n_heads,
+        )(self_features, candidate_features, global_features, candidate_mask)
 
-        self_hidden   = nn.relu(nn.Dense(H)(nn.relu(nn.Dense(H)(self_features))))
-        global_hidden = nn.relu(nn.Dense(H)(nn.relu(nn.Dense(H)(global_features))))
+        # stop_gradient ensures value-loss gradients cannot reach policy weights
+        # even if a future refactor accidentally shares a sub-module.
+        value = _ValueNet(
+            hidden_size     = self.hidden_size,
+            candidate_count = self.candidate_count,
+            n_heads         = self.n_heads,
+        )(
+            jax.lax.stop_gradient(self_features),
+            jax.lax.stop_gradient(candidate_features),
+            jax.lax.stop_gradient(global_features),
+            candidate_mask,
+        )
 
-        cand_flat      = candidate_features.reshape(N * K, self.candidate_dim)
-        cand_hidden    = nn.relu(nn.Dense(H)(nn.relu(nn.Dense(H)(cand_flat)))).reshape(N, K, H)
-
-        # Cross-attention: each candidate queries the fleet set.
-        # Geometric "is this fleet aimed at me?" learned via q·k.
-        fleet_hidden = nn.relu(nn.Dense(H)(fleet_features))                              # [N, F, H]
-        q = nn.Dense(H)(cand_hidden)                                                     # [N, K, H]
-        k = nn.Dense(H)(fleet_hidden)                                                    # [N, F, H]
-        v = nn.Dense(H)(fleet_hidden)                                                    # [N, F, H]
-        attn_logits = jnp.einsum('nkh,nfh->nkf', q, k) / jnp.sqrt(jnp.float32(H))
-        shifted     = attn_logits - jnp.max(attn_logits, axis=-1, keepdims=True)
-        exp_logits  = jnp.exp(shifted) * fleet_mask[:, None, :].astype(jnp.float32)
-        attn        = exp_logits / (exp_logits.sum(axis=-1, keepdims=True) + 1e-9)       # safe when 0 alive
-        fleet_ctx   = jnp.einsum('nkf,nfh->nkh', attn, v)                                # [N, K, H]
-        cand_hidden = cand_hidden + fleet_ctx                                            # residual
-
-        expanded_self   = jnp.broadcast_to(self_hidden[:, None, :],   (N, K, H))
-        expanded_global = jnp.broadcast_to(global_hidden[:, None, :], (N, K, H))
-        joint = jnp.concatenate([expanded_self, expanded_global, cand_hidden], axis=-1)
-
-        target_logits = nn.Dense(1)(nn.relu(nn.Dense(H)(joint))).squeeze(-1)
-        target_logits = jnp.where(candidate_mask, target_logits, jnp.finfo(jnp.float32).min)
-
-        ships_logits = nn.Dense(self.ship_bucket_count)(nn.relu(nn.Dense(H)(joint)))
-
-        pooled   = cand_hidden.mean(axis=1)
-        value_in = jnp.concatenate([self_hidden, global_hidden, pooled], axis=-1)
-        value    = nn.Dense(1)(nn.relu(nn.Dense(H)(value_in))).squeeze(-1)
-
-        return PolicyOutput(target_logits=target_logits, ships_logits=ships_logits, value=value)
+        return PolicyOutput(
+            target_logits = target_logits,
+            ships_logits  = ships_logits,
+            value         = value,
+        )
 
 
 def build_policy(cfg) -> PlanetPolicy:
     return PlanetPolicy(
-        self_dim=self_feature_dim(),
-        candidate_dim=candidate_feature_dim(),
-        global_dim=global_feature_dim(),
-        fleet_dim=fleet_feature_dim(),
-        candidate_count=cfg.env.candidate_count,
-        ship_bucket_count=cfg.env.ship_bucket_count,
-        hidden_size=cfg.model.hidden_size,
+        self_dim         = self_feature_dim(),
+        candidate_dim    = candidate_feature_dim(),
+        global_dim       = global_feature_dim(),
+        candidate_count  = cfg.env.candidate_count,
+        ship_bucket_count= cfg.env.ship_bucket_count,
+        hidden_size      = cfg.model.hidden_size,
+        n_heads          = getattr(cfg.model, 'n_heads', 4),
     )
 
 
-def init_params(module: PlanetPolicy, seed: int = 0, fleet_count: int = 1) -> dict:
+def init_params(module: PlanetPolicy, seed: int = 0) -> dict:
     K = module.candidate_count
     dummy = (
         jnp.zeros((1, module.self_dim)),
         jnp.zeros((1, K, module.candidate_dim)),
         jnp.zeros((1, module.global_dim)),
         jnp.ones((1, K), dtype=bool),
-        jnp.zeros((1, fleet_count, module.fleet_dim)),
-        jnp.ones((1, fleet_count), dtype=bool),
     )
     return module.init(jax.random.PRNGKey(seed), *dummy)

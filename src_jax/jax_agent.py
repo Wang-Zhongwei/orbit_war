@@ -21,7 +21,7 @@ from .bc_data import obs_to_env_state
 from .features import MIN_SOURCE_SHIPS, _make_env_encoder, aim_fleets
 from .physics import MAX_BASE_PLANETS, MAX_FLEETS
 from .policy import build_policy
-from .rollout import CAND_DIM, GLOB_DIM, SELF_DIM, FLEET_DIM
+from .rollout import CAND_DIM, GLOB_DIM, SELF_DIM
 
 
 def _obs_to_dict(obs) -> dict:
@@ -83,8 +83,8 @@ def make_jax_agent(
     MAX_SRC = MAX_BASE_PLANETS
 
     @jax.jit
-    def _forward(sf, cf, gf, cm, ff, fm):
-        return module.apply(params, sf, cf, gf, cm, ff, fm)
+    def _forward(sf, cf, gf, cm):
+        return module.apply(params, sf, cf, gf, cm)
 
     _reaim_all = jax.jit(aim_fleets)
 
@@ -104,10 +104,8 @@ def make_jax_agent(
         cf = enc.cand_feats.reshape(MAX_SRC, K, CAND_DIM)
         gf = jnp.broadcast_to(enc.global_feat[0][None, :], (MAX_SRC, GLOB_DIM))
         cm = enc.cand_mask.reshape(MAX_SRC, K)
-        ff = jnp.broadcast_to(enc.fleet_feats[0][None, :, :], (MAX_SRC, MAX_FLEETS, FLEET_DIM))
-        fm = jnp.broadcast_to(enc.fleet_mask[0][None, :],     (MAX_SRC, MAX_FLEETS))
 
-        out = _forward(sf, cf, gf, cm, ff, fm)
+        out = _forward(sf, cf, gf, cm)
 
         target_logits = _safe_target_logits(out.target_logits)
         if deterministic:
