@@ -1,0 +1,18 @@
+seed: 42
+
+env:
+  candidate_count: 8
+  ship_bucket_count: 8
+
+model:
+  hidden_size: 128
+
+bc:
+  epochs: 1
+  batch_size: 2048
+  lr: 3e-4
+  winner_only: false
+  stream: true
+  stream_buffer: 200
+  out_dir: artifacts/bc
+  run_name: bc_pretrain

@@ -317,28 +317,7 @@ def episode_to_samples(
         state   = steps[i-1][agent]['observation']
         action  = steps[i][agent]['action']
     """
-    steps = episode.get("steps", [])
-    batch_states: list[EnvState] = []
-    batch_players: list[int]     = []
-    batch_actions: list[list]    = []
-
-    for i in range(1, len(steps)):          # start at 1 so i-1 is valid
-        for agent_idx, agent_data in enumerate(steps[i]):
-            action = agent_data.get("action", [])
-            if not action:
-                continue
-            if agent_data.get("status") == "DONE":
-                continue
-            # State the agent saw before acting: previous step's observation
-            prev_obs = steps[i - 1][agent_idx]["observation"]
-            try:
-                state = obs_to_env_state(prev_obs)
-            except Exception:
-                continue
-            batch_states.append(state)
-            batch_players.append(int(prev_obs["player"]))
-            batch_actions.append(action)
-
+    batch_states, batch_players, batch_actions = _collect_states_actions(episode)
     if not batch_states:
         return None
 
@@ -352,8 +331,7 @@ def episode_to_samples(
     rows_sf, rows_cf, rows_gf, rows_cm = [], [], [], []
     rows_ff, rows_fm, rows_ti, rows_sb = [], [], [], []
 
-    N = len(batch_states)
-    for i in range(N):
+    for i in range(len(batch_states)):
         labels = extract_labels(
             batch_actions[i],
             src_ids          = enc_np.src_ids[i],
@@ -390,6 +368,115 @@ def episode_to_samples(
         "fleet_mask":   np.stack(rows_fm),
         "target_idx":   np.array(rows_ti, dtype=np.int32),
         "ships_bucket": np.array(rows_sb, dtype=np.int32),
+    }
+
+
+# ---------------------------------------------------------------------------
+# On-device variant for streaming — avoids JAX→numpy→JAX round-trip
+# ---------------------------------------------------------------------------
+
+def _collect_states_actions(episode: dict):
+    """Shared state/action collection used by both sample functions."""
+    steps = episode.get("steps", [])
+    batch_states: list[EnvState] = []
+    batch_players: list[int]     = []
+    batch_actions: list[list]    = []
+
+    for i in range(1, len(steps)):
+        for agent_idx, agent_data in enumerate(steps[i]):
+            action = agent_data.get("action", [])
+            if not action:
+                continue
+            if agent_data.get("status") == "DONE":
+                continue
+            prev_obs = steps[i - 1][agent_idx]["observation"]
+            try:
+                state = obs_to_env_state(prev_obs)
+            except Exception:
+                continue
+            batch_states.append(state)
+            batch_players.append(int(prev_obs["player"]))
+            batch_actions.append(action)
+
+    return batch_states, batch_players, batch_actions
+
+
+def episode_to_samples_jax(
+    episode: dict,
+    encode_fn,
+    ship_bucket_count: int,
+) -> dict | None:
+    """Streaming variant of episode_to_samples: feature arrays stay on device.
+
+    Only the small index/mask arrays needed for label extraction (src_ids, cand_mask, etc.)
+    are copied to CPU. The large feature tensors (self_feats, cand_feats, fleet_feats) are
+    gathered on-device via JAX advanced indexing and returned as JAX arrays.
+
+    Use in training loops where you want to avoid the JAX→numpy→JAX round-trip that
+    episode_to_samples incurs when writing shards.
+    """
+    batch_states, batch_players, batch_actions = _collect_states_actions(episode)
+    if not batch_states:
+        return None
+
+    batched = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *batch_states)
+    players_arr = jnp.array(batch_players, dtype=jnp.int32)
+    enc = encode_fn(batched, players_arr)
+
+    # Transfer only the small arrays needed for label extraction
+    src_ids_np    = np.asarray(enc.src_ids)
+    src_valid_np  = np.asarray(enc.src_valid)
+    src_ships_np  = np.asarray(enc.src_ships)
+    cand_mask_np  = np.asarray(enc.cand_mask)
+    src_slots_np  = np.asarray(enc.src_slots)
+    cand_slots_np = np.asarray(enc.cand_slots_safe)
+    p_x_np        = np.asarray(batched.p_x)
+    p_y_np        = np.asarray(batched.p_y)
+    p_radius_np   = np.asarray(batched.p_radius)
+    ang_vel_np    = np.asarray(batched.angular_velocity)
+
+    ts_list: list[int] = []
+    si_list: list[int] = []
+    ci_list: list[int] = []
+    bi_list: list[int] = []
+
+    for i in range(len(batch_states)):
+        labels = extract_labels(
+            batch_actions[i],
+            src_ids          = src_ids_np[i],
+            src_valid        = src_valid_np[i],
+            src_ships        = src_ships_np[i],
+            cand_mask        = cand_mask_np[i],
+            B                = ship_bucket_count,
+            p_x              = p_x_np[i],
+            p_y              = p_y_np[i],
+            p_radius         = p_radius_np[i],
+            angular_velocity = float(ang_vel_np[i]),
+            src_slots        = src_slots_np[i],
+            cand_slots       = cand_slots_np[i],
+        )
+        for src_idx, cand_idx, bucket in labels:
+            ts_list.append(i)
+            si_list.append(src_idx)
+            ci_list.append(cand_idx)
+            bi_list.append(bucket)
+
+    if not ts_list:
+        return None
+
+    ts = np.array(ts_list, dtype=np.int32)
+    si = np.array(si_list, dtype=np.int32)
+
+    # Gather features on-device — large tensors never leave the accelerator
+    return {
+        "self_feats":   enc.self_feats[ts, si],
+        "cand_feats":   enc.cand_feats[ts, si],
+        "global_feats": enc.global_feat[ts],
+        "cand_mask":    enc.cand_mask[ts, si],
+        "fleet_feats":  enc.fleet_feats[ts],
+        "fleet_mask":   enc.fleet_mask[ts],
+        "target_idx":   jnp.array(ci_list, dtype=jnp.int32),
+        "ships_bucket": jnp.array(bi_list, dtype=jnp.int32),
     }
 
 

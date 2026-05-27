@@ -1,6 +1,6 @@
 ---
 name: orbit-wars-training-pipeline
-description: Run the Orbit Wars JAX training workflow: download Kaggle episode replays with download_episodes.py, pre-encode into shards with src_jax.bc_encode, behavior-clone pretrain with src_jax.bc_train, then start PPO self-play from the BC checkpoint. Use when the user asks to run, resume, monitor, or document the Orbit Wars data/pretraining/self-play pipeline.
+description: Run the Orbit Wars JAX training workflow: download Kaggle episode replays with download_episodes.py, then either pre-encode into shards with src_jax.bc_encode + behavior-clone with src_jax.bc_train, OR stream directly from zip with src_jax.bc_train --stream (no shards, best for large 1-epoch runs), then start PPO self-play from the BC checkpoint. Use when the user asks to run, resume, monitor, or document the Orbit Wars data/pretraining/self-play pipeline.
 ---
 
 # Orbit Wars Training Pipeline
@@ -36,27 +36,60 @@ Verification gate — confirm zip landed:
 ls -lh episodes/2026-05-24/*.zip
 ```
 
-## Step 2 — Encode (one-time per date, ~600s)
+## Step 2 — Behavior Cloning
 
-Reads the zip and writes sharded `.npz` files of pre-encoded features. Skips automatically if shards already exist.
+Two modes depending on how many epochs you need:
 
+### Stream mode (recommended for large datasets, 1 epoch)
+
+Encodes episodes on the fly directly from the zip — no intermediate shard files, no pre-encode step.
+Each episode is encoded once, fed to training, and discarded. Best when the dataset is large enough
+that 1 epoch provides sufficient coverage.
+
+The default config (`src_jax/configs/bc_cfg.yaml`) already sets `stream: true` and `epochs: 1`,
+so you can usually just pass `--episode_dirs`:
+
+```bash
+conda run --no-capture-output -n torch-gpu python -u -m src_jax.bc_train \
+  --episode_dirs episodes/2026-05-24 \
+  --run_name bc_stream_may24
+# → artifacts/bc/bc_stream_may24/ckpt_last.pkl
+```
+
+To use a custom config:
+```bash
+--config src_jax/configs/bc_cfg.yaml
+```
+
+CLI args override config file values when provided. All BC fields are optional:
+- `--epochs N` / `--batch_size N` / `--lr F` — training hyperparams
+- `--stream` / `--no_stream` — enable or disable on-the-fly encoding
+- `--stream_buffer N` — episodes to buffer before a training pass (default: 200). Larger = better shuffle within buffer.
+- `--winner_only` — only learn from the winning agent's actions.
+- `--out_dir DIR` / `--run_name NAME` — output paths
+- `--episode_dirs` accepts multiple dates: `episodes/2026-05-24 episodes/2026-05-25`
+
+Progress is printed every `stream_buffer * 5` episodes and after each epoch.
+
+### Shard mode (for multi-epoch runs over smaller datasets)
+
+Encode once, train many epochs cheaply from pre-built `.npz` shards.
+
+**Encode (one-time per date, ~600s):**
 ```bash
 conda run --no-capture-output -n torch-gpu python -u -m src_jax.bc_encode \
   --episodes_dir episodes/2026-05-24
 # → episodes/2026-05-24/shards/shard_0000.npz ...
 ```
 
-Verification gate — confirm shards wrote:
+Use `--force` to re-encode from scratch. Use `--winner_only` to encode only the winning agent's actions.
+
+Verification gate:
 ```bash
 ls episodes/2026-05-24/shards/ | head
 ```
 
-Use `--force` to re-encode from scratch. Use `--winner_only` to encode only the winning agent's actions.
-
-## Step 3 — Behavior Cloning
-
-Streams shards per epoch; starts immediately. Pass multiple paths to `--episode_dirs` to train across several dates.
-
+**Train:**
 ```bash
 conda run --no-capture-output -n torch-gpu python -u -m src_jax.bc_train \
   --episode_dirs episodes/2026-05-24 \
@@ -67,14 +100,9 @@ conda run --no-capture-output -n torch-gpu python -u -m src_jax.bc_train \
 
 Default settings: 10 epochs, batch_size 2048, lr 3e-4, W&B enabled. Pass `--no_wandb` to disable.
 
-Multi-day example:
-```bash
---episode_dirs episodes/2026-05-24 episodes/2026-05-25
-```
-
 Compatibility aliases: `--episodes_dirs` and `--episodes_dir` are accepted by `src_jax.bc_train`.
 
-## Step 4 — PPO Self-Play From BC Checkpoint
+## Step 3 — PPO Self-Play From BC Checkpoint
 
 ```bash
 conda run --no-capture-output -n torch-gpu python -u -m src_jax.train \
@@ -87,6 +115,6 @@ Default config: `src_jax/configs/default_cfg.yaml` (1000 updates, checkpoint eve
 ## Monitoring Notes
 
 - Use `--no-capture-output` with `conda run` or output is buffered until the process exits.
-- Encode progress is printed every 50 episodes.
-- BC training prints `epoch=N loss=… tgt=… shp=… Xs` after each epoch (no loading wait).
-- W&B run is tagged with `n_shards` and `episodes_dirs` for traceability.
+- Stream mode prints `ep=N samples=N steps=N` every 1000 episodes (with default buffer=200), then a full epoch summary.
+- Shard mode prints `epoch=N loss=… tgt=… shp=… Xs` after each epoch.
+- W&B run is tagged with `episodes_dirs` and (in shard mode) `n_shards` for traceability.

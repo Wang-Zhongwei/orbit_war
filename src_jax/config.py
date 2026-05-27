@@ -39,6 +39,18 @@ class PPOConfig:
 
 
 @dataclass(slots=True)
+class BCConfig:
+    epochs: int = 1
+    batch_size: int = 2048
+    lr: float = 3e-4
+    winner_only: bool = False
+    stream: bool = True
+    stream_buffer: int = 200
+    out_dir: str = "artifacts/bc"
+    run_name: str = "bc_pretrain"
+
+
+@dataclass(slots=True)
 class TrainConfig:
     seed: int = 42
     run_name: str = "orbit_wars_jax_ppo"
@@ -52,6 +64,7 @@ class TrainConfig:
     env: EnvConfig = field(default_factory=EnvConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     ppo: PPOConfig = field(default_factory=PPOConfig)
+    bc: BCConfig = field(default_factory=BCConfig)
 
     def __setstate__(self, state) -> None:
         slot_state: dict = state[1] if isinstance(state, tuple) else state
@@ -79,13 +92,14 @@ def load_train_config(path: str | Path) -> TrainConfig:
 
 def _config_from_dict(data: dict[str, Any]) -> TrainConfig:
     cfg = TrainConfig()
-    _apply(cfg, data, skip={"env", "model", "ppo", "opponents"})
+    _apply(cfg, data, skip={"env", "model", "ppo", "bc", "opponents"})
     if "opponents" in data:
         raw = data["opponents"]
         cfg.opponents = [raw] if isinstance(raw, str) else list(raw)
     _apply(cfg.env, data.get("env", {}))
     _apply(cfg.model, data.get("model", {}))
     _apply(cfg.ppo, data.get("ppo", {}))
+    _apply(cfg.bc, data.get("bc", {}))
     return cfg
 
 
