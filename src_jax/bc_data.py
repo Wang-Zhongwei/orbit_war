@@ -501,6 +501,15 @@ def episode_to_samples_jax(
 # Dataset loader — lazy iterator over episode files
 # ---------------------------------------------------------------------------
 
+def _count_episode_jsons(episodes_dir: Path) -> int:
+    """Return the number of JSON episode files without loading them."""
+    zips = sorted(episodes_dir.glob("*.zip"))
+    if zips:
+        with zipfile.ZipFile(zips[0]) as zf:
+            return sum(1 for n in zf.namelist() if n.endswith(".json"))
+    return sum(1 for _ in episodes_dir.glob("*.json"))
+
+
 def _iter_episode_jsons(episodes_dir: Path):
     """Yield (name, episode_dict) from either a zip archive or loose .json files."""
     zips = sorted(episodes_dir.glob("*.zip"))
@@ -555,25 +564,33 @@ def encode_to_shards(
     ship_bucket_count: int,
     *,
     episodes_per_shard: int = 100,
+    num_shards: int | None = None,
     winner_only: bool = False,
     force: bool = False,
 ) -> Path:
     """Encode all episodes in episodes_dir and write sharded .npz files.
 
     Skips if shards already exist unless force=True. Returns the shard directory.
+    num_shards limits how many shards are written (useful for quick tests).
     """
     shard_dir = episodes_dir / SHARD_DIR_NAME
     if not force and any(shard_dir.glob("*.npz")):
         print(f"Shards already exist in {shard_dir} — skipping (use --force to re-encode)")
         return shard_dir
 
+    total_files = _count_episode_jsons(episodes_dir)
+    print(f"Found {total_files} episode files in {episodes_dir}")
+    if winner_only:
+        print("  winner_only=True: encoding only winning agent's actions")
+
     shard_dir.mkdir(exist_ok=True)
     buffer: list[dict[str, np.ndarray]] = []
-    shard_idx = n_episodes = n_samples = 0
+    shard_idx = n_episodes = n_samples = n_skipped = 0
     t0 = time.time()
 
     for _name, episode in _iter_episode_jsons(episodes_dir):
         if not isinstance(episode, dict) or "steps" not in episode:
+            n_skipped += 1
             continue
 
         if winner_only:
@@ -581,6 +598,7 @@ def encode_to_shards(
             statuses = episode.get("statuses", [])
             valid_rewards = [r for r in rewards if r is not None]
             if not valid_rewards:
+                n_skipped += 1
                 continue
             best = max(valid_rewards)
             winning_player = next(
@@ -589,11 +607,13 @@ def encode_to_shards(
                 None,
             )
             if winning_player is None:
+                n_skipped += 1
                 continue
             episode = _filter_winner(episode, winning_player)
 
         samples = episode_to_samples(episode, encode_fn, ship_bucket_count)
         if samples is None:
+            n_skipped += 1
             continue
 
         buffer.append(samples)
@@ -602,22 +622,40 @@ def encode_to_shards(
 
         if len(buffer) >= episodes_per_shard:
             _flush_shard(shard_dir, shard_idx, buffer)
+            elapsed = time.time() - t0
+            print(f"  shard {shard_idx:04d} written — {n_episodes}/{total_files} episodes, "
+                  f"{n_samples} samples ({elapsed:.1f}s, "
+                  f"{n_episodes / elapsed:.1f} ep/s)")
             shard_idx += 1
             buffer = []
+            if num_shards is not None and shard_idx >= num_shards:
+                break
 
-        if n_episodes % 50 == 0:
-            print(f"  {n_episodes} episodes, {n_samples} samples ({time.time() - t0:.1f}s)")
+        elif n_episodes % 50 == 0:
+            elapsed = time.time() - t0
+            print(f"  {n_episodes}/{total_files} episodes, {n_samples} samples "
+                  f"({elapsed:.1f}s, {n_episodes / elapsed:.1f} ep/s)")
 
-    if buffer:
+    if buffer and (num_shards is None or shard_idx < num_shards):
         _flush_shard(shard_dir, shard_idx, buffer)
         shard_idx += 1
 
-    print(f"Encoded {n_episodes} episodes → {shard_idx} shards in {shard_dir} ({time.time() - t0:.1f}s)")
+    elapsed = time.time() - t0
+    avg_samples = n_samples / n_episodes if n_episodes else 0
+    skipped_msg = f", {n_skipped} skipped" if n_skipped else ""
+    print(
+        f"Done: {n_episodes} episodes → {shard_idx} shards, "
+        f"{n_samples} samples ({avg_samples:.1f} samples/ep{skipped_msg}) "
+        f"in {elapsed:.1f}s ({n_episodes / elapsed:.1f} ep/s)"
+    )
+    print(f"Shards written to: {shard_dir}")
     return shard_dir
 
 
 def _flush_shard(shard_dir: Path, idx: int, buffer: list[dict[str, np.ndarray]]) -> None:
-    np.savez(shard_dir / f"shard_{idx:04d}.npz", **concat_samples(buffer))
+    np.savez(shard_dir / f"shard_{idx:04d}.npz",
+             n_episodes=np.array(len(buffer)),
+             **concat_samples(buffer))
 
 
 def find_shards(episodes_dirs: list[Path]) -> list[Path]:
@@ -632,3 +670,20 @@ def find_shards(episodes_dirs: list[Path]) -> list[Path]:
             )
         paths.extend(sorted(shard_dir.glob("*.npz")))
     return paths
+
+
+def shard_episode_counts(shard_paths: list[Path], episodes_per_shard_fallback: int = 100) -> list[int]:
+    """Return the number of episodes in each shard.
+
+    Reads the n_episodes scalar saved by _flush_shard. Falls back to
+    episodes_per_shard_fallback for shards encoded before that field was added.
+    """
+    counts = []
+    for p in shard_paths:
+        d = np.load(p)
+        if "n_episodes" in d:
+            counts.append(int(d["n_episodes"]))
+        else:
+            counts.append(episodes_per_shard_fallback)
+        d.close()
+    return counts

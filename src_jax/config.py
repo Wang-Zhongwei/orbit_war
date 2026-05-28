@@ -66,7 +66,7 @@ class BCConfig:
     batch_size: int = 2048
     lr: float = 3e-4
     winner_only: bool = False
-    stream: bool = True
+    use_shard: bool = False
     stream_buffer: int = 200
     top_k_episodes: int | None = None
     out_dir: str = "artifacts/bc"

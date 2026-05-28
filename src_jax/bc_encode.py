@@ -17,8 +17,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .bc_data import SHARD_DIR_NAME, encode_to_shards
-from .config import TrainConfig, default_train_config_path, load_train_config
+from .bc_data import encode_to_shards
+from .config import TrainConfig, load_train_config
 from .features import _make_env_encoder
 
 

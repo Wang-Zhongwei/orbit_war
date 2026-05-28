@@ -9,10 +9,10 @@ Usage:
 
     # Smoke test — dataclass defaults + CLI overrides, no config file needed:
     python -m src_jax.bc_train --episode_dirs episodes/2026-05-24 \\
-                                --stream --top_k_episodes 5 --epochs 1
+                                --top_k_episodes 5 --epochs 1
 
 Runtime flags (accepted in both modes):
-    --stream / --no_stream   Override the stream setting from config
+    --use_shard / --no_use_shard   Use pre-built shards (default: stream from zip)
     --no_wandb               Disable W&B logging
 
 Loss:
@@ -40,6 +40,7 @@ from .bc_data import (
     _iter_episode_jsons,
     episode_to_samples_jax,
     find_shards,
+    shard_episode_counts,
 )
 from .config import TrainConfig, load_train_config
 from .features import _make_env_encoder
@@ -83,7 +84,7 @@ def _bc_step(
 
     (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     state = state.apply_gradients(grads=grads)
-    return state, loss, aux[0], aux[1]   # state, total, tgt_loss, shp_loss
+    return state, loss, aux[0], aux[1], aux[2], aux[3]  # state, total, tgt_loss, shp_loss, tgt_acc, shp_acc
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +127,18 @@ def train(
     bc = cfg.bc
     aug_ids = DEFAULT_AUG_IDS
     shard_paths = find_shards(episodes_dirs)
+    if bc.top_k_episodes is not None:
+        counts = shard_episode_counts(shard_paths)
+        cumulative = 0
+        n_shards = len(shard_paths)
+        for i, c in enumerate(counts):
+            cumulative += c
+            if cumulative >= bc.top_k_episodes:
+                n_shards = i + 1
+                break
+        shard_paths = shard_paths[:n_shards]
     print(f"Found {len(shard_paths)} shards across {len(episodes_dirs)} date dir(s)"
+          + (f" | top_k_episodes={bc.top_k_episodes}" if bc.top_k_episodes else "")
           + (f" | augment={aug_ids}" if bc.augment else ""))
 
     policy = build_policy(cfg)
@@ -166,9 +178,13 @@ def train(
     for epoch in range(1, bc.epochs + 1):
         shard_order = rng.permutation(len(shard_paths)).tolist()
         losses, tgt_losses, shp_losses = [], [], []
+        tgt_accs, shp_accs = [], []
         t0 = time.time()
+        n_steps_epoch = 0
 
-        for shard_i in shard_order:
+        print(f"\nepoch {epoch}/{bc.epochs}  ({len(shard_paths)} shards)", flush=True)
+
+        for si, shard_i in enumerate(shard_order):
             data = np.load(shard_paths[shard_i])
             N    = data["target_idx"].shape[0]
             perm = rng.permutation(N)
@@ -190,32 +206,66 @@ def train(
                 sf, cf, gf = sf[perm2], cf[perm2], gf[perm2]
                 cm, ti, sb = cm[perm2], ti[perm2], sb[perm2]
 
+            shard_losses: list[jax.Array] = []
+            shard_tgt_l: list[jax.Array] = []
+            shard_shp_l: list[jax.Array] = []
+            shard_tgt_a: list[jax.Array] = []
+            shard_shp_a: list[jax.Array] = []
             for start in range(0, N - bc.batch_size + 1, bc.batch_size):
                 end = start + bc.batch_size
-                state, loss, tgt_l, shp_l = _bc_step(
+                state, loss, tgt_l, shp_l, tgt_a, shp_a = _bc_step(
                     state,
                     sf[start:end], cf[start:end], gf[start:end], cm[start:end],
                     ti[start:end], sb[start:end],
                 )
-                losses.append(float(loss))
-                tgt_losses.append(float(tgt_l))
-                shp_losses.append(float(shp_l))
+                shard_losses.append(loss)
+                shard_tgt_l.append(tgt_l)
+                shard_shp_l.append(shp_l)
+                shard_tgt_a.append(tgt_a)
+                shard_shp_a.append(shp_a)
                 global_step += 1
+                n_steps_epoch += 1
+
+            # Single GPU→CPU sync per shard instead of per step
+            losses.append(float(jnp.mean(jnp.stack(shard_losses))))
+            tgt_losses.append(float(jnp.mean(jnp.stack(shard_tgt_l))))
+            shp_losses.append(float(jnp.mean(jnp.stack(shard_shp_l))))
+            tgt_accs.append(float(jnp.mean(jnp.stack(shard_tgt_a))))
+            shp_accs.append(float(jnp.mean(jnp.stack(shard_shp_a))))
+
+            elapsed = time.time() - t0
+            steps_per_s = n_steps_epoch / elapsed if elapsed > 0 else 0
+            print(
+                f"  shard {si+1:3d}/{len(shard_paths)}"
+                f"  loss={losses[-1]:.4f}"
+                f"  tgt_acc={tgt_accs[-1]:.3f}"
+                f"  shp_acc={shp_accs[-1]:.3f}"
+                f"  steps={n_steps_epoch}"
+                f"  {elapsed:.0f}s ({steps_per_s:.1f} steps/s)",
+                flush=True,
+            )
 
         mean_loss = float(np.mean(losses))
         mean_tgt  = float(np.mean(tgt_losses))
         mean_shp  = float(np.mean(shp_losses))
+        mean_tgt_acc = float(np.mean(tgt_accs))
+        mean_shp_acc = float(np.mean(shp_accs))
         elapsed   = time.time() - t0
+        steps_per_s = n_steps_epoch / elapsed if elapsed > 0 else 0
         print(
             f"epoch={epoch:3d}  loss={mean_loss:.4f}"
             f"  tgt={mean_tgt:.4f}  shp={mean_shp:.4f}"
-            f"  {elapsed:.1f}s"
+            f"  tgt_acc={mean_tgt_acc:.3f}  shp_acc={mean_shp_acc:.3f}"
+            f"  steps={n_steps_epoch}  {elapsed:.1f}s ({steps_per_s:.1f} steps/s)"
         )
 
         if use_wandb:
             import wandb
             wandb.log(
-                {"bc/loss": mean_loss, "bc/tgt_loss": mean_tgt, "bc/ships_loss": mean_shp},
+                {
+                    "bc/loss": mean_loss, "bc/tgt_loss": mean_tgt, "bc/ships_loss": mean_shp,
+                    "bc/tgt_acc": mean_tgt_acc, "bc/shp_acc": mean_shp_acc,
+                },
                 step=global_step,
             )
 
@@ -288,7 +338,7 @@ def train_stream(
                 "epochs": bc.epochs,
                 "batch_size": bc.batch_size,
                 "lr": bc.lr,
-                "stream": True,
+                "use_shard": False,
                 "stream_buffer": bc.stream_buffer,
                 "top_k_episodes": bc.top_k_episodes,
                 "augment": bc.augment,
@@ -324,27 +374,42 @@ def train_stream(
             sf, cf, gf = sf[perm2], cf[perm2], gf[perm2]
             cm, ti, sb = cm[perm2], ti[perm2], sb[perm2]
 
+        buf_losses: list[jax.Array] = []
+        buf_tgt_l: list[jax.Array] = []
+        buf_shp_l: list[jax.Array] = []
+        buf_tgt_a: list[jax.Array] = []
+        buf_shp_a: list[jax.Array] = []
         for start in range(0, N - bc.batch_size + 1, bc.batch_size):
             end = start + bc.batch_size
-            state, loss, tgt_l, shp_l = _bc_step(
+            state, loss, tgt_l, shp_l, tgt_a, shp_a = _bc_step(
                 state,
                 sf[start:end], cf[start:end], gf[start:end], cm[start:end],
                 ti[start:end], sb[start:end],
             )
-            losses.append(float(loss))
-            tgt_losses.append(float(tgt_l))
-            shp_losses.append(float(shp_l))
+            buf_losses.append(loss)
+            buf_tgt_l.append(tgt_l)
+            buf_shp_l.append(shp_l)
+            buf_tgt_a.append(tgt_a)
+            buf_shp_a.append(shp_a)
             global_step += 1
+
+        # Single GPU→CPU sync per buffer drain instead of per step
+        losses.append(float(jnp.mean(jnp.stack(buf_losses))))
+        tgt_losses.append(float(jnp.mean(jnp.stack(buf_tgt_l))))
+        shp_losses.append(float(jnp.mean(jnp.stack(buf_shp_l))))
+        tgt_accs.append(float(jnp.mean(jnp.stack(buf_tgt_a))))
+        shp_accs.append(float(jnp.mean(jnp.stack(buf_shp_a))))
         n_samples += N
 
     for epoch in range(1, bc.epochs + 1):
         losses, tgt_losses, shp_losses = [], [], []
+        tgt_accs, shp_accs = [], []
         t0 = time.time()
         n_episodes = n_samples = global_step = 0
         buffer: list[dict] = []
         limit_msg = "" if bc.top_k_episodes is None else f" (top_k_episodes={bc.top_k_episodes})"
         print(
-            f"epoch {epoch}: reading episodes from {[str(d) for d in episodes_dirs]}"
+            f"\nepoch {epoch}/{bc.epochs}: reading from {[str(d) for d in episodes_dirs]}"
             f"{limit_msg} ...",
             flush=True,
         )
@@ -377,11 +442,24 @@ def train_stream(
                 buffer.append(samples)
                 n_episodes += 1
 
+                if n_episodes % 20 == 0:
+                    print(f"  loading ep={n_episodes}  buffered={len(buffer)} ...", flush=True)
+
                 if len(buffer) >= bc.stream_buffer:
+                    if global_step == 0:
+                        print("  (first batch — JAX JIT compile, may take ~2 min) ...", flush=True)
                     _drain_buffer(buffer)
                     buffer = []
-                    print(f"  ep={n_episodes}  samples={n_samples}  steps={global_step}"
-                          f"  ({time.time() - t0:.0f}s)", flush=True)
+                    elapsed = time.time() - t0
+                    steps_per_s = global_step / elapsed if elapsed > 0 else 0
+                    print(
+                        f"  ep={n_episodes}  samples={n_samples}  steps={global_step}"
+                        f"  loss={float(np.mean(losses)):.4f}"
+                        f"  tgt_acc={float(np.mean(tgt_accs)):.3f}"
+                        f"  shp_acc={float(np.mean(shp_accs)):.3f}"
+                        f"  {elapsed:.0f}s ({steps_per_s:.1f} steps/s)",
+                        flush=True,
+                    )
 
                 if bc.top_k_episodes is not None and n_episodes >= bc.top_k_episodes:
                     reached_episode_limit = True
@@ -404,17 +482,25 @@ def train_stream(
         mean_loss = float(np.mean(losses)) if losses else float("nan")
         mean_tgt  = float(np.mean(tgt_losses)) if tgt_losses else float("nan")
         mean_shp  = float(np.mean(shp_losses)) if shp_losses else float("nan")
+        mean_tgt_acc = float(np.mean(tgt_accs)) if tgt_accs else float("nan")
+        mean_shp_acc = float(np.mean(shp_accs)) if shp_accs else float("nan")
+        elapsed = time.time() - t0
+        steps_per_s = global_step / elapsed if elapsed > 0 else 0
         print(
             f"epoch={epoch:3d}  loss={mean_loss:.4f}"
             f"  tgt={mean_tgt:.4f}  shp={mean_shp:.4f}"
+            f"  tgt_acc={mean_tgt_acc:.3f}  shp_acc={mean_shp_acc:.3f}"
             f"  ep={n_episodes}  samples={n_samples}"
-            f"  {time.time() - t0:.1f}s"
+            f"  steps={global_step}  {elapsed:.1f}s ({steps_per_s:.1f} steps/s)"
         )
 
         if use_wandb:
             import wandb
             wandb.log(
-                {"bc/loss": mean_loss, "bc/tgt_loss": mean_tgt, "bc/ships_loss": mean_shp},
+                {
+                    "bc/loss": mean_loss, "bc/tgt_loss": mean_tgt, "bc/ships_loss": mean_shp,
+                    "bc/tgt_acc": mean_tgt_acc, "bc/shp_acc": mean_shp_acc,
+                },
                 step=global_step,
             )
 
@@ -448,15 +534,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--winner_only", default=None, action="store_true")
     parser.add_argument("--stream_buffer", type=int, default=None)
     parser.add_argument("--top_k_episodes", type=int, default=None,
-                        help="Process only the first N valid episodes (stream mode only)")
+                        help="Process only the first N valid episodes (zip-streaming mode only)")
     parser.add_argument("--run_name", default=None)
     parser.add_argument("--augment", default=None, action="store_true")
     parser.add_argument("--no_augment", dest="augment", action="store_false")
     # Runtime flags — accepted in both modes
-    parser.add_argument("--stream", default=None, action="store_true",
-                        help="Encode on the fly from zip; no shards needed")
-    parser.add_argument("--no_stream", dest="stream", action="store_false",
-                        help="Use pre-built shards")
+    parser.add_argument("--use_shard", default=None, action="store_true",
+                        help="Use pre-built shards instead of streaming from zip")
+    parser.add_argument("--no_use_shard", dest="use_shard", action="store_false",
+                        help="Stream on the fly from zip (default)")
     parser.add_argument("--no_wandb", action="store_true")
     return parser.parse_args()
 
@@ -477,20 +563,18 @@ def main() -> None:
     if args.top_k_episodes is not None: bc.top_k_episodes = args.top_k_episodes
     if args.run_name       is not None: bc.run_name       = args.run_name
     if args.augment        is not None: bc.augment        = args.augment
-    if args.stream         is not None: bc.stream         = args.stream
+    if args.use_shard      is not None: bc.use_shard      = args.use_shard
     use_wandb = not args.no_wandb
 
     if cfg.bc.top_k_episodes is not None and cfg.bc.top_k_episodes <= 0:
         raise ValueError("--top_k_episodes must be a positive integer when provided")
-    if cfg.bc.top_k_episodes is not None and not cfg.bc.stream:
-        raise ValueError("--top_k_episodes is only supported in stream mode")
 
     episodes_dirs = [Path(d) for d in args.episodes_dirs]
 
-    if cfg.bc.stream:
-        train_stream(episodes_dirs, cfg, use_wandb=use_wandb)
-    else:
+    if cfg.bc.use_shard:
         train(episodes_dirs, cfg, use_wandb=use_wandb)
+    else:
+        train_stream(episodes_dirs, cfg, use_wandb=use_wandb)
 
 
 if __name__ == "__main__":
