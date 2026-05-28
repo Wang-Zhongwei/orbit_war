@@ -1,41 +1,63 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 
+def _setstate(instance: Any, state: Any) -> None:
+    """Backward-compatible __setstate__ for slots dataclasses.
+
+    Handles both old non-slots checkpoints (state is a plain dict) and new
+    slots checkpoints (state is (dict_state, slot_state) tuple).  Fields
+    missing from the stored state get their declared default values, so
+    adding a new field never breaks loading an older checkpoint.
+    """
+    slot_state: dict = state[1] if isinstance(state, tuple) else (state or {})
+    for f in fields(type(instance)):
+        if f.name in slot_state:
+            object.__setattr__(instance, f.name, slot_state[f.name])
+        elif f.default is not MISSING:
+            object.__setattr__(instance, f.name, f.default)
+        elif f.default_factory is not MISSING:  # type: ignore[misc]
+            object.__setattr__(instance, f.name, f.default_factory())
+
+
 @dataclass(slots=True)
 class EnvConfig:
-    board_size: float = 100.0
     episode_steps: int = 500
     candidate_count: int = 8
     ship_bucket_count: int = 8
     max_planets: int = 48
     max_ships: float = 400.0
-    max_production: float = 5.0
+
+    def __setstate__(self, state) -> None: _setstate(self, state)
 
 
 @dataclass(slots=True)
 class ModelConfig:
     hidden_size: int = 128
 
+    def __setstate__(self, state) -> None: _setstate(self, state)
+
 
 @dataclass(slots=True)
 class PPOConfig:
-    rollout_steps: int = 32
-    num_envs: int = 4
-    total_updates: int = 200
+    rollout_steps: int = 64
+    num_envs: int = -1
+    total_updates: int = 1000
     epochs: int = 4
-    minibatch_size: int = 512
+    minibatch_size: int = 2048
     gamma: float = 0.99
     clip_coef: float = 0.2
-    ent_coef: float = 0.01
+    ent_coef: float = 0.05
     vf_coef: float = 0.5
     lr: float = 3e-4
     max_grad_norm: float = 0.5
+
+    def __setstate__(self, state) -> None: _setstate(self, state)
 
 
 @dataclass(slots=True)
@@ -46,8 +68,12 @@ class BCConfig:
     winner_only: bool = False
     stream: bool = True
     stream_buffer: int = 200
+    top_k_episodes: int | None = None
     out_dir: str = "artifacts/bc"
     run_name: str = "bc_pretrain"
+    augment: bool = True
+
+    def __setstate__(self, state) -> None: _setstate(self, state)
 
 
 @dataclass(slots=True)
@@ -67,15 +93,12 @@ class TrainConfig:
     bc: BCConfig = field(default_factory=BCConfig)
 
     def __setstate__(self, state) -> None:
-        slot_state: dict = state[1] if isinstance(state, tuple) else state
-        if slot_state and "opponent" in slot_state and "opponents" not in slot_state:
+        slot_state: dict = state[1] if isinstance(state, tuple) else (state or {})
+        # Rename legacy field
+        if "opponent" in slot_state and "opponents" not in slot_state:
             slot_state = dict(slot_state)
             slot_state["opponents"] = [slot_state.pop("opponent")]
-        for key, value in (slot_state or {}).items():
-            try:
-                object.__setattr__(self, key, value)
-            except AttributeError:
-                pass
+        _setstate(self, slot_state)
 
 
 def default_train_config_path() -> Path:

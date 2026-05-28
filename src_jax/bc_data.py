@@ -99,7 +99,7 @@ def _find_angles_for_action(
 # Observation → EnvState
 # ---------------------------------------------------------------------------
 
-def obs_to_env_state(obs: dict) -> EnvState:
+def obs_to_env_state(obs: dict, num_agents: int = 2) -> EnvState:
     """Reconstruct a JAX EnvState from a Kaggle episode observation dict.
 
     Planet format: [id, owner, x, y, radius, ships, production]
@@ -203,7 +203,7 @@ def obs_to_env_state(obs: dict) -> EnvState:
         comet_path_idx  = jnp.asarray(dummy_path_idx),
         step             = jnp.int32(obs["step"]),
         angular_velocity = jnp.float32(obs["angular_velocity"]),
-        num_agents       = jnp.int32(2),
+        num_agents       = jnp.int32(num_agents),
         comet_id_base    = jnp.int32(n_base),
     )
 
@@ -346,13 +346,21 @@ def episode_to_samples(
             src_slots        = enc_np.src_slots[i],
             cand_slots       = enc_np.cand_slots_safe[i],
         )
+        # Emit explicit no-op labels for valid sources the expert chose to hold.
+        # Without these, the policy only sees "given expert decided to launch,
+        # where to?" and collapses toward always-launch at inference.
+        acted_src = {src_idx for src_idx, _, _ in labels}
+        src_valid_i = enc_np.src_valid[i]
+        for j in range(len(src_valid_i)):
+            if bool(src_valid_i[j]) and j not in acted_src:
+                labels.append((j, 0, 0))
         for src_idx, cand_idx, ship_bucket in labels:
             rows_sf.append(enc_np.self_feats[i,   src_idx])
             rows_cf.append(enc_np.cand_feats[i,   src_idx])
             rows_gf.append(enc_np.global_feat[i])
             rows_cm.append(enc_np.cand_mask[i,    src_idx])
-            rows_ff.append(enc_np.fleet_feats[i])
-            rows_fm.append(enc_np.fleet_mask[i])
+            # rows_ff.append(enc_np.fleet_feats[i])
+            # rows_fm.append(enc_np.fleet_mask[i])
             rows_ti.append(cand_idx)
             rows_sb.append(ship_bucket)
 
@@ -364,8 +372,8 @@ def episode_to_samples(
         "cand_feats":   np.stack(rows_cf).astype(np.float32),
         "global_feats": np.stack(rows_gf).astype(np.float32),
         "cand_mask":    np.stack(rows_cm),
-        "fleet_feats":  np.stack(rows_ff).astype(np.float32),
-        "fleet_mask":   np.stack(rows_fm),
+        # "fleet_feats":  np.stack(rows_ff).astype(np.float32),
+        # "fleet_mask":   np.stack(rows_fm),
         "target_idx":   np.array(rows_ti, dtype=np.int32),
         "ships_bucket": np.array(rows_sb, dtype=np.int32),
     }
@@ -378,6 +386,7 @@ def episode_to_samples(
 def _collect_states_actions(episode: dict):
     """Shared state/action collection used by both sample functions."""
     steps = episode.get("steps", [])
+    num_agents = len(steps[0]) if steps else 2
     batch_states: list[EnvState] = []
     batch_players: list[int]     = []
     batch_actions: list[list]    = []
@@ -391,7 +400,7 @@ def _collect_states_actions(episode: dict):
                 continue
             prev_obs = steps[i - 1][agent_idx]["observation"]
             try:
-                state = obs_to_env_state(prev_obs)
+                state = obs_to_env_state(prev_obs, num_agents)
             except Exception:
                 continue
             batch_states.append(state)
@@ -455,6 +464,14 @@ def episode_to_samples_jax(
             src_slots        = src_slots_np[i],
             cand_slots       = cand_slots_np[i],
         )
+        # Emit explicit no-op labels for valid sources the expert chose to hold.
+        # Without these, the policy only sees "given expert decided to launch,
+        # where to?" and collapses toward always-launch at inference.
+        acted_src = {src_idx for src_idx, _, _ in labels}
+        src_valid_i = src_valid_np[i]
+        for j in range(len(src_valid_i)):
+            if bool(src_valid_i[j]) and j not in acted_src:
+                labels.append((j, 0, 0))
         for src_idx, cand_idx, bucket in labels:
             ts_list.append(i)
             si_list.append(src_idx)
@@ -473,8 +490,8 @@ def episode_to_samples_jax(
         "cand_feats":   enc.cand_feats[ts, si],
         "global_feats": enc.global_feat[ts],
         "cand_mask":    enc.cand_mask[ts, si],
-        "fleet_feats":  enc.fleet_feats[ts],
-        "fleet_mask":   enc.fleet_mask[ts],
+        # "fleet_feats":  enc.fleet_feats[ts],
+        # "fleet_mask":   enc.fleet_mask[ts],
         "target_idx":   jnp.array(ci_list, dtype=jnp.int32),
         "ships_bucket": jnp.array(bi_list, dtype=jnp.int32),
     }
@@ -562,9 +579,13 @@ def encode_to_shards(
         if winner_only:
             rewards  = episode.get("rewards", [])
             statuses = episode.get("statuses", [])
+            valid_rewards = [r for r in rewards if r is not None]
+            if not valid_rewards:
+                continue
+            best = max(valid_rewards)
             winning_player = next(
                 (i for i, (r, s) in enumerate(zip(rewards, statuses))
-                 if r == max(rewards) and s == "DONE"),
+                 if r == best and s == "DONE"),
                 None,
             )
             if winning_player is None:

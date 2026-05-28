@@ -6,3 +6,4 @@ submission/*
 episodes/*
 artifacts/*
 wandb/*
+*.ipynb

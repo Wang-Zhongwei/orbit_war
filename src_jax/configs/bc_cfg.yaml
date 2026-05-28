@@ -1,7 +1,7 @@
 seed: 42
 
 env:
-  candidate_count: 8
+  candidate_count: 12
   ship_bucket_count: 8
 
 model:
@@ -14,5 +14,7 @@ bc:
   winner_only: false
   stream: true
   stream_buffer: 200
+  top_k_episodes: null
   out_dir: artifacts/bc
   run_name: bc_pretrain
+  augment: true

@@ -69,7 +69,7 @@ class _PolicyHead(nn.Module):
 
         target_logits = nn.Dense(1)(nn.gelu(nn.Dense(H)(joint))).squeeze(-1)   # [N, K]
         target_logits = jnp.where(
-            candidate_mask, target_logits, jnp.finfo(jnp.float32).min
+            candidate_mask, target_logits, -jnp.inf
         )
         ships_logits  = nn.Dense(self.ship_bucket_count)(
             nn.gelu(nn.Dense(H)(joint))

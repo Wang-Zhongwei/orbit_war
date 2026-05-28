@@ -16,6 +16,7 @@ from .constants import (
     PLANET_CLEARANCE,
     ROTATION_RADIUS_LIMIT,
     SUN_RADIUS,
+    MAX_PRODUCTION,
 )
 
 
@@ -34,7 +35,7 @@ def generate_planets(rng: _stdlib_random.Random | None = None) -> list[list]:
     for _ in range(5000):
         if static_groups >= MIN_STATIC_GROUPS:
             break
-        prod = rng.randint(1, 5)
+        prod = rng.randint(1, MAX_PRODUCTION)
         r = 1 + math.log(prod)
         angle = rng.uniform(0, math.pi / 2)
         min_orbital = ROTATION_RADIUS_LIMIT - r

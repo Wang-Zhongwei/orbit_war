@@ -1,7 +1,12 @@
 """
 Pre-encode a day's episode zip into sharded .npz files for fast BC training.
 
-Run once per date directory before training:
+Usage:
+    # Formal mode — env config comes from YAML:
+    python -m src_jax.bc_encode --episodes_dir episodes/2026-05-24 \\
+                                 --config src_jax/configs/bc_cfg.yaml
+
+    # Smoke-test mode — uses dataclass defaults, no config file needed:
     python -m src_jax.bc_encode --episodes_dir episodes/2026-05-24
 
 Output: episodes/2026-05-24/shards/shard_NNNN.npz
@@ -13,15 +18,18 @@ import argparse
 from pathlib import Path
 
 from .bc_data import SHARD_DIR_NAME, encode_to_shards
-from .config import default_train_config_path, load_train_config
+from .config import TrainConfig, default_train_config_path, load_train_config
 from .features import _make_env_encoder
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--episodes_dir", required=True,
                         help="Date directory containing the episode zip (e.g. episodes/2026-05-24)")
-    parser.add_argument("--config", default=str(default_train_config_path()))
+    parser.add_argument("--config", default=None,
+                        help="TrainConfig YAML (formal mode). Omit to use dataclass defaults "
+                             "(smoke-test mode).")
     parser.add_argument("--episodes_per_shard", type=int, default=100,
                         help="Episodes per shard file (default: 100)")
     parser.add_argument("--winner_only", action="store_true",
@@ -30,7 +38,7 @@ def main() -> None:
                         help="Re-encode even if shards already exist")
     args = parser.parse_args()
 
-    cfg = load_train_config(args.config)
+    cfg = load_train_config(args.config) if args.config is not None else TrainConfig()
     encode_fn = _make_env_encoder(cfg.env.candidate_count, cfg.env)
 
     episodes_dir = Path(args.episodes_dir)

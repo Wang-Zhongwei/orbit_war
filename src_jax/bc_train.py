@@ -2,22 +2,18 @@
 Behavior-cloning pretraining: imitate top players by minimizing cross-entropy.
 
 Usage:
-    python -m src_jax.bc_train [options]
+    # Formal training — config file + optional CLI overrides (CLI wins):
+    python -m src_jax.bc_train --config src_jax/configs/bc_cfg.yaml \\
+                                --episode_dirs episodes/2026-05-24 \\
+                                --top_k_episodes 200 --out_dir ./artifacts/bc/run1
 
-    --episode_dirs DIR [DIR ...]
-                         Date directories containing shards/ (default: episodes/)
-    --out_dir DIR        Where to save checkpoints (default: artifacts/bc)
-    --config PATH        TrainConfig YAML (default: src_jax/configs/default_cfg.yaml)
-    --epochs N           Passes over the dataset (default: 10)
-    --batch_size N       Samples per gradient step (default: 2048)
-    --lr LR              Learning rate (default: 3e-4)
-    --winner_only        Learn only from the winning agent (default: False)
-    --stream             Encode episodes on the fly from zip; skips shards entirely.
-                         Best for 1-epoch runs over large datasets (no disk space wasted,
-                         no pre-encode step). Re-encoding cost per epoch is the trade-off.
-    --stream_buffer N    Episodes to buffer before training in stream mode (default: 200)
-    --run_name NAME      W&B / checkpoint run name (default: bc_pretrain)
-    --no_wandb           Disable W&B logging
+    # Smoke test — dataclass defaults + CLI overrides, no config file needed:
+    python -m src_jax.bc_train --episode_dirs episodes/2026-05-24 \\
+                                --stream --top_k_episodes 5 --epochs 1
+
+Runtime flags (accepted in both modes):
+    --stream / --no_stream   Override the stream setting from config
+    --no_wandb               Disable W&B logging
 
 Loss:
     CE(target_logits, expert_target) + CE(ships_logits[expert_target], expert_bucket)
@@ -38,15 +34,14 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
+from .augment import DEFAULT_AUG_IDS, expand_with_augmentations
 from .bc_data import (
     _filter_winner,
     _iter_episode_jsons,
-    concat_samples,
-    episode_to_samples,
     episode_to_samples_jax,
     find_shards,
 )
-from .config import TrainConfig, default_train_config_path, load_train_config
+from .config import TrainConfig, load_train_config
 from .features import _make_env_encoder
 from .policy import build_policy, init_params
 from .ppo import TrainState
@@ -123,23 +118,22 @@ def save_bc_checkpoint(
 
 def train(
     episodes_dirs: list[Path],
-    out_dir: Path,
     cfg: TrainConfig,
     *,
-    epochs: int,
-    batch_size: int,
-    lr: float,
-    run_name: str,
-    use_wandb: bool,
+    use_wandb: bool = True,
 ) -> TrainState:
+    """Shard-based BC training loop. All hyperparameters are read from cfg.bc."""
+    bc = cfg.bc
+    aug_ids = DEFAULT_AUG_IDS
     shard_paths = find_shards(episodes_dirs)
-    print(f"Found {len(shard_paths)} shards across {len(episodes_dirs)} date dir(s)")
+    print(f"Found {len(shard_paths)} shards across {len(episodes_dirs)} date dir(s)"
+          + (f" | augment={aug_ids}" if bc.augment else ""))
 
     policy = build_policy(cfg)
     params = init_params(policy, cfg.seed)
     tx = optax.chain(
         optax.clip_by_global_norm(0.5),
-        optax.adam(lr),
+        optax.adam(bc.lr),
     )
     state = TrainState.create(apply_fn=policy.apply, params=params, tx=tx)
 
@@ -147,26 +141,29 @@ def train(
         import wandb
         wandb.init(
             project="orbit-war",
-            name=run_name,
+            name=bc.run_name,
             config={
                 "episodes_dirs": [str(d) for d in episodes_dirs],
                 "n_shards": len(shard_paths),
-                "epochs": epochs,
-                "batch_size": batch_size,
-                "lr": lr,
+                "epochs": bc.epochs,
+                "batch_size": bc.batch_size,
+                "lr": bc.lr,
+                "augment": bc.augment,
+                "aug_ids": aug_ids if bc.augment else [],
                 "candidate_count": cfg.env.candidate_count,
                 "ship_bucket_count": cfg.env.ship_bucket_count,
+                "top_k_episodes": bc.top_k_episodes,
                 "hidden_size": cfg.model.hidden_size,
             },
         )
 
-    print(f"Starting BC training: {epochs} epochs, batch={batch_size}")
-    print(f"Checkpoints → {out_dir / run_name}")
+    print(f"Starting BC training: {bc.epochs} epochs, batch={bc.batch_size}", flush=True)
+    print(f"Checkpoints → {Path(bc.out_dir) / bc.run_name}", flush=True)
 
     rng = np.random.default_rng(cfg.seed)
     global_step = 0
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(1, bc.epochs + 1):
         shard_order = rng.permutation(len(shard_paths)).tolist()
         losses, tgt_losses, shp_losses = [], [], []
         t0 = time.time()
@@ -183,8 +180,18 @@ def train(
             ti = jnp.asarray(data["target_idx"][perm])
             sb = jnp.asarray(data["ships_bucket"][perm])
 
-            for start in range(0, N - batch_size + 1, batch_size):
-                end = start + batch_size
+            # D4 augmentation: expand shard N→N*len(aug_ids) then re-shuffle.
+            if bc.augment:
+                sf, cf, gf, cm, ti, sb = expand_with_augmentations(
+                    sf, cf, gf, cm, ti, sb, aug_ids
+                )
+                N = sf.shape[0]
+                perm2 = jnp.asarray(rng.permutation(N))
+                sf, cf, gf = sf[perm2], cf[perm2], gf[perm2]
+                cm, ti, sb = cm[perm2], ti[perm2], sb[perm2]
+
+            for start in range(0, N - bc.batch_size + 1, bc.batch_size):
+                end = start + bc.batch_size
                 state, loss, tgt_l, shp_l = _bc_step(
                     state,
                     sf[start:end], cf[start:end], gf[start:end], cm[start:end],
@@ -212,7 +219,7 @@ def train(
                 step=global_step,
             )
 
-        save_bc_checkpoint(out_dir, run_name, epoch, state, cfg)
+        save_bc_checkpoint(Path(bc.out_dir), bc.run_name, epoch, state, cfg)
 
     if use_wandb:
         import wandb
@@ -221,30 +228,53 @@ def train(
     return state
 
 
+def _resolve_episode_dirs(episodes_dirs: list[Path]) -> list[Path]:
+    """Auto-expand dirs that contain no episode files directly but have dated subdirs."""
+    resolved: list[Path] = []
+    for d in episodes_dirs:
+        d = Path(d)
+        if not d.is_dir():
+            resolved.append(d)
+            continue
+        has_direct = any(d.glob("*.zip")) or any(d.glob("*.json"))
+        if has_direct:
+            resolved.append(d)
+        else:
+            subdirs = sorted(
+                child for child in d.iterdir()
+                if child.is_dir()
+                and (any(child.glob("*.zip")) or any(child.glob("*.json")))
+            )
+            if subdirs:
+                print(f"  auto-discovered: {[s.name for s in subdirs]}", flush=True)
+                resolved.extend(subdirs)
+            else:
+                resolved.append(d)   # keep as-is; will raise a clear error later
+    return resolved
+
+
 # ---------------------------------------------------------------------------
 # Streaming training loop (on-the-fly encode from zip, no shards)
 # ---------------------------------------------------------------------------
 
 def train_stream(
     episodes_dirs: list[Path],
-    out_dir: Path,
     cfg: TrainConfig,
     *,
-    epochs: int,
-    batch_size: int,
-    lr: float,
-    run_name: str,
-    use_wandb: bool,
-    winner_only: bool,
-    stream_buffer: int,
+    use_wandb: bool = True,
 ) -> TrainState:
+    """Streaming BC training loop (on-the-fly encoding from zip). All hyperparameters are read from cfg.bc."""
+    bc = cfg.bc
+    aug_ids = DEFAULT_AUG_IDS
+
+    episodes_dirs = _resolve_episode_dirs(episodes_dirs)
     encode_fn = _make_env_encoder(cfg.env.candidate_count, cfg.env)
 
     policy = build_policy(cfg)
     params = init_params(policy, cfg.seed)
     tx = optax.chain(
         optax.clip_by_global_norm(0.5),
-        optax.adam(lr),
+        optax.adam(bc.lr),
     )
     state = TrainState.create(apply_fn=policy.apply, params=params, tx=tx)
 
@@ -252,14 +282,17 @@ def train_stream(
         import wandb
         wandb.init(
             project="orbit-war",
-            name=run_name,
+            name=bc.run_name,
             config={
                 "episodes_dirs": [str(d) for d in episodes_dirs],
-                "epochs": epochs,
-                "batch_size": batch_size,
-                "lr": lr,
+                "epochs": bc.epochs,
+                "batch_size": bc.batch_size,
+                "lr": bc.lr,
                 "stream": True,
-                "stream_buffer": stream_buffer,
+                "stream_buffer": bc.stream_buffer,
+                "top_k_episodes": bc.top_k_episodes,
+                "augment": bc.augment,
+                "aug_ids": aug_ids if bc.augment else [],
                 "candidate_count": cfg.env.candidate_count,
                 "ship_bucket_count": cfg.env.ship_bucket_count,
                 "hidden_size": cfg.model.hidden_size,
@@ -270,7 +303,6 @@ def train_stream(
 
     def _drain_buffer(buf: list[dict]) -> None:
         nonlocal state, global_step, n_samples
-        # Concatenate on-device — no host transfer of feature tensors
         keys = buf[0].keys()
         data = {k: jnp.concatenate([s[k] for s in buf], axis=0) for k in keys}
         N    = int(data["target_idx"].shape[0])
@@ -281,8 +313,19 @@ def train_stream(
         cm = data["cand_mask"][perm]
         ti = data["target_idx"][perm]
         sb = data["ships_bucket"][perm]
-        for start in range(0, N - batch_size + 1, batch_size):
-            end = start + batch_size
+
+        # D4 augmentation: expand buffer N→N*len(aug_ids) then re-shuffle.
+        if bc.augment:
+            sf, cf, gf, cm, ti, sb = expand_with_augmentations(
+                sf, cf, gf, cm, ti, sb, aug_ids
+            )
+            N = int(sf.shape[0])
+            perm2 = jnp.array(rng.permutation(N))
+            sf, cf, gf = sf[perm2], cf[perm2], gf[perm2]
+            cm, ti, sb = cm[perm2], ti[perm2], sb[perm2]
+
+        for start in range(0, N - bc.batch_size + 1, bc.batch_size):
+            end = start + bc.batch_size
             state, loss, tgt_l, shp_l = _bc_step(
                 state,
                 sf[start:end], cf[start:end], gf[start:end], cm[start:end],
@@ -294,22 +337,33 @@ def train_stream(
             global_step += 1
         n_samples += N
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(1, bc.epochs + 1):
         losses, tgt_losses, shp_losses = [], [], []
         t0 = time.time()
         n_episodes = n_samples = global_step = 0
         buffer: list[dict] = []
+        limit_msg = "" if bc.top_k_episodes is None else f" (top_k_episodes={bc.top_k_episodes})"
+        print(
+            f"epoch {epoch}: reading episodes from {[str(d) for d in episodes_dirs]}"
+            f"{limit_msg} ...",
+            flush=True,
+        )
 
         for episodes_dir in episodes_dirs:
+            reached_episode_limit = False
             for _name, episode in _iter_episode_jsons(episodes_dir):
                 if not isinstance(episode, dict) or "steps" not in episode:
                     continue
-                if winner_only:
+                if bc.winner_only:
                     rewards  = episode.get("rewards", [])
                     statuses = episode.get("statuses", [])
+                    valid_rewards = [r for r in rewards if r is not None]
+                    if not valid_rewards:
+                        continue
+                    best = max(valid_rewards)
                     winning_player = next(
                         (i for i, (r, s) in enumerate(zip(rewards, statuses))
-                         if r == max(rewards) and s == "DONE"),
+                         if r == best and s == "DONE"),
                         None,
                     )
                     if winning_player is None:
@@ -323,15 +377,29 @@ def train_stream(
                 buffer.append(samples)
                 n_episodes += 1
 
-                if len(buffer) >= stream_buffer:
+                if len(buffer) >= bc.stream_buffer:
                     _drain_buffer(buffer)
                     buffer = []
-                    if n_episodes % (stream_buffer * 5) == 0:
-                        print(f"  ep={n_episodes}  samples={n_samples}  steps={global_step}"
-                              f"  ({time.time() - t0:.0f}s)")
+                    print(f"  ep={n_episodes}  samples={n_samples}  steps={global_step}"
+                          f"  ({time.time() - t0:.0f}s)", flush=True)
+
+                if bc.top_k_episodes is not None and n_episodes >= bc.top_k_episodes:
+                    reached_episode_limit = True
+                    break
+
+            if reached_episode_limit:
+                break
 
         if buffer:
             _drain_buffer(buffer)
+
+        if n_episodes == 0:
+            dirs_str = ", ".join(d.name for d in episodes_dirs)
+            raise RuntimeError(
+                f"Stream mode processed 0 episodes from: {dirs_str}\n"
+                "Check that the directories contain .zip or .json episode replay files.\n"
+                "Example: --episode_dirs episodes/2026-05-24"
+            )
 
         mean_loss = float(np.mean(losses)) if losses else float("nan")
         mean_tgt  = float(np.mean(tgt_losses)) if tgt_losses else float("nan")
@@ -350,7 +418,7 @@ def train_stream(
                 step=global_step,
             )
 
-        save_bc_checkpoint(out_dir, run_name, epoch, state, cfg)
+        save_bc_checkpoint(Path(bc.out_dir), bc.run_name, epoch, state, cfg)
 
     if use_wandb:
         import wandb
@@ -363,69 +431,66 @@ def train_stream(
 # CLI
 # ---------------------------------------------------------------------------
 
-def _default_bc_config_path() -> Path:
-    return Path(__file__).resolve().parent / "configs" / "bc_cfg.yaml"
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--episode_dirs", "--episodes_dirs", "--episodes_dir",
                         dest="episodes_dirs", nargs="+", default=["episodes"],
-                        help="Date directories (e.g. episodes/2026-05-24 episodes/2026-05-23)")
-    parser.add_argument("--config", default=str(_default_bc_config_path()),
-                        help="TrainConfig YAML (default: src_jax/configs/bc_cfg.yaml)")
-    # BC fields — all optional; config file values are used when not provided
-    parser.add_argument("--out_dir", default=None, help="Checkpoint output directory")
+                        help="Date directories (e.g. episodes/2026-05-24)")
+    parser.add_argument("--config", default=None,
+                        help="TrainConfig YAML (formal mode). Omit to use dataclass defaults "
+                             "with CLI overrides (smoke-test mode).")
+    # Smoke-test overrides — applied to cfg.bc when --config is not given
+    parser.add_argument("--out_dir", default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--winner_only", default=None, action="store_true")
+    parser.add_argument("--stream_buffer", type=int, default=None)
+    parser.add_argument("--top_k_episodes", type=int, default=None,
+                        help="Process only the first N valid episodes (stream mode only)")
+    parser.add_argument("--run_name", default=None)
+    parser.add_argument("--augment", default=None, action="store_true")
+    parser.add_argument("--no_augment", dest="augment", action="store_false")
+    # Runtime flags — accepted in both modes
     parser.add_argument("--stream", default=None, action="store_true",
                         help="Encode on the fly from zip; no shards needed")
     parser.add_argument("--no_stream", dest="stream", action="store_false",
-                        help="Use pre-built shards (overrides config stream=true)")
-    parser.add_argument("--stream_buffer", type=int, default=None,
-                        help="Episodes to buffer before a training pass in stream mode")
-    parser.add_argument("--run_name", default=None)
+                        help="Use pre-built shards")
     parser.add_argument("--no_wandb", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    cfg  = load_train_config(args.config)
-    bc   = cfg.bc  # defaults from config file
 
-    # CLI args override config; None means "not provided on command line"
-    out_dir       = Path(args.out_dir   if args.out_dir       is not None else bc.out_dir)
-    epochs        = args.epochs         if args.epochs         is not None else bc.epochs
-    batch_size    = args.batch_size     if args.batch_size     is not None else bc.batch_size
-    lr            = args.lr             if args.lr             is not None else bc.lr
-    winner_only   = args.winner_only    if args.winner_only    is not None else bc.winner_only
-    use_stream    = args.stream         if args.stream         is not None else bc.stream
-    stream_buffer = args.stream_buffer  if args.stream_buffer  is not None else bc.stream_buffer
-    run_name      = args.run_name       if args.run_name       is not None else bc.run_name
+    cfg = load_train_config(args.config) if args.config is not None else TrainConfig()
+
+    # CLI flags always override config (last writer wins: defaults → YAML → CLI)
+    bc = cfg.bc
+    if args.out_dir        is not None: bc.out_dir        = args.out_dir
+    if args.epochs         is not None: bc.epochs         = args.epochs
+    if args.batch_size     is not None: bc.batch_size     = args.batch_size
+    if args.lr             is not None: bc.lr             = args.lr
+    if args.winner_only    is not None: bc.winner_only    = args.winner_only
+    if args.stream_buffer  is not None: bc.stream_buffer  = args.stream_buffer
+    if args.top_k_episodes is not None: bc.top_k_episodes = args.top_k_episodes
+    if args.run_name       is not None: bc.run_name       = args.run_name
+    if args.augment        is not None: bc.augment        = args.augment
+    if args.stream         is not None: bc.stream         = args.stream
+    use_wandb = not args.no_wandb
+
+    if cfg.bc.top_k_episodes is not None and cfg.bc.top_k_episodes <= 0:
+        raise ValueError("--top_k_episodes must be a positive integer when provided")
+    if cfg.bc.top_k_episodes is not None and not cfg.bc.stream:
+        raise ValueError("--top_k_episodes is only supported in stream mode")
 
     episodes_dirs = [Path(d) for d in args.episodes_dirs]
-    common = dict(
-        out_dir    = out_dir,
-        cfg        = cfg,
-        epochs     = epochs,
-        batch_size = batch_size,
-        lr         = lr,
-        run_name   = run_name,
-        use_wandb  = not args.no_wandb,
-    )
 
-    if use_stream:
-        train_stream(
-            episodes_dirs,
-            **common,
-            winner_only   = winner_only,
-            stream_buffer = stream_buffer,
-        )
+    if cfg.bc.stream:
+        train_stream(episodes_dirs, cfg, use_wandb=use_wandb)
     else:
-        train(episodes_dirs, **common)
+        train(episodes_dirs, cfg, use_wandb=use_wandb)
 
 
 if __name__ == "__main__":

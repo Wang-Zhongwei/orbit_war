@@ -214,8 +214,8 @@ class _EncodedTurn(NamedTuple):
     angles:          jnp.ndarray  # [MAX_SRC, K]    float32
     cand_feats:      jnp.ndarray  # [MAX_SRC, K, 14]
     global_feat:     jnp.ndarray  # [12]
-    fleet_feats:     jnp.ndarray  # [MAX_FLEETS, 6]
-    fleet_mask:      jnp.ndarray  # [MAX_FLEETS]    bool
+    # fleet_feats:     jnp.ndarray  # [MAX_FLEETS, 6]
+    # fleet_mask:      jnp.ndarray  # [MAX_FLEETS]    bool
     step:            jnp.ndarray  # []              int32
 
 
@@ -224,15 +224,15 @@ def _make_env_encoder(K: int, env_cfg):
 
     Call once at JaxVecEnv init; reuse every tick.
     """
-    from .constants import MAX_ANGULAR_VELOCITY
+    from .constants import MAX_ANGULAR_VELOCITY, BOARD_SIZE, MAX_PRODUCTION
 
     K_enemy    = K // 3
     K_neutral  = K // 3
     K_friendly = K - 1 - K_enemy - K_neutral   # friendly quota; total non-noop slots = K-1
 
-    board_size           = jnp.float32(env_cfg.board_size)
+    board_size           = jnp.float32(BOARD_SIZE)
     max_ships            = jnp.float32(env_cfg.max_ships)
-    max_production       = jnp.float32(env_cfg.max_production)
+    max_production       = jnp.float32(MAX_PRODUCTION)
     max_planets          = jnp.float32(env_cfg.max_planets)
     episode_steps        = jnp.float32(env_cfg.episode_steps)
     max_angular_velocity = jnp.float32(MAX_ANGULAR_VELOCITY)
@@ -534,17 +534,17 @@ def _make_env_encoder(K: int, env_cfg):
         # ── Fleet features  [MAX_FLEETS, 6] ──────────────────────────────
         # Velocity (not pure heading) so the cross-attention can extrapolate
         # "fleet_pos + t·vel" geometrically without re-learning _fleet_speed.
-        f_is_enemy = (state.f_owner != player).astype(jnp.float32)
-        f_spd      = _fleet_speed(state.f_ships)                              # [MAX_FLEETS]
-        fleet_feats = jnp.stack([
-            f_is_enemy,                                                       # [0] 1 if enemy fleet, else 0
-            jnp.clip(state.f_ships, 0.0, max_ships) / max_ships,             # [1] fleet size — damage potential
-            state.f_x / board_size,                                           # [2] normalized x position
-            state.f_y / board_size,                                           # [3] normalized y position
-            f_spd * jnp.cos(state.f_angle) / board_size,                      # [4] vx per tick, board-normalized
-            f_spd * jnp.sin(state.f_angle) / board_size,                      # [5] vy per tick, board-normalized
-        ], axis=1).astype(jnp.float32)                                        # [MAX_FLEETS, 6]
-        fleet_mask = state.f_alive                                            # [MAX_FLEETS]
+        # f_is_enemy = (state.f_owner != player).astype(jnp.float32)
+        # f_spd      = _fleet_speed(state.f_ships)                              # [MAX_FLEETS]
+        # fleet_feats = jnp.stack([
+        #     f_is_enemy,                                                       # [0] 1 if enemy fleet, else 0
+        #     jnp.clip(state.f_ships, 0.0, max_ships) / max_ships,             # [1] fleet size — damage potential
+        #     state.f_x / board_size,                                           # [2] normalized x position
+        #     state.f_y / board_size,                                           # [3] normalized y position
+        #     f_spd * jnp.cos(state.f_angle) / board_size,                      # [4] vx per tick, board-normalized
+        #     f_spd * jnp.sin(state.f_angle) / board_size,                      # [5] vy per tick, board-normalized
+        # ], axis=1).astype(jnp.float32)                                        # [MAX_FLEETS, 6]
+        # fleet_mask = state.f_alive                                            # [MAX_FLEETS]
 
         return _EncodedTurn(
             src_valid       = src_valid,
@@ -558,8 +558,8 @@ def _make_env_encoder(K: int, env_cfg):
             angles          = angles,
             cand_feats      = cand_feats,
             global_feat     = global_feat,
-            fleet_feats     = fleet_feats,
-            fleet_mask      = fleet_mask,
+            # fleet_feats     = fleet_feats,
+            # fleet_mask      = fleet_mask,
             step            = state.step,
         )
 
