@@ -9,6 +9,11 @@ import flax.linen as nn
 from .features import self_feature_dim, candidate_feature_dim, global_feature_dim
 
 
+# Finite floor used to mask invalid candidates in the target logits. Must be
+# very negative (prob≈0) but finite so entropy/log_softmax stay NaN-free.
+MASK_LOGIT = -1e9
+
+
 class PolicyOutput(NamedTuple):
     target_logits: jax.Array   # [N, K]
     ships_logits: jax.Array    # [N, K, B]
@@ -68,9 +73,11 @@ class _PolicyHead(nn.Module):
         ], axis=-1)                                                             # [N, K, 3H]
 
         target_logits = nn.Dense(1)(nn.gelu(nn.Dense(H)(joint))).squeeze(-1)   # [N, K]
-        target_logits = jnp.where(
-            candidate_mask, target_logits, -jnp.inf
-        )
+        # Mask invalid candidates with a large *finite* negative instead of -inf.
+        # -inf makes softmax prob exactly 0, but then the entropy term
+        # exp(log_p) * log_p = 0 * -inf = NaN, which poisons the PPO loss and
+        # every gradient after it. A finite floor gives prob≈0 with finite log_p.
+        target_logits = jnp.where(candidate_mask, target_logits, MASK_LOGIT)
         ships_logits  = nn.Dense(self.ship_bucket_count)(
             nn.gelu(nn.Dense(H)(joint))
         )                                                                       # [N, K, B]

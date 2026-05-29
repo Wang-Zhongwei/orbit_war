@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import pickle
+import time
 from pathlib import Path
 
 import jax
@@ -116,8 +117,10 @@ def main() -> None:
 
     print("Compiling JAX rollout (first update may be slow) …", flush=True)
 
+    t0 = time.time()
     try:
         for update in range(start_update, cfg.ppo.total_updates + 1):
+            t_update = time.time()
             # ── Collect rollout ───────────────────────────────────────────────
             carry, steps = collect(train_state.params, opp_params, carry)
 
@@ -154,6 +157,9 @@ def main() -> None:
             # ── Logging ───────────────────────────────────────────────────────
             if update % cfg.log_every == 0:
                 stats = episode_stats(steps)
+                elapsed = time.time() - t0
+                update_time = time.time() - t_update
+                updates_per_s = (update - start_update + 1) / elapsed if elapsed > 0 else 0
                 print(
                     f"update={update}"
                     f" reward={stats['episode_reward_mean']:.4f}"
@@ -163,6 +169,7 @@ def main() -> None:
                     f" ev={metrics['explained_variance']:.3f}"
                     f" entropy={metrics['entropy']:.3f}"
                     f" clip={metrics['clip_fraction']:.3f}"
+                    f"  {elapsed:.0f}s ({updates_per_s:.2f} updates/s, {update_time:.1f}s/update)"
                 )
                 if use_wandb:
                     import wandb

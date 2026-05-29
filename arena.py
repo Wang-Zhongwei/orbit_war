@@ -38,7 +38,6 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 from src.evaluation import AGENTS, run_match_raw, format_head_to_head_matrix
-from src.kaggle_adapter.ppo_agent import make_ppo_agent
 
 
 CSV_HEADER: list[str] = [
@@ -54,16 +53,14 @@ DEFAULT_CSV = Path(__file__).parent / "results" / "matches.csv"
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _register_ppo_agent(
-    cfg_path: str,
-    checkpoint: str | None,
+def _register_jax_agent(
+    checkpoint_path: str,
     deterministic: bool,
-    name: str = "ppo",
+    name: str = "jax",
 ) -> None:
-    """Build a PPO agent from checkpoint and register it in AGENTS under ``name``."""
-    from src.config import load_train_config
-    cfg = load_train_config(cfg_path)
-    AGENTS[name] = make_ppo_agent(cfg, checkpoint, deterministic=deterministic)
+    """Build a JAX BC/RL agent from checkpoint and register it in AGENTS under ``name``."""
+    from src_jax.jax_agent import make_jax_agent
+    AGENTS[name] = make_jax_agent(checkpoint_path, deterministic=deterministic)
 
 
 def _resolve_agents(names: Sequence[str]) -> None:
@@ -284,34 +281,33 @@ def _build_parser() -> argparse.ArgumentParser:
     p_list = sub.add_parser("list", help="List registered agents.")
     p_list.set_defaults(_handler="list")
 
-    def _add_ppo_args(p: argparse.ArgumentParser) -> None:
-        g = p.add_argument_group("RL agent (optional)")
-        g.add_argument("--checkpoint", type=str, default=None,
-                       help="Path to a .pt checkpoint. Registers a 'ppo' agent (or --ppo-name).")
-        g.add_argument("--config", type=str, default=None,
-                       help="Path to train config YAML (default: src default).")
-        g.add_argument("--deterministic", action="store_true")
-        g.add_argument("--ppo-name", type=str, default="ppo",
-                       help="Registry key used for the loaded RL agent (default: ppo).")
+    def _add_jax_args(p: argparse.ArgumentParser) -> None:
+        g = p.add_argument_group("JAX agent (optional)")
+        g.add_argument("--jax-checkpoint", type=str, default=None,
+                       help="Path to a .pkl JAX checkpoint. Registers a 'jax' agent (or --jax-name).")
+        g.add_argument("--jax-name", type=str, default="jax",
+                       help="Registry key used for the loaded JAX agent (default: jax).")
+        g.add_argument("--jax-stochastic", action="store_true",
+                       help="Sample from the JAX policy instead of taking argmax.")
 
     p_match = sub.add_parser("match", help="Run a single match.")
     p_match.add_argument(
         "--agents", nargs="+", required=True,
-        help="Agent names in slot order (length 2 or 4). Use 'ppo' for the RL agent.",
+        help="Agent names in slot order (length 2 or 4).",
     )
     p_match.add_argument("--seed", type=int, default=0)
     p_match.add_argument("--out", type=Path, default=DEFAULT_CSV)
     p_match.add_argument("--episode-steps", type=int, default=500)
     p_match.add_argument("--replay", type=Path, default=None,
                          help="Save HTML replay to this path.")
-    _add_ppo_args(p_match)
+    _add_jax_args(p_match)
     p_match.set_defaults(_handler="match")
 
     real_agents = [a for a in AGENTS if a != "random"]
     p_tour = sub.add_parser("tournament", help="Round-robin 1v1 with slot rotation.")
     p_tour.add_argument(
         "--agents", nargs="+", default=real_agents,
-        help=f"Agents to include (default: {real_agents}). Use 'ppo' for the RL agent.",
+        help=f"Agents to include (default: {real_agents}).",
     )
     p_tour.add_argument("--rounds", type=int, default=10,
                         help="Number of seed rounds. Each round = (#pairs * 2) matches.")
@@ -323,7 +319,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_tour.add_argument("--workers", type=int, default=1,
                         help="Number of worker processes (default 1).")
     p_tour.add_argument("--quiet", action="store_true")
-    _add_ppo_args(p_tour)
+    _add_jax_args(p_tour)
     p_tour.set_defaults(_handler="tournament")
 
     return p
@@ -339,11 +335,12 @@ def main(argv: Iterable[str] | None = None) -> int:
             print(f"  {k:<12} -> {shown}")
         return 0
 
-    # Register RL agent before any agent resolution.
-    if getattr(args, "checkpoint", None) is not None:
-        from src.config import default_train_config_path
-        cfg_path = args.config or str(default_train_config_path())
-        _register_ppo_agent(cfg_path, args.checkpoint, args.deterministic, args.ppo_name)
+    if getattr(args, "jax_checkpoint", None) is not None:
+        _register_jax_agent(
+            args.jax_checkpoint,
+            deterministic=not args.jax_stochastic,
+            name=args.jax_name,
+        )
 
     if args._handler == "match":
         if len(args.agents) not in (2, 4):

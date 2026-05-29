@@ -36,20 +36,24 @@ def main() -> None:
                         help="Encode only the winning agent's actions")
     parser.add_argument("--force", action="store_true",
                         help="Re-encode even if shards already exist")
+    parser.add_argument("--workers", type=int, default=-1,
+                        help="Worker processes for parallel encoding. -1=all CPUs, 1=single-threaded (default: -1)")
     args = parser.parse_args()
 
     cfg = load_train_config(args.config) if args.config is not None else TrainConfig()
-    encode_fn = _make_env_encoder(cfg.env.candidate_count, cfg.env)
 
     episodes_dir = Path(args.episodes_dir)
     print(f"Encoding {episodes_dir} …")
     shard_dir = encode_to_shards(
         episodes_dir,
-        encode_fn,
-        cfg.env.ship_bucket_count,
+        encode_fn=None,
+        ship_bucket_count=cfg.env.ship_bucket_count,
         episodes_per_shard=args.episodes_per_shard,
         winner_only=args.winner_only,
         force=args.force,
+        workers=args.workers,
+        encode_fn_factory=_make_env_encoder,
+        encode_fn_factory_args=(cfg.env.candidate_count, cfg.env),
     )
     print(f"Done → {shard_dir}")
 

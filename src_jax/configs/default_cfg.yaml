@@ -1,6 +1,6 @@
 seed: 42
 run_name: orbit_wars_jax_ppo
-save_dir: ./artifacts/jax
+save_dir: ./artifacts/ppo
 checkpoint_every: 50
 log_every: 1
 opponents: self

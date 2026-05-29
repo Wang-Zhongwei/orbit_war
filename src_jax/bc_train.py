@@ -97,6 +97,8 @@ def save_bc_checkpoint(
     epoch: int,
     state: TrainState,
     cfg: TrainConfig,
+    *,
+    tag: str | None = None,
 ) -> None:
     run_dir = save_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -106,11 +108,12 @@ def save_bc_checkpoint(
         "opt_state": state.opt_state,
         "config":    cfg,
     }
+    stem = tag if tag is not None else f"{epoch:06d}"
     # Save in the same format as train.py so PPO --resume works directly.
-    for path in [run_dir / "ckpt_last.pkl", run_dir / f"ckpt_{epoch:06d}.pkl"]:
+    for path in [run_dir / "ckpt_last.pkl", run_dir / f"ckpt_{stem}.pkl"]:
         with open(path, "wb") as f:
             pickle.dump(ckpt, f)
-    print(f"  Checkpoint saved → {run_dir}/ckpt_{epoch:06d}.pkl")
+    print(f"  Checkpoint saved → {run_dir}/ckpt_{stem}.pkl")
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +247,12 @@ def train(
                 f"  {elapsed:.0f}s ({steps_per_s:.1f} steps/s)",
                 flush=True,
             )
+
+            if (si + 1) % 5 == 0:
+                save_bc_checkpoint(
+                    Path(bc.out_dir), bc.run_name, epoch, state, cfg,
+                    tag=f"{epoch:06d}_shard{si+1:04d}",
+                )
 
         mean_loss = float(np.mean(losses))
         mean_tgt  = float(np.mean(tgt_losses))

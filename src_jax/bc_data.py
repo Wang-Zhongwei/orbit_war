@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import json
 import math
+import multiprocessing as mp
+import os
 import time
 import zipfile
 from pathlib import Path
@@ -557,6 +559,44 @@ def concat_samples(sample_list: list[dict[str, np.ndarray]]) -> dict[str, np.nda
 
 SHARD_DIR_NAME = "shards"
 
+# ---------------------------------------------------------------------------
+# Multiprocessing worker helpers
+# ---------------------------------------------------------------------------
+
+# Module-level state populated by each worker process via Pool initializer.
+_worker_encode_fn = None
+_worker_ship_bucket_count: int = 0
+
+
+def _worker_init(encode_fn_factory, factory_args, ship_bucket_count: int) -> None:
+    """Called once per worker process. Builds encode_fn locally (avoids pickling JAX fn)."""
+    import os
+    os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
+    global _worker_encode_fn, _worker_ship_bucket_count
+    _worker_encode_fn = encode_fn_factory(*factory_args)
+    _worker_ship_bucket_count = ship_bucket_count
+
+
+def _worker_encode_episode(args: tuple) -> dict | None:
+    """Top-level worker task: encode one episode dict → samples dict (numpy arrays)."""
+    episode, winner_only = args
+    if winner_only:
+        rewards  = episode.get("rewards", [])
+        statuses = episode.get("statuses", [])
+        valid_rewards = [r for r in rewards if r is not None]
+        if not valid_rewards:
+            return None
+        best = max(valid_rewards)
+        winning_player = next(
+            (i for i, (r, s) in enumerate(zip(rewards, statuses))
+             if r == best and s == "DONE"),
+            None,
+        )
+        if winning_player is None:
+            return None
+        episode = _filter_winner(episode, winning_player)
+    return episode_to_samples(episode, _worker_encode_fn, _worker_ship_bucket_count)
+
 
 def encode_to_shards(
     episodes_dir: Path,
@@ -567,19 +607,37 @@ def encode_to_shards(
     num_shards: int | None = None,
     winner_only: bool = False,
     force: bool = False,
+    workers: int = -1,
+    encode_fn_factory=None,
+    encode_fn_factory_args: tuple = (),
 ) -> Path:
     """Encode all episodes in episodes_dir and write sharded .npz files.
 
     Skips if shards already exist unless force=True. Returns the shard directory.
     num_shards limits how many shards are written (useful for quick tests).
+
+    workers=-1 uses all available CPUs via multiprocessing. workers=1 (or 0) runs
+    single-threaded. For workers>1 you must pass encode_fn_factory and
+    encode_fn_factory_args so each worker can re-build the (non-picklable) JAX
+    encode_fn locally.
     """
     shard_dir = episodes_dir / SHARD_DIR_NAME
     if not force and any(shard_dir.glob("*.npz")):
         print(f"Shards already exist in {shard_dir} — skipping (use --force to re-encode)")
         return shard_dir
 
+    n_workers = os.cpu_count() if workers == -1 else workers
+    use_mp = n_workers is not None and n_workers > 1 and encode_fn_factory is not None
+
+    # Single-threaded path: build encode_fn locally if not provided.
+    if not use_mp and encode_fn is None:
+        if encode_fn_factory is None:
+            raise ValueError("encode_fn or encode_fn_factory must be provided")
+        encode_fn = encode_fn_factory(*encode_fn_factory_args)
+
     total_files = _count_episode_jsons(episodes_dir)
-    print(f"Found {total_files} episode files in {episodes_dir}")
+    print(f"Found {total_files} episode files in {episodes_dir}"
+          + (f" | workers={n_workers}" if use_mp else ""))
     if winner_only:
         print("  winner_only=True: encoding only winning agent's actions")
 
@@ -588,57 +646,73 @@ def encode_to_shards(
     shard_idx = n_episodes = n_samples = n_skipped = 0
     t0 = time.time()
 
-    for _name, episode in _iter_episode_jsons(episodes_dir):
-        if not isinstance(episode, dict) or "steps" not in episode:
-            n_skipped += 1
-            continue
-
-        if winner_only:
-            rewards  = episode.get("rewards", [])
-            statuses = episode.get("statuses", [])
-            valid_rewards = [r for r in rewards if r is not None]
-            if not valid_rewards:
-                n_skipped += 1
-                continue
-            best = max(valid_rewards)
-            winning_player = next(
-                (i for i, (r, s) in enumerate(zip(rewards, statuses))
-                 if r == best and s == "DONE"),
-                None,
-            )
-            if winning_player is None:
-                n_skipped += 1
-                continue
-            episode = _filter_winner(episode, winning_player)
-
-        samples = episode_to_samples(episode, encode_fn, ship_bucket_count)
-        if samples is None:
-            n_skipped += 1
-            continue
-
-        buffer.append(samples)
-        n_episodes += 1
-        n_samples  += len(samples["target_idx"])
-
-        if len(buffer) >= episodes_per_shard:
+    def _maybe_flush(force_flush: bool = False) -> None:
+        nonlocal buffer, shard_idx, n_samples
+        if not buffer:
+            return
+        if force_flush or len(buffer) >= episodes_per_shard:
             _flush_shard(shard_dir, shard_idx, buffer)
             elapsed = time.time() - t0
             print(f"  shard {shard_idx:04d} written — {n_episodes}/{total_files} episodes, "
                   f"{n_samples} samples ({elapsed:.1f}s, "
                   f"{n_episodes / elapsed:.1f} ep/s)")
-            shard_idx += 1
             buffer = []
-            if num_shards is not None and shard_idx >= num_shards:
-                break
+            shard_idx += 1
 
+    def _process_result(samples) -> bool:
+        """Add samples to buffer; return True if num_shards limit hit."""
+        nonlocal n_episodes, n_samples, n_skipped
+        if samples is None:
+            n_skipped += 1
+            return False
+        buffer.append(samples)
+        n_episodes += 1
+        n_samples  += len(samples["target_idx"])
+        if len(buffer) >= episodes_per_shard:
+            _maybe_flush()
+            if num_shards is not None and shard_idx >= num_shards:
+                return True
         elif n_episodes % 50 == 0:
             elapsed = time.time() - t0
             print(f"  {n_episodes}/{total_files} episodes, {n_samples} samples "
                   f"({elapsed:.1f}s, {n_episodes / elapsed:.1f} ep/s)")
+        return False
 
-    if buffer and (num_shards is None or shard_idx < num_shards):
-        _flush_shard(shard_dir, shard_idx, buffer)
-        shard_idx += 1
+    if use_mp:
+        ctx = mp.get_context("spawn")
+        pool = ctx.Pool(
+            processes=n_workers,
+            initializer=_worker_init,
+            initargs=(encode_fn_factory, encode_fn_factory_args, ship_bucket_count),
+        )
+        episodes_iter = (
+            (ep, winner_only)
+            for _name, ep in _iter_episode_jsons(episodes_dir)
+            if isinstance(ep, dict) and "steps" in ep
+        )
+        done = False
+        try:
+            for samples in pool.imap_unordered(_worker_encode_episode, episodes_iter,
+                                               chunksize=4):
+                if _process_result(samples):
+                    done = True
+                    break
+        finally:
+            pool.terminate()
+            pool.join()
+        if not done and buffer and (num_shards is None or shard_idx < num_shards):
+            _maybe_flush(force_flush=True)
+    else:
+        for _name, episode in _iter_episode_jsons(episodes_dir):
+            if not isinstance(episode, dict) or "steps" not in episode:
+                n_skipped += 1
+                continue
+            samples = episode_to_samples(episode, encode_fn, ship_bucket_count)
+            if _process_result(samples):
+                break
+        else:
+            if buffer and (num_shards is None or shard_idx < num_shards):
+                _maybe_flush(force_flush=True)
 
     elapsed = time.time() - t0
     avg_samples = n_samples / n_episodes if n_episodes else 0

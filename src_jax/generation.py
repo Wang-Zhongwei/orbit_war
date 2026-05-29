@@ -6,6 +6,8 @@ from __future__ import annotations
 import math
 import random as _stdlib_random
 
+import numpy as np
+
 from .constants import (
     BOARD_SIZE,
     CENTER,
@@ -140,6 +142,36 @@ def generate_comet_paths(
         rng = _stdlib_random
     comet_pid_set: set[int] = set(comet_planet_ids) if comet_planet_ids else set()
 
+    static_planets = [p for p in initial_planets
+                      if p[0] not in comet_pid_set
+                      and _dist((p[2], p[3]), (CENTER, CENTER)) + p[4] >= ROTATION_RADIUS_LIMIT]
+    orbiting_planets = [p for p in initial_planets
+                        if p[0] not in comet_pid_set
+                        and _dist((p[2], p[3]), (CENTER, CENTER)) + p[4] < ROTATION_RADIUS_LIMIT]
+
+    # Precompute orbiting planet orbit params (static across attempts)
+    if orbiting_planets:
+        op_x0 = np.array([p[2] for p in orbiting_planets], dtype=np.float64)
+        op_y0 = np.array([p[3] for p in orbiting_planets], dtype=np.float64)
+        op_r_arr = np.array([p[4] for p in orbiting_planets], dtype=np.float64)
+        dx_init = op_x0 - CENTER
+        dy_init = op_y0 - CENTER
+        op_orb_r = np.hypot(dx_init, dy_init)
+        op_init_angle = np.arctan2(dy_init, dx_init)
+    else:
+        op_r_arr = op_orb_r = op_init_angle = None
+
+    if static_planets:
+        sp_x = np.array([p[2] for p in static_planets], dtype=np.float64)
+        sp_y = np.array([p[3] for p in static_planets], dtype=np.float64)
+        sp_r = np.array([p[4] for p in static_planets], dtype=np.float64)
+    else:
+        sp_x = sp_y = sp_r = None
+
+    buf = COMET_RADIUS + 0.5
+    num = 5000
+    t_arr = np.linspace(0.3 * math.pi, 0.3 * math.pi + 1.4 * math.pi, num)
+
     for _ in range(300):
         e = rng.uniform(0.75, 0.93)
         a = rng.uniform(60, 150)
@@ -150,92 +182,74 @@ def generate_comet_paths(
         b = a * math.sqrt(1 - e ** 2)
         c_val = a * e
         phi = rng.uniform(math.pi / 6, math.pi / 3)
+        cos_phi = math.cos(phi)
+        sin_phi = math.sin(phi)
 
-        dense: list[tuple[float, float]] = []
-        num = 5000
-        for i in range(num):
-            t = 0.3 * math.pi + 1.4 * math.pi * i / (num - 1)
-            ex = c_val + a * math.cos(t)
-            ey = b * math.sin(t)
-            x = CENTER + ex * math.cos(phi) - ey * math.sin(phi)
-            y = CENTER + ex * math.sin(phi) + ey * math.cos(phi)
-            dense.append((x, y))
+        # Vectorized dense ellipse generation (replaces 5000-iteration Python loop)
+        ex = c_val + a * np.cos(t_arr)
+        ey = b * np.sin(t_arr)
+        x_arr = CENTER + ex * cos_phi - ey * sin_phi
+        y_arr = CENTER + ex * sin_phi + ey * cos_phi
+        dense = np.stack([x_arr, y_arr], axis=1)  # [5000, 2]
 
-        path: list[tuple[float, float]] = [dense[0]]
-        cum = 0.0
-        target = comet_speed
-        for i in range(1, len(dense)):
-            cum += _dist(dense[i], dense[i - 1])
-            if cum >= target:
-                path.append(dense[i])
-                target += comet_speed
+        # Vectorized cumulative-distance subsampling (replaces second Python loop)
+        diffs = np.diff(dense, axis=0)
+        seg_lens = np.hypot(diffs[:, 0], diffs[:, 1])
+        cum_dist = np.concatenate([[0.0], np.cumsum(seg_lens)])
+        targets = np.arange(comet_speed, float(cum_dist[-1]) + comet_speed, comet_speed)
+        indices = np.searchsorted(cum_dist, targets)
+        indices = indices[indices < num]
+        path = dense[np.concatenate([[0], indices])]  # [N, 2]
 
-        board_start: int | None = None
-        board_end: int | None = None
-        for i, (x, y) in enumerate(path):
-            if 0 <= x <= BOARD_SIZE and 0 <= y <= BOARD_SIZE:
-                if board_start is None:
-                    board_start = i
-                board_end = i
-        if board_start is None:
+        # Board bounds filtering
+        in_bounds = ((path[:, 0] >= 0) & (path[:, 0] <= BOARD_SIZE) &
+                     (path[:, 1] >= 0) & (path[:, 1] <= BOARD_SIZE))
+        valid_idx = np.where(in_bounds)[0]
+        if len(valid_idx) == 0:
             continue
-        visible = path[board_start : board_end + 1]
+        visible = path[int(valid_idx[0]):int(valid_idx[-1]) + 1]  # [V, 2]
         if not (5 <= len(visible) <= 40):
             continue
 
+        vx = visible[:, 0]  # x coords (cx in original)
+        vy = visible[:, 1]  # y coords (cy in original)
+
+        # 4 symmetric path variants — same layout as original [[coord0, coord1], ...]
         paths = [
-            [[y, x] for x, y in visible],
-            [[BOARD_SIZE - x, y] for x, y in visible],
-            [[x, BOARD_SIZE - y] for x, y in visible],
-            [[BOARD_SIZE - y, BOARD_SIZE - x] for x, y in visible],
+            np.stack([vy, vx], axis=1).tolist(),
+            np.stack([BOARD_SIZE - vx, vy], axis=1).tolist(),
+            np.stack([vx, BOARD_SIZE - vy], axis=1).tolist(),
+            np.stack([BOARD_SIZE - vy, BOARD_SIZE - vx], axis=1).tolist(),
         ]
 
-        static_planets = [p for p in initial_planets
-                          if p[0] not in comet_pid_set
-                          and _dist((p[2], p[3]), (CENTER, CENTER)) + p[4] >= ROTATION_RADIUS_LIMIT]
-        orbiting_planets = [p for p in initial_planets
-                            if p[0] not in comet_pid_set
-                            and _dist((p[2], p[3]), (CENTER, CENTER)) + p[4] < ROTATION_RADIUS_LIMIT]
+        # sym_pt[k, j] = j-th symmetric position for visible point k
+        # sym_pt 0 = (cy, cx), 1 = (BOARD-cx, cy), 2 = (cx, BOARD-cy), 3 = (BOARD-cy, BOARD-cx)
+        sym0 = np.stack([vy, BOARD_SIZE - vx, vx, BOARD_SIZE - vy], axis=1)  # [V, 4] first coord
+        sym1 = np.stack([vx, vy, BOARD_SIZE - vy, BOARD_SIZE - vx], axis=1)  # [V, 4] second coord
 
-        buf = COMET_RADIUS + 0.5
+        # Sun collision (vectorized)
+        if np.any(np.hypot(vx - CENTER, vy - CENTER) < SUN_RADIUS + COMET_RADIUS):
+            continue
+
+        # Static planet collision (vectorized, all sym-pts × all planets at once)
         valid = True
-        for k, (cx, cy) in enumerate(visible):
-            if _dist((cx, cy), (CENTER, CENTER)) < SUN_RADIUS + COMET_RADIUS:
+        if sp_x is not None:
+            dx = sym0[:, :, None] - sp_x[None, None, :]  # [V, 4, P]
+            dy = sym1[:, :, None] - sp_y[None, None, :]
+            if np.any(np.hypot(dx, dy) < (sp_r[None, None, :] + buf)):
                 valid = False
-                break
-            sym_pts = [
-                (cy, cx),
-                (BOARD_SIZE - cx, cy),
-                (cx, BOARD_SIZE - cy),
-                (BOARD_SIZE - cy, BOARD_SIZE - cx),
-            ]
-            for planet in static_planets:
-                for sp in sym_pts:
-                    if _dist(sp, (planet[2], planet[3])) < planet[4] + buf:
-                        valid = False
-                        break
-                if not valid:
-                    break
-            if not valid:
-                break
 
-            game_step = spawn_step - 1 + k
-            for planet in orbiting_planets:
-                dx = planet[2] - CENTER
-                dy = planet[3] - CENTER
-                orb_r = math.sqrt(dx ** 2 + dy ** 2)
-                init_angle = math.atan2(dy, dx)
-                cur_angle = init_angle + angular_velocity * game_step
-                px = CENTER + orb_r * math.cos(cur_angle)
-                py = CENTER + orb_r * math.sin(cur_angle)
-                for sp in sym_pts:
-                    if _dist(sp, (px, py)) < planet[4] + COMET_RADIUS:
-                        valid = False
-                        break
-                if not valid:
-                    break
-            if not valid:
-                break
+        # Orbiting planet collision (vectorized, planet position varies per step)
+        if valid and op_orb_r is not None:
+            V = len(visible)
+            game_steps = (spawn_step - 1) + np.arange(V, dtype=np.float64)  # [V]
+            cur_angles = op_init_angle[None, :] + angular_velocity * game_steps[:, None]  # [V, Q]
+            px = CENTER + op_orb_r[None, :] * np.cos(cur_angles)  # [V, Q]
+            py = CENTER + op_orb_r[None, :] * np.sin(cur_angles)
+            dx = sym0[:, :, None] - px[:, None, :]  # [V, 4, Q]
+            dy = sym1[:, :, None] - py[:, None, :]
+            if np.any(np.hypot(dx, dy) < (op_r_arr[None, None, :] + COMET_RADIUS)):
+                valid = False
 
         if valid:
             return paths
