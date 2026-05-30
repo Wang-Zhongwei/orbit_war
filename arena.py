@@ -5,9 +5,8 @@ Responsibilities
 ----------------
 1. Provide a human-readable CSV log of every match.
 2. Run a single match and append one row per slot to ``results/matches.csv``.
-3. Schedule a round-robin 1v1 tournament with slot rotation: every pair plays
-   the same seed twice (once with each ordering) so starting-position bias
-   cancels out.
+3. Schedule a round-robin 1v1 tournament. Because the game is symmetric, every
+   pair plays once per seed with a randomized slot ordering.
 4. Print a head-to-head win matrix at the end of a tournament.
 
 Elo computation lives in ``evaluate_elo.py`` — this script is write-only over
@@ -31,6 +30,7 @@ import datetime
 import itertools
 import multiprocessing
 import os
+import random
 import sys
 import time
 import uuid
@@ -198,11 +198,11 @@ def tournament(
     workers: int = 1,
     verbose: bool = True,
 ) -> None:
-    """Round-robin 1v1 with slot rotation.
+    """Round-robin 1v1 with randomized slot ordering.
 
-    For each round we pick one seed and play every pair *twice* — once with A
-    as player 0 and once with A as player 1 — on the same map. This cancels
-    starting-position bias cheaply. Prints a head-to-head win matrix when done.
+    For each round we pick one seed and play every pair once. Slot ordering is
+    randomized per pair because the game is symmetric. Prints a head-to-head
+    win matrix when done.
 
     ``flush_period`` controls how many matches are completed before buffered
     CSV rows are written to disk (default 10). A final flush always runs at
@@ -218,18 +218,19 @@ def tournament(
     if workers == -1:
         workers = os.cpu_count() or 1
 
-    total = rounds * len(pairs) * 2
+    total = rounds * len(pairs)
     done = 0
     t_start = time.perf_counter()
     match_records: list[dict] = []
     pending_rows: list[list] = []
 
-    tasks = [
-        {"slot_order": slot_order, "seed": base_seed + r, "episode_steps": episode_steps}
-        for r in range(rounds)
-        for a, b in pairs
-        for slot_order in [(a, b), (b, a)]
-    ]
+    tasks = []
+    for r in range(rounds):
+        seed = base_seed + r
+        rng = random.Random(seed)
+        for a, b in pairs:
+            slot_order = (a, b) if rng.randrange(2) == 0 else (b, a)
+            tasks.append({"slot_order": slot_order, "seed": seed, "episode_steps": episode_steps})
 
     def _handle_result(result: dict) -> None:
         nonlocal done
@@ -304,13 +305,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_match.set_defaults(_handler="match")
 
     real_agents = [a for a in AGENTS if a != "random"]
-    p_tour = sub.add_parser("tournament", help="Round-robin 1v1 with slot rotation.")
+    p_tour = sub.add_parser("tournament", help="Round-robin 1v1 with randomized slots.")
     p_tour.add_argument(
         "--agents", nargs="+", default=real_agents,
         help=f"Agents to include (default: {real_agents}).",
     )
-    p_tour.add_argument("--rounds", type=int, default=10,
-                        help="Number of seed rounds. Each round = (#pairs * 2) matches.")
+    p_tour.add_argument("--rounds", type=int, default=20,
+                        help="Number of seed rounds. Each round = #pairs matches.")
     p_tour.add_argument("--base-seed", type=int, default=1000)
     p_tour.add_argument("--out", type=Path, default=DEFAULT_CSV)
     p_tour.add_argument("--episode-steps", type=int, default=500)

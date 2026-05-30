@@ -85,7 +85,10 @@ class TrainConfig:
     checkpoint_every: int = 50
     log_every: int = 1
     opponents: list[str] = field(default_factory=lambda: ["self"])
+    eval_opponents: list[str] = field(default_factory=list)
     self_play_update_interval: int = 50
+    self_eval_update_interval: int = 50
+    eval_rounds: int = 10
     self_play_deterministic: bool = False
     alternate_player_sides: bool = True
     env: EnvConfig = field(default_factory=EnvConfig)
@@ -116,10 +119,13 @@ def load_train_config(path: str | Path) -> TrainConfig:
 
 def _config_from_dict(data: dict[str, Any]) -> TrainConfig:
     cfg = TrainConfig()
-    _apply(cfg, data, skip={"env", "model", "ppo", "bc", "opponents"})
+    _apply(cfg, data, skip={"env", "model", "ppo", "bc", "opponents", "eval_opponents"})
     if "opponents" in data:
         raw = data["opponents"]
         cfg.opponents = [raw] if isinstance(raw, str) else list(raw)
+    if "eval_opponents" in data:
+        raw = data["eval_opponents"]
+        cfg.eval_opponents = [raw] if isinstance(raw, str) else list(raw)
     _apply(cfg.env, data.get("env", {}))
     _apply(cfg.model, data.get("model", {}))
     _apply(cfg.ppo, data.get("ppo", {}))

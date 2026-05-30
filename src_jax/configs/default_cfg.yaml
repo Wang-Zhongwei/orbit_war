@@ -4,7 +4,11 @@ save_dir: ./artifacts/ppo
 checkpoint_every: 50
 log_every: 1
 opponents: self
+eval_opponents:
+  - never_miss
 self_play_update_interval: 50
+self_eval_update_interval: 50
+eval_rounds: 10
 self_play_deterministic: false
 alternate_player_sides: true
 
@@ -17,13 +21,13 @@ model:
 
 ppo:
   rollout_steps: 64
-  num_envs: -1
+  num_envs: 64
   total_updates: 1000
   epochs: 4
   minibatch_size: 2048
   gamma: 0.99
   clip_coef: 0.2
-  ent_coef: 0.05
+  ent_coef: 0.01
   vf_coef: 0.5
   kl_coef: 0.1
   lr: 0.0003

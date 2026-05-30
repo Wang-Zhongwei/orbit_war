@@ -273,6 +273,36 @@ def run_match_raw(
         "wall_time_s": wall_time,
     }
 
+def eval_agent(
+    agent,
+    opponent_fns: dict[str, object],
+    rounds: int,
+    base_seed: int,
+) -> dict[str, float]:
+    """Evaluate a callable agent against named opponents.
+
+    Each opponent gets `rounds` matches with slot randomised per seed.
+    Returns win rates in [0, 1] (draws count as 0.5).
+    """
+    import random as _random
+    win_rates: dict[str, float] = {}
+    for name, opp_fn in opponent_fns.items():
+        wins = draws = total = 0
+        for r in range(rounds):
+            seed = base_seed + r
+            agent_slot = _random.Random(seed).randrange(2)
+            slot_order = [(agent, opp_fn), (opp_fn, agent)][agent_slot]
+            res = run_match_raw(list(slot_order), seed=seed)
+            outcome = res["outcomes"][agent_slot]
+            if outcome == 1.0:
+                wins += 1
+            elif outcome == 0.5:
+                draws += 1
+            total += 1
+        win_rates[name] = (wins + 0.5 * draws) / total if total else 0.0
+    return win_rates
+
+
 
 # ---------------------------------------------------------------------------
 # Head-to-head evaluation

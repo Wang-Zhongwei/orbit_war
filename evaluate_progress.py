@@ -10,21 +10,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import pickle
 import re
 from pathlib import Path
 
-from src.config import load_train_config, default_train_config_path
-from src.kaggle_adapter import make_ppo_agent
-from src.evaluation import AGENTS, run_match_raw
+import jax
+import jax.numpy as jnp
+
+from src_jax.jax_agent import build_agent
+from src.evaluation import AGENTS, eval_agent
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt-dir", type=Path, default=Path("artifacts/orbit_wars_ppo"))
-    p.add_argument("--config", type=str, default=None)
     p.add_argument("--opponents", nargs="+", default=["never_miss", "sub_v3"])
     p.add_argument("--rounds", type=int, default=10,
-                   help="Rounds per opponent. Each round = 2 matches (slot rotation).")
+                   help="Matches per opponent.")
     p.add_argument("--base-seed", type=int, default=1000)
     p.add_argument("--step", type=int, default=100,
                    help="Evaluate every N checkpoints (default 100).")
@@ -34,8 +36,8 @@ def parse_args() -> argparse.Namespace:
 
 def find_checkpoints(ckpt_dir: Path, step: int) -> list[tuple[int, Path]]:
     results = []
-    for p in sorted(ckpt_dir.glob("ckpt_*.pt")):
-        m = re.fullmatch(r"ckpt_(\d+)\.pt", p.name)
+    for p in sorted(ckpt_dir.glob("ckpt_*.pkl")):
+        m = re.fullmatch(r"ckpt_(\d+)\.pkl", p.name)
         if m and int(m.group(1)) % step == 0:
             results.append((int(m.group(1)), p))
     return results
@@ -43,34 +45,18 @@ def find_checkpoints(ckpt_dir: Path, step: int) -> list[tuple[int, Path]]:
 
 def eval_checkpoint(
     ckpt_path: Path,
-    cfg,
     opponent_fns: dict[str, object],
     rounds: int,
     base_seed: int,
 ) -> dict[str, float]:
-    agent = make_ppo_agent(cfg, str(ckpt_path))
-    win_rates: dict[str, float] = {}
-    for name, opp_fn in opponent_fns.items():
-        wins = draws = total = 0
-        for r in range(rounds):
-            seed = base_seed + r
-            for slot_order in [(agent, opp_fn), (opp_fn, agent)]:
-                res = run_match_raw(list(slot_order), seed=seed)
-                ppo_slot = 0 if slot_order[0] is agent else 1
-                outcome = res["outcomes"][ppo_slot]
-                if outcome == 1.0:
-                    wins += 1
-                elif outcome == 0.5:
-                    draws += 1
-                total += 1
-        win_rates[name] = (wins + 0.5 * draws) / total
-    return win_rates
+    with open(ckpt_path, "rb") as f:
+        ckpt = pickle.load(f)
+    params = jax.tree_util.tree_map(jnp.asarray, ckpt["params"])
+    return eval_agent(build_agent(params, ckpt["config"]), opponent_fns, rounds, base_seed)
 
 
 def main() -> None:
     args = parse_args()
-    cfg_path = args.config or str(default_train_config_path())
-    cfg = load_train_config(cfg_path)
 
     for opp in args.opponents:
         if opp not in AGENTS:
@@ -82,12 +68,12 @@ def main() -> None:
         raise FileNotFoundError(f"No checkpoints (step={args.step}) found in {args.ckpt_dir}")
 
     print(f"Evaluating {len(checkpoints)} checkpoints × {len(args.opponents)} opponents "
-          f"× {args.rounds * 2} matches each")
+          f"× {args.rounds} matches each")
 
     records: list[dict] = []
     for i, (update, ckpt_path) in enumerate(checkpoints):
         print(f"[{i+1}/{len(checkpoints)}] {ckpt_path.name}", end="  ", flush=True)
-        win_rates = eval_checkpoint(ckpt_path, cfg, opponent_fns, args.rounds, args.base_seed)
+        win_rates = eval_checkpoint(ckpt_path, opponent_fns, args.rounds, args.base_seed)
         records.append({"update": update, "checkpoint": ckpt_path.name, **win_rates})
         print("  ".join(f"{opp}={win_rates[opp]:.2f}" for opp in args.opponents))
 

@@ -505,7 +505,7 @@ class StudyConfig:
     n_trials: int = 60
     opponents: list[str] = field(default_factory=lambda: ["random", "sniper"])
     matches_per_trial: int = 8
-    base_seed: int = 5000
+    base_seed: int = 1000
     storage: str | None = DEFAULT_OPTUNA_STORAGE
     study_name: str | None = None
     n_jobs: int = 1

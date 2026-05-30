@@ -24,12 +24,25 @@ from .rollout import (
 )
 
 N_BOARDS = 512  # board pool size
+_EVAL_BASE_SEED = 1000
+
+def run_eval(params, cfg, base_seed: int = _EVAL_BASE_SEED) -> dict[str, float]:
+    from .jax_agent import build_agent
+    from src.evaluation import AGENTS, eval_agent
+
+    agent = build_agent(params, cfg, deterministic=True)
+    opponent_fns = {opp: AGENTS[opp] for opp in cfg.eval_opponents}
+    return eval_agent(agent, opponent_fns, cfg.eval_rounds, base_seed)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=str(default_train_config_path()))
     parser.add_argument("--resume", type=str, default=None, metavar="CKPT")
+    parser.add_argument("--ref_policy", type=str, default=None, metavar="CKPT",
+                        help="Frozen reference policy for KL regularization. "
+                             "Defaults to the --resume checkpoint when kl_coef > 0.")
+    parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--no_wandb", action="store_true")
     return parser.parse_args()
 
@@ -55,13 +68,14 @@ def main() -> None:
     cfg.ppo.num_envs = N
     K     = cfg.env.candidate_count
     use_wandb = not args.no_wandb
+    run_name = args.run_name or cfg.run_name
 
     if use_wandb:
         import wandb
 
         wandb.init(
             project="orbit-war",
-            name=cfg.run_name,
+            name=run_name,
             config={
                 "seed": cfg.seed, "num_envs": N,
                 "n_boards": N_BOARDS,
@@ -86,6 +100,7 @@ def main() -> None:
     key         = jax.random.PRNGKey(cfg.seed)
 
     start_update = 1
+    ref_params = None
     if args.resume:
         with open(args.resume, "rb") as f:
             ckpt = pickle.load(f)
@@ -95,6 +110,15 @@ def main() -> None:
         train_state = train_state.replace(**restored)
         start_update = ckpt["update"] + 1
         print(f"Resumed from {args.resume} (update {ckpt['update']})")
+        if cfg.ppo.kl_coef > 0 and args.ref_policy is None:
+            ref_params = restored["params"]
+            print(f"KL reference: resume checkpoint (kl_coef={cfg.ppo.kl_coef})")
+
+    if args.ref_policy:
+        with open(args.ref_policy, "rb") as f:
+            ref_ckpt = pickle.load(f)
+        ref_params = jax.tree_util.tree_map(jnp.asarray, ref_ckpt["params"])
+        print(f"KL reference: {args.ref_policy} (kl_coef={cfg.ppo.kl_coef})")
 
     # ── JIT-compiled rollout fn ───────────────────────────────────────────────
     collect = make_rollout_fn(
@@ -148,11 +172,20 @@ def main() -> None:
                 epochs=cfg.ppo.epochs,
                 minibatch_size=cfg.ppo.minibatch_size,
                 key=key,
+                ref_params=ref_params,
+                kl_coef=cfg.ppo.kl_coef,
             )
 
             # ── Self-play opponent sync ───────────────────────────────────────
             if "self" in cfg.opponents and update % cfg.self_play_update_interval == 0:
                 opp_params = train_state.params
+
+            # ── Eval vs rule-based opponents ──────────────────────────────────
+            eval_results: dict[str, float] = {}
+            if cfg.eval_opponents and update % cfg.self_eval_update_interval == 0:
+                eval_results = run_eval(train_state.params, cfg)
+                for opp, wr in eval_results.items():
+                    print(f"  eval vs {opp}: win_rate={wr:.3f}")
 
             # ── Logging ───────────────────────────────────────────────────────
             if update % cfg.log_every == 0:
@@ -176,6 +209,7 @@ def main() -> None:
 
                     wandb.log(
                         {
+                            **{f"eval/win_rate_{opp}": wr for opp, wr in eval_results.items()},
                             "reward/episode_mean":      stats["episode_reward_mean"],
                             "reward/episodes_finished": stats["episodes_finished"],
                             "train/samples":            stats["samples"],
@@ -185,13 +219,14 @@ def main() -> None:
                             "train/entropy":            metrics["entropy"],
                             "train/clip_fraction":      metrics["clip_fraction"],
                             "train/kl_divergence":      metrics["kl_divergence"],
+                            "train/kl_ref":             metrics["kl_ref"],
                             "train/explained_variance": metrics["explained_variance"],
                         },
                         step=update,
                     )
 
             if update % cfg.checkpoint_every == 0 or update == cfg.ppo.total_updates:
-                save_checkpoint(save_dir, cfg.run_name, update, train_state, cfg)
+                save_checkpoint(save_dir, run_name, update, train_state, cfg)
 
     finally:
         if use_wandb:
