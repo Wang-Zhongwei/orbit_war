@@ -46,7 +46,7 @@ Encodes episodes on the fly directly from the zip — no intermediate shard file
 Each episode is encoded once, fed to training, and discarded. Best when the dataset is large enough
 that 1 epoch provides sufficient coverage.
 
-The default config (`src_jax/configs/bc_cfg.yaml`) already sets `stream: true` and `epochs: 1`,
+The default config (`configs/bc_default.yaml`) already sets `stream: true` and `epochs: 1`,
 so you can usually just pass `--episode_dirs`:
 
 ```bash
@@ -58,7 +58,7 @@ conda run --no-capture-output -n torch-gpu python -u -m src_jax.bc_train \
 
 To use a custom config:
 ```bash
---config src_jax/configs/bc_cfg.yaml
+--config configs/bc_default.yaml
 ```
 
 CLI args override config file values when provided. All BC fields are optional:
@@ -110,7 +110,7 @@ conda run --no-capture-output -n torch-gpu python -u -m src_jax.train \
 # → artifacts/jax/orbit_wars_jax_ppo/
 ```
 
-Default config: `src_jax/configs/default_cfg.yaml` (1000 updates, checkpoint every 50, opponent: self).
+Default config: `configs/ppo_default.yaml` (1000 updates, checkpoint every 50, opponent: self).
 
 ## Monitoring Notes
 

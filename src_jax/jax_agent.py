@@ -2,18 +2,16 @@
 JAX policy → kaggle-environment callable agent.
 
 Usage:
-    from src_jax.jax_agent import build_agent
-    import pickle, jax, jax.numpy as jnp
+    from src_jax.jax_agent import make_jax_agent
 
-    with open("artifacts/bc/bc_pretrain/ckpt_last.pkl", "rb") as f:
-        ckpt = pickle.load(f)
-    params = jax.tree_util.tree_map(jnp.asarray, ckpt["params"])
-    agent = build_agent(params, ckpt["config"])
+    agent = make_jax_agent("artifacts/bc/bc_pretrain/ckpt_last.pkl")
     env.run([agent, opponent])
 """
 
 from __future__ import annotations
 
+import pickle
+from pathlib import Path
 from typing import Callable
 
 import jax
@@ -141,3 +139,20 @@ def build_agent(
         return moves
 
     return agent
+
+
+def make_jax_agent(
+    checkpoint_path: str | Path,
+    deterministic: bool = True,
+) -> Callable:
+    """Return an obs->moves callable that runs a policy checkpoint.
+
+    This is the public checkpoint-loading wrapper used by notebooks and arena
+    scripts. The lower-level ``build_agent`` is useful when params/config are
+    already loaded in memory.
+    """
+    with open(checkpoint_path, "rb") as f:
+        ckpt = pickle.load(f)
+
+    params = jax.tree_util.tree_map(jnp.asarray, ckpt["params"])
+    return build_agent(params, ckpt["config"], deterministic=deterministic)

@@ -80,8 +80,8 @@ class BCConfig:
 @dataclass(slots=True)
 class TrainConfig:
     seed: int = 42
-    run_name: str = "orbit_wars_jax_ppo"
-    save_dir: str = "artifacts/jax"
+    run_name: str = "default"
+    save_dir: str = "artifacts/ppo"
     checkpoint_every: int = 50
     log_every: int = 1
     opponents: list[str] = field(default_factory=lambda: ["self"])
@@ -106,7 +106,7 @@ class TrainConfig:
 
 
 def default_train_config_path() -> Path:
-    return Path(__file__).resolve().parent / "configs" / "default_cfg.yaml"
+    return Path(__file__).resolve().parent.parent / "configs" / "ppo_default.yaml"
 
 
 def load_train_config(path: str | Path) -> TrainConfig:

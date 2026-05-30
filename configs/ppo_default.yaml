@@ -1,8 +1,8 @@
 
 seed: 42
-run_name: orbit_wars_ppo
+run_name: default
 device: auto
-save_dir: ./artifacts
+save_dir: ./artifacts/ppo
 checkpoint_every: 50
 log_every: 1
 opponents: self
@@ -19,13 +19,13 @@ model:
 
 ppo:
   rollout_steps: 64
-  num_envs: -1
+  num_envs: 512
   total_updates: 1000
   epochs: 4
-  minibatch_size: 2048
+  minibatch_size: 8192
   gamma: 0.99
   clip_coef: 0.2
   ent_coef: 0.01
   vf_coef: 0.5
-  lr: 0.0003
+  lr: 0.0001
   max_grad_norm: 0.5

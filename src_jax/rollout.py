@@ -19,7 +19,6 @@ from .physics import (
     EnvState,
     jax_step,
     MAX_BASE_PLANETS,
-    MAX_FLEETS,
     MAX_ACTIONS_PA,
     N_AGENTS,
 )
@@ -29,6 +28,7 @@ from .features import (
 )
 from .ppo import TrainingBatch, sample_actions
 from .env import select_boards
+from .heuristic import heuristic_actions
 
 MAX_SRC  = MAX_BASE_PLANETS   # alias for clarity
 SELF_DIM = self_feature_dim()
@@ -142,21 +142,28 @@ def make_rollout_fn(
     cfg,
     module,
     rollout_steps: int,
+    n_opponents: int = 1,
+    heuristic_opp_mask: tuple[bool, ...] = (),
 ):
     """
     Build and return a JIT-compiled rollout collector.
 
     Parameters
     ----------
-    board_pool    : JaxState[n_boards, ...]
-    n_boards      : int
-    cfg           : TrainConfig
-    module        : PlanetPolicy (Flax module)
-    rollout_steps : int (static — baked into the JIT)
+    board_pool          : JaxState[n_boards, ...]
+    n_boards            : int
+    cfg                 : TrainConfig
+    module              : PlanetPolicy (Flax module)
+    rollout_steps       : int (static — baked into the JIT)
+    n_opponents         : int (static) — opponent pool size; env i uses pool[i % n_opponents]
+    heuristic_opp_mask  : tuple[bool] length n_opponents — True for heuristic slots.
+                          Heuristic opponents bypass neural inference entirely.
+                          opp_params slots for heuristic indices are ignored (pass dummies).
 
     Returns
     -------
     collect(params, opp_params, carry) -> (final_carry, RolloutStep[T, N, ...])
+    opp_params shape: [n_opponents, ...] stacked param tree
     """
     K                  = cfg.env.candidate_count
     N_ENVS             = cfg.ppo.num_envs
@@ -165,8 +172,16 @@ def make_rollout_fn(
     alternate_sides    = cfg.alternate_player_sides
     opp_deterministic  = cfg.self_play_deterministic
 
+    if not heuristic_opp_mask:
+        heuristic_opp_mask = (False,) * n_opponents
+    _any_heuristic = any(heuristic_opp_mask)
+    _any_neural    = not all(heuristic_opp_mask)
+    # Static bool array for per-env selection in the mixed case (baked into JIT).
+    _heuristic_arr = jnp.array(heuristic_opp_mask, dtype=jnp.bool_)
+
     encode_batch = _make_env_encoder(K, cfg.env)
     _batched_step = jax.jit(jax.vmap(functools.partial(jax_step, episode_steps=episode_steps)))
+    _vmap_heuristic = jax.vmap(heuristic_actions)
 
     # ── helpers (closed over) ────────────────────────────────────────────────
 
@@ -191,6 +206,25 @@ def make_rollout_fn(
         lp  = lp_f.reshape(N_ENVS, MAX_SRC)
         val = outputs.value.reshape(N_ENVS, MAX_SRC)
         return ti, sb, lp, val, key
+
+    def _run_opp_policy(stacked_opp_params, enc, key, deterministic):
+        # stacked_opp_params: [n_opponents, ...] — select per env via round-robin
+        opp_idx = jnp.arange(N_ENVS, dtype=jnp.int32) % n_opponents
+        per_env_params = jax.tree_util.tree_map(lambda p: p[opp_idx], stacked_opp_params)
+
+        sf = enc.self_feats  # [N, MAX_SRC, SELF_DIM]
+        cf = enc.cand_feats  # [N, MAX_SRC, K, CAND_DIM]
+        gf = jnp.broadcast_to(enc.global_feat[:, None, :], (N_ENVS, MAX_SRC, GLOB_DIM))
+        cm = enc.cand_mask   # [N, MAX_SRC, K]
+
+        outputs = jax.vmap(lambda p, sf_i, cf_i, gf_i, cm_i: module.apply(p, sf_i, cf_i, gf_i, cm_i))(
+            per_env_params, sf, cf, gf, cm
+        )  # each leaf: [N, MAX_SRC, ...]
+
+        flat = jax.tree_util.tree_map(lambda x: x.reshape(N_ENVS * MAX_SRC, *x.shape[2:]), outputs)
+        key, subkey = jax.random.split(key)
+        ti_f, sb_f, _, _, key = sample_actions(flat, subkey, deterministic=deterministic)
+        return ti_f.reshape(N_ENVS, MAX_SRC), sb_f.reshape(N_ENVS, MAX_SRC), key
 
     def _enc_to_actions(enc, state, ti, sb):
         def one_env(
@@ -245,11 +279,31 @@ def make_rollout_fn(
         ti, sb, lp, val, key = _run_policy(params, l_enc, key, deterministic=False)
         l_acts = _enc_to_actions(l_enc, state, ti, sb)
 
-        # Encode and run opponent policy
+        # Opponent actions — heuristic and/or neural branches resolved at JIT time.
         opp_players = 1 - learner_players
-        o_enc  = encode_batch(state, opp_players)
-        oti, osb, _, _, key = _run_policy(opp_params, o_enc, key, deterministic=opp_deterministic)
-        o_acts = _enc_to_actions(o_enc, state, oti, osb)
+
+        if _any_heuristic:
+            h_acts = _vmap_heuristic(state, opp_players)  # [N, MAX_ACTIONS_PA, 3]
+
+        if _any_neural:
+            o_enc = encode_batch(state, opp_players)
+            if n_opponents == 1:
+                # All envs share the same params — use the efficient batched forward.
+                single_opp = jax.tree_util.tree_map(lambda p: p[0], opp_params)
+                oti, osb, _, _, key = _run_policy(single_opp, o_enc, key, deterministic=opp_deterministic)
+            else:
+                oti, osb, key = _run_opp_policy(opp_params, o_enc, key, deterministic=opp_deterministic)
+            n_acts = _enc_to_actions(o_enc, state, oti, osb)
+
+        if _any_heuristic and _any_neural:
+            # Mixed pool: select per-env based on which opponent slot is assigned.
+            opp_slot = jnp.arange(N_ENVS, dtype=jnp.int32) % n_opponents
+            env_is_heuristic = _heuristic_arr[opp_slot]   # [N]
+            o_acts = jnp.where(env_is_heuristic[:, None, None], h_acts, n_acts)
+        elif _any_heuristic:
+            o_acts = h_acts
+        else:
+            o_acts = n_acts
 
         # Physics step
         joint = _joint_actions(learner_players, l_acts, o_acts)

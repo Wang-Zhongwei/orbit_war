@@ -4,7 +4,7 @@ Pre-encode a day's episode zip into sharded .npz files for fast BC training.
 Usage:
     # Formal mode — env config comes from YAML:
     python -m src_jax.bc_encode --episodes_dir episodes/2026-05-24 \\
-                                 --config src_jax/configs/bc_cfg.yaml
+                                 --config configs/bc_default.yaml
 
     # Smoke-test mode — uses dataclass defaults, no config file needed:
     python -m src_jax.bc_encode --episodes_dir episodes/2026-05-24

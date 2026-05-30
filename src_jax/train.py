@@ -23,7 +23,7 @@ from .rollout import (
     make_rollout_fn,
 )
 
-N_BOARDS = 512  # board pool size
+N_BOARDS = 1024
 _EVAL_BASE_SEED = 1000
 
 def run_eval(params, cfg, base_seed: int = _EVAL_BASE_SEED) -> dict[str, float]:
@@ -120,13 +120,41 @@ def main() -> None:
         ref_params = jax.tree_util.tree_map(jnp.asarray, ref_ckpt["params"])
         print(f"KL reference: {args.ref_policy} (kl_coef={cfg.ppo.kl_coef})")
 
+    # Build opponent pool — "self", "heuristic", or "ckpt:PATH".
+    # Heuristic slots store dummy params (learner params) that are never used;
+    # the rollout bypasses neural inference for those envs entirely.
+    opp_pool: list[tuple[str, object]] = []
+    for opp_name in cfg.opponents:
+        if opp_name == "self":
+            opp_pool.append(("self", train_state.params))
+        elif opp_name == "heuristic":
+            opp_pool.append(("heuristic", train_state.params))  # dummy — never used
+            print("Heuristic opponent registered (JAX stateless greedy).")
+        elif opp_name.startswith("ckpt:"):
+            path = opp_name[5:]
+            with open(path, "rb") as f:
+                opp_ckpt = pickle.load(f)
+            opp_pool.append((opp_name, jax.tree_util.tree_map(jnp.asarray, opp_ckpt["params"])))
+            print(f"Checkpoint opponent loaded: {path}")
+        else:
+            raise ValueError(f"Unknown training opponent {opp_name!r}. Use 'self', 'heuristic', or 'ckpt:PATH'.")
+
+    heuristic_opp_mask = tuple(name == "heuristic" for name, _ in opp_pool)
+
+    # Stack pool into [n_opponents, ...] — env i uses slot i % n_opponents.
+    stacked_opp_params = jax.tree_util.tree_map(
+        lambda *xs: jnp.stack(xs), *[p for _, p in opp_pool]
+    )
+
     # ── JIT-compiled rollout fn ───────────────────────────────────────────────
     collect = make_rollout_fn(
-        board_pool    = board_pool,
-        n_boards      = N_BOARDS,
-        cfg           = cfg,
-        module        = policy,
-        rollout_steps = cfg.ppo.rollout_steps,
+        board_pool          = board_pool,
+        n_boards            = N_BOARDS,
+        cfg                 = cfg,
+        module              = policy,
+        rollout_steps       = cfg.ppo.rollout_steps,
+        n_opponents         = len(opp_pool),
+        heuristic_opp_mask  = heuristic_opp_mask,
     )
 
     # ── Initial carry ─────────────────────────────────────────────────────────
@@ -134,8 +162,6 @@ def main() -> None:
         board_pool, N_BOARDS, N, cfg.seed, cfg.alternate_player_sides
     )
     carry = RolloutCarry(batched_state, board_idx, ep_reward, learner_players, key)
-
-    opp_params = train_state.params
 
     save_dir = Path(cfg.save_dir)
 
@@ -146,7 +172,7 @@ def main() -> None:
         for update in range(start_update, cfg.ppo.total_updates + 1):
             t_update = time.time()
             # ── Collect rollout ───────────────────────────────────────────────
-            carry, steps = collect(train_state.params, opp_params, carry)
+            carry, steps = collect(train_state.params, stacked_opp_params, carry)
 
             # ── Bootstrap value from last carry state ─────────────────────────
             boot_val = compute_bootstrap_val(
@@ -176,9 +202,13 @@ def main() -> None:
                 kl_coef=cfg.ppo.kl_coef,
             )
 
-            # ── Self-play opponent sync ───────────────────────────────────────
-            if "self" in cfg.opponents and update % cfg.self_play_update_interval == 0:
-                opp_params = train_state.params
+            # ── Self-play sync: refresh all "self" slots in the stacked pool ───
+            if any(n == "self" for n, _ in opp_pool) and update % cfg.self_play_update_interval == 0:
+                for i, (name, _) in enumerate(opp_pool):
+                    if name == "self":
+                        stacked_opp_params = jax.tree_util.tree_map(
+                            lambda s, p: s.at[i].set(p), stacked_opp_params, train_state.params
+                        )
 
             # ── Eval vs rule-based opponents ──────────────────────────────────
             eval_results: dict[str, float] = {}

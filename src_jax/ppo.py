@@ -199,7 +199,7 @@ def ppo_update(
     ret     = batch.returns
     adv_raw = batch.advantages
 
-    ev = float(1.0 - adv_raw.var() / (ret.var() + 1e-8))
+    ev_jax = 1.0 - adv_raw.var() / (ret.var() + 1e-8)
     adv = (adv_raw - adv_raw.mean()) / (adv_raw.std() + 1e-8)
 
     size = sf.shape[0]
@@ -213,8 +213,13 @@ def ppo_update(
     _ref_params = ref_params if ref_params is not None else state.params
     kc = jnp.float32(kl_coef if ref_params is not None else 0.0)
 
-    acc = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0,
-           "entropy": 0.0, "clip_fraction": 0.0, "kl_divergence": 0.0, "kl_ref": 0.0}
+    acc_loss = jnp.float32(0.0)
+    acc_pg   = jnp.float32(0.0)
+    acc_vl   = jnp.float32(0.0)
+    acc_em   = jnp.float32(0.0)
+    acc_kl   = jnp.float32(0.0)
+    acc_cf   = jnp.float32(0.0)
+    acc_kd   = jnp.float32(0.0)
     n_updates = 0
 
     for _ in range(epochs):
@@ -228,16 +233,24 @@ def ppo_update(
                 old_lp[idx], ti[idx], sb[idx], ret[idx], adv[idx],
                 cc, ec, vc, _ref_params, kc,
             )
-            acc["loss"]          += float(loss)
-            acc["policy_loss"]   += float(pg)
-            acc["value_loss"]    += float(vl)
-            acc["entropy"]       += float(em)
-            acc["kl_ref"]        += float(kl)
-            acc["clip_fraction"] += float((jnp.abs(ratio - 1.0) > clip_coef).mean())
-            acc["kl_divergence"] += float((old_lp[idx] - new_lp).mean())
+            acc_loss = acc_loss + loss
+            acc_pg   = acc_pg + pg
+            acc_vl   = acc_vl + vl
+            acc_em   = acc_em + em
+            acc_kl   = acc_kl + kl
+            acc_cf   = acc_cf + (jnp.abs(ratio - 1.0) > clip_coef).mean()
+            acc_kd   = acc_kd + (old_lp[idx] - new_lp).mean()
             n_updates += 1
 
     n = max(n_updates, 1)
-    metrics = {k: v / n for k, v in acc.items()}
-    metrics["explained_variance"] = ev
+    metrics = {
+        "loss":               float(acc_loss / n),
+        "policy_loss":        float(acc_pg / n),
+        "value_loss":         float(acc_vl / n),
+        "entropy":            float(acc_em / n),
+        "kl_ref":             float(acc_kl / n),
+        "clip_fraction":      float(acc_cf / n),
+        "kl_divergence":      float(acc_kd / n),
+        "explained_variance": float(ev_jax),
+    }
     return state, metrics, key
