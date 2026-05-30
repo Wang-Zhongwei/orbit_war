@@ -2,16 +2,18 @@
 JAX policy → kaggle-environment callable agent.
 
 Usage:
-    from src_jax.jax_agent import make_jax_agent
+    from src_jax.jax_agent import build_agent
+    import pickle, jax, jax.numpy as jnp
 
-    agent = make_jax_agent("artifacts/bc/bc_pretrain/ckpt_last.pkl")
+    with open("artifacts/bc/bc_pretrain/ckpt_last.pkl", "rb") as f:
+        ckpt = pickle.load(f)
+    params = jax.tree_util.tree_map(jnp.asarray, ckpt["params"])
+    agent = build_agent(params, ckpt["config"])
     env.run([agent, opponent])
 """
 
 from __future__ import annotations
 
-import pickle
-from pathlib import Path
 from typing import Callable
 
 import jax
@@ -19,7 +21,7 @@ import jax.numpy as jnp
 
 from .bc_data import obs_to_env_state
 from .features import MIN_SOURCE_SHIPS, _make_env_encoder, aim_fleets
-from .physics import MAX_BASE_PLANETS, MAX_FLEETS
+from .physics import MAX_BASE_PLANETS
 from .policy import build_policy
 from .rollout import CAND_DIM, GLOB_DIM, SELF_DIM
 
@@ -28,7 +30,6 @@ def _obs_to_dict(obs) -> dict:
     """Accept either a plain dict or a kaggle StructuredObservation object."""
     if isinstance(obs, dict):
         return obs
-    # kaggle returns a struct-like; convert via __dict__ or vars
     try:
         return dict(obs)
     except TypeError:
@@ -37,7 +38,6 @@ def _obs_to_dict(obs) -> dict:
         return vars(obs)
     except TypeError:
         pass
-    # Last resort: attribute access for known keys
     keys = [
         "player", "step", "planets", "fleets", "initial_planets",
         "angular_velocity", "comet_planet_ids", "comets", "remainingOverageTime",
@@ -51,35 +51,21 @@ def _safe_target_logits(target_logits: jax.Array) -> jax.Array:
     return jnp.where(invalid[:, None], jnp.zeros_like(target_logits), target_logits)
 
 
-def make_jax_agent(
-    checkpoint_path: str | Path,
+def build_agent(
+    params,
+    cfg,
     deterministic: bool = True,
 ) -> Callable:
-    """Return an obs→moves callable that runs the JAX policy from a checkpoint.
-
-    The checkpoint must be in the format saved by bc_train.py or train.py
-    (a pickle with keys 'params' and 'config').
-
-    Parameters
-    ----------
-    checkpoint_path : path to the .pkl checkpoint file
-    deterministic   : if True (default) take argmax; otherwise sample
-    """
-    with open(checkpoint_path, "rb") as f:
-        ckpt = pickle.load(f)
-
-    cfg    = ckpt["config"]
-    params = jax.tree_util.tree_map(jnp.asarray, ckpt["params"])
+    """Return an obs→moves callable from in-memory params."""
+    params  = jax.tree_util.tree_map(jnp.asarray, params)
     rng_key = jax.random.PRNGKey(int(getattr(cfg, "seed", 0)))
 
     K = cfg.env.candidate_count
     B = cfg.env.ship_bucket_count
 
-    module     = build_policy(cfg)
-    encode_fn  = _make_env_encoder(K, cfg.env)
+    module    = build_policy(cfg)
+    encode_fn = _make_env_encoder(K, cfg.env)
 
-    # JIT-compile the forward pass once.  Input shapes must stay fixed:
-    # [MAX_BASE_PLANETS, *] because we process exactly one env at a time.
     MAX_SRC = MAX_BASE_PLANETS
 
     @jax.jit
@@ -95,11 +81,9 @@ def make_jax_agent(
         state  = obs_to_env_state(obs_dict)
         player = jnp.array([int(obs_dict.get("player", 0))], dtype=jnp.int32)
 
-        # Batch-dim 1 for the encoder (vmapped over envs)
         batched = jax.tree_util.tree_map(lambda x: x[None], state)
         enc     = encode_fn(batched, player)
 
-        # Flatten MAX_SRC decisions for the policy
         sf = enc.self_feats.reshape(MAX_SRC, SELF_DIM)
         cf = enc.cand_feats.reshape(MAX_SRC, K, CAND_DIM)
         gf = jnp.broadcast_to(enc.global_feat[0][None, :], (MAX_SRC, GLOB_DIM))
@@ -109,58 +93,50 @@ def make_jax_agent(
 
         target_logits = _safe_target_logits(out.target_logits)
         if deterministic:
-            ti = jnp.argmax(target_logits, axis=-1)          # [MAX_SRC]
+            ti = jnp.argmax(target_logits, axis=-1)
         else:
             rng_key, subkey = jax.random.split(rng_key)
             ti = jax.random.categorical(subkey, target_logits)
 
         row_idx = jnp.arange(MAX_SRC)
-        shp_logits = out.ships_logits[row_idx, ti]           # [MAX_SRC, B]
+        shp_logits = out.ships_logits[row_idx, ti]
         if deterministic:
-            sb = jnp.argmax(shp_logits, axis=-1)             # [MAX_SRC]
+            sb = jnp.argmax(shp_logits, axis=-1)
         else:
             rng_key, subkey = jax.random.split(rng_key)
             sb = jax.random.categorical(subkey, shp_logits)
 
-        # Convert to moves
-        src_valid       = enc.src_valid[0]        # [MAX_SRC]
-        src_ids         = enc.src_ids[0]          # [MAX_SRC]
-        src_ships       = enc.src_ships[0]        # [MAX_SRC] int32
-        cand_mask       = enc.cand_mask[0]        # [MAX_SRC, K]
-        src_slots       = enc.src_slots[0]        # [MAX_SRC] int32
-        cand_slots_safe = enc.cand_slots_safe[0]  # [MAX_SRC, K] int32
+        src_valid       = enc.src_valid[0]
+        src_ids         = enc.src_ids[0]
+        src_ships       = enc.src_ships[0]
+        cand_mask       = enc.cand_mask[0]
+        src_slots       = enc.src_slots[0]
+        cand_slots_safe = enc.cand_slots_safe[0]
 
-        # Re-aim with the actual ships the policy sends and re-verify sun
-        # clearance with that exact intercept geometry. The encoder's cand_mask
-        # used src_ships//2 as a speed estimate; the policy can pick any bucket
-        # and the resulting fleet speed shifts the intercept point. If the
-        # sun-block check disagrees here, drop the fleet rather than send it
-        # into the sun.
+        # Re-aim with actual ship count and re-verify sun clearance.
         frac       = (sb.astype(jnp.float32) + 1.0) / jnp.float32(B)
         ships_send = jnp.maximum(MIN_SOURCE_SHIPS, jnp.floor(frac * src_ships.astype(jnp.float32)).astype(jnp.int32))
-        selected_tgt = cand_slots_safe[row_idx, ti]   # [MAX_SRC]
+        selected_tgt = cand_slots_safe[row_idx, ti]
 
         reaim_angles, is_blocked = _reaim_all(
             state.p_x, state.p_y, state.p_radius,
             state.p_alive, state.p_is_comet,
             state.angular_velocity,
             src_slots, selected_tgt, ships_send,
-        )  # both [MAX_SRC]
+        )
 
         moves: list = []
         for i in range(MAX_SRC):
             if not bool(src_valid[i]):
                 continue
             t = int(ti[i])
-            if t == 0:           # no-op chosen
+            if t == 0:
                 continue
             if not bool(cand_mask[i, t]):
                 continue
             if bool(is_blocked[i]):
                 continue
-            ships = int(ships_send[i])
-            angle = float(reaim_angles[i])
-            moves.append([int(src_ids[i]), angle, ships])
+            moves.append([int(src_ids[i]), float(reaim_angles[i]), int(ships_send[i])])
 
         return moves
 

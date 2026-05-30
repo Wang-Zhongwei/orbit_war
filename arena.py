@@ -59,8 +59,14 @@ def _register_jax_agent(
     name: str = "jax",
 ) -> None:
     """Build a JAX BC/RL agent from checkpoint and register it in AGENTS under ``name``."""
-    from src_jax.jax_agent import make_jax_agent
-    AGENTS[name] = make_jax_agent(checkpoint_path, deterministic=deterministic)
+    import pickle
+    import jax
+    import jax.numpy as jnp
+    from src_jax.jax_agent import build_agent
+    with open(checkpoint_path, "rb") as f:
+        ckpt = pickle.load(f)
+    params = jax.tree_util.tree_map(jnp.asarray, ckpt["params"])
+    AGENTS[name] = build_agent(params, ckpt["config"], deterministic=deterministic)
 
 
 def _resolve_agents(names: Sequence[str]) -> None:

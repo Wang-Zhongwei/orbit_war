@@ -87,7 +87,6 @@ def collect_rollout(
             [0] + [batch.self_features.shape[0] for batch in batches[:-1]]
         )
         merged = merge_batches(batches)
-        row_values = np.zeros((merged.self_features.shape[0],), dtype=np.float32)
         if merged.self_features.shape[0] > 0:
             with torch.inference_mode():
                 outputs = policy(
@@ -101,6 +100,7 @@ def collect_rollout(
                 sampled_target_index = sampled.target_index.detach().cpu().numpy() # detach from computation graph to make it fixed in PPO update
                 sampled_log_prob = sampled.log_prob.detach().cpu().numpy()
         else:
+            row_values = np.zeros((0,), dtype=np.float32)
             sampled_target_index = np.zeros((0,), dtype=np.int64)
             sampled_log_prob = np.zeros((0,), dtype=np.float32)
 

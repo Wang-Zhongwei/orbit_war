@@ -135,12 +135,12 @@ def ppo_update(
             optimizer.step()
             clip_fraction = ((ratio.detach() - 1.0).abs() > clip_coef).float().mean()
             kl = (old_log_prob[idx] - new_log_prob).detach().mean()
-            metrics["loss"] += float(loss.detach().cpu())
-            metrics["policy_loss"] += float(policy_loss.detach().cpu())
-            metrics["value_loss"] += float(value_loss.detach().cpu())
-            metrics["entropy"] += float(entropy_mean.detach().cpu())
-            metrics["clip_fraction"] += float(clip_fraction.cpu())
-            metrics["kl_divergence"] += float(kl.cpu())
+            metrics["loss"] += loss.item()
+            metrics["policy_loss"] += policy_loss.item()
+            metrics["value_loss"] += value_loss.item()
+            metrics["entropy"] += entropy_mean.item()
+            metrics["clip_fraction"] += clip_fraction.item()
+            metrics["kl_divergence"] += kl.item()
             updates += 1
     n = max(updates, 1)
     return {key: (value if key == "explained_variance" else value / n) for key, value in metrics.items()}
