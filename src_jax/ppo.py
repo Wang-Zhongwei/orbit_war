@@ -55,6 +55,13 @@ def _categorical_entropy(logits: jax.Array) -> jax.Array:
     return -jnp.sum(jnp.exp(log_probs) * log_probs, axis=-1)
 
 
+def _categorical_kl(ref_logits: jax.Array, new_logits: jax.Array) -> jax.Array:
+    """KL(p_ref || p_new) per row; last axis is the category dimension."""
+    log_p_ref = jax.nn.log_softmax(ref_logits, axis=-1)
+    log_p_new = jax.nn.log_softmax(new_logits, axis=-1)
+    return jnp.sum(jnp.exp(log_p_ref) * (log_p_ref - log_p_new), axis=-1)
+
+
 def _safe_target_logits(target_logits: jax.Array) -> jax.Array:
     invalid = ~jnp.isfinite(target_logits).any(axis=-1)
     safe = jnp.where(invalid[:, None], jnp.zeros_like(target_logits).at[:, 0].set(0.0), target_logits)
@@ -126,7 +133,9 @@ def _minibatch_update(
     clip_coef: jax.Array,
     ent_coef: jax.Array,
     vf_coef: jax.Array,
-) -> tuple[TrainState, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    ref_params: dict,
+    kl_coef: jax.Array,
+) -> tuple[TrainState, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     def loss_fn(params):
         outputs = state.apply_fn(params, sf, cf, gf, cm)
         new_lp, ent = action_log_prob_and_entropy(outputs, ti, sb)
@@ -135,13 +144,25 @@ def _minibatch_update(
             -adv * ratio,
             -adv * jnp.clip(ratio, 1.0 - clip_coef, 1.0 + clip_coef),
         ).mean()
-        vl  = 0.5 * jnp.mean((ret - outputs.value) ** 2)
-        em  = ent.mean()
-        return pg + vf_coef * vl - ent_coef * em, (pg, vl, em, ratio, new_lp)
+        vl = 0.5 * jnp.mean((ret - outputs.value) ** 2)
+        em = ent.mean()
 
-    (loss, (pg, vl, em, ratio, new_lp)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+        # KL(ref || new) across both action heads.
+        # ref_params is closed over (not differentiated), so gradients only
+        # flow through new policy outputs.
+        ref_out = state.apply_fn(ref_params, sf, cf, gf, cm)
+        ref_tgt = _safe_target_logits(ref_out.target_logits)
+        new_tgt = _safe_target_logits(outputs.target_logits)
+        kl_tgt   = _categorical_kl(ref_tgt, new_tgt).mean()                # scalar
+        kl_ships = _categorical_kl(ref_out.ships_logits, outputs.ships_logits).mean()  # [N,K]→scalar
+        kl = 0.5 * (kl_tgt + kl_ships)
+
+        loss = pg + vf_coef * vl - ent_coef * em + kl_coef * kl
+        return loss, (pg, vl, em, kl, ratio, new_lp)
+
+    (loss, (pg, vl, em, kl, ratio, new_lp)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     state = state.apply_gradients(grads=grads)
-    return state, loss, pg, vl, em, ratio, new_lp
+    return state, loss, pg, vl, em, kl, ratio, new_lp
 
 
 # ---------------------------------------------------------------------------
@@ -158,12 +179,14 @@ def ppo_update(
     epochs: int,
     minibatch_size: int,
     key: jax.Array,
+    ref_params: dict | None = None,
+    kl_coef: float = 0.0,
 ) -> tuple[TrainState, dict[str, float], jax.Array]:
     if batch.self_features.shape[0] == 0:
         return state, {
             "loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0,
             "entropy": 0.0, "clip_fraction": 0.0, "kl_divergence": 0.0,
-            "explained_variance": 0.0,
+            "kl_ref": 0.0, "explained_variance": 0.0,
         }, key
 
     sf      = batch.self_features
@@ -185,9 +208,13 @@ def ppo_update(
     cc = jnp.float32(clip_coef)
     ec = jnp.float32(ent_coef)
     vc = jnp.float32(vf_coef)
+    # When ref_params is None, pass current params as a dummy and zero the coefficient
+    # so the KL term drops out without any Python control flow inside the JIT.
+    _ref_params = ref_params if ref_params is not None else state.params
+    kc = jnp.float32(kl_coef if ref_params is not None else 0.0)
 
     acc = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0,
-           "entropy": 0.0, "clip_fraction": 0.0, "kl_divergence": 0.0}
+           "entropy": 0.0, "clip_fraction": 0.0, "kl_divergence": 0.0, "kl_ref": 0.0}
     n_updates = 0
 
     for _ in range(epochs):
@@ -195,16 +222,17 @@ def ppo_update(
         order = jax.random.permutation(subkey, size)
         for start in range(0, size, mb):
             idx = order[start : start + mb]
-            state, loss, pg, vl, em, ratio, new_lp = _minibatch_update(
+            state, loss, pg, vl, em, kl, ratio, new_lp = _minibatch_update(
                 state,
                 sf[idx], cf[idx], gf[idx], cm[idx],
                 old_lp[idx], ti[idx], sb[idx], ret[idx], adv[idx],
-                cc, ec, vc,
+                cc, ec, vc, _ref_params, kc,
             )
             acc["loss"]          += float(loss)
             acc["policy_loss"]   += float(pg)
             acc["value_loss"]    += float(vl)
             acc["entropy"]       += float(em)
+            acc["kl_ref"]        += float(kl)
             acc["clip_fraction"] += float((jnp.abs(ratio - 1.0) > clip_coef).mean())
             acc["kl_divergence"] += float((old_lp[idx] - new_lp).mean())
             n_updates += 1
