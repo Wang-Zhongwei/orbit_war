@@ -227,8 +227,8 @@ def _make_env_encoder(K: int, env_cfg):
     from .constants import MAX_ANGULAR_VELOCITY, BOARD_SIZE, MAX_PRODUCTION
 
     K_enemy    = K // 3
-    K_neutral  = K // 3
-    K_friendly = K - 1 - K_enemy - K_neutral   # friendly quota; total non-noop slots = K-1
+    K_friendly = K // 3
+    K_neutral  = K - 1 - K_enemy - K_friendly
 
     board_size           = jnp.float32(BOARD_SIZE)
     max_ships            = jnp.float32(env_cfg.max_ships)
@@ -269,16 +269,37 @@ def _make_env_encoder(K: int, env_cfg):
                 valid       = sorted_dist[slots] < INF
                 return slots, valid
 
-            is_enemy_planet   = excl_mask & (state.p_owner != -1) & (state.p_owner != player)
-            is_neutral_planet = excl_mask & (state.p_owner == -1)
+            is_enemy_planet    = excl_mask & (state.p_owner != -1) & (state.p_owner != player)
+            is_neutral_planet  = excl_mask & (state.p_owner == -1)
             is_friendly_planet = excl_mask & (state.p_owner == player)
 
-            enemy_slots,   enemy_valid   = top_k(is_enemy_planet,   K_enemy)
-            neutral_slots, neutral_valid = top_k(is_neutral_planet, K_neutral)
+            enemy_slots,    enemy_valid    = top_k(is_enemy_planet,    K_enemy)
+            neutral_slots,  neutral_valid  = top_k(is_neutral_planet,  K_neutral)
             friendly_slots, friendly_valid = top_k(is_friendly_planet, K_friendly)
 
-            cand_slots = jnp.concatenate([jnp.array([-1], jnp.int32), enemy_slots, neutral_slots, friendly_slots])
-            cand_valid = jnp.concatenate([jnp.array([True], bool),     enemy_valid, neutral_valid, friendly_valid])
+            # Flatten per-category picks [K-1]
+            per_slots = jnp.concatenate([enemy_slots,  neutral_slots,  friendly_slots])
+            per_valid = jnp.concatenate([enemy_valid,  neutral_valid,  friendly_valid])
+
+            # Overflow pool: nearest planets not already claimed by a quota slot.
+            # Handles the case where a category has fewer planets than its quota —
+            # instead of wasting those slots, fill them with the next-closest planets
+            # from any category.
+            selected   = jnp.zeros(MAX_PLANETS, dtype=jnp.bool_).at[per_slots].set(per_valid)
+            ovfl_dist  = jnp.where(excl_mask & ~selected, dist_to_src, INF)
+            ovfl_slots = jnp.argsort(ovfl_dist)[:K - 1]   # [K-1] — max deficit is K-1
+            ovfl_valid = ovfl_dist[ovfl_slots] < INF
+
+            # Exclusive prefix-sum of invalids → overflow index for each slot.
+            # per_valid[i]=False means: use ovfl_slots[# of invalids before i].
+            inv      = (~per_valid).astype(jnp.int32)
+            ovfl_idx = jnp.minimum(jnp.cumsum(inv) - inv, K - 2)  # clamp to [0, K-2]
+
+            final_slots = jnp.where(per_valid, per_slots, ovfl_slots[ovfl_idx])
+            final_valid = jnp.where(per_valid, True,      ovfl_valid[ovfl_idx])
+
+            cand_slots = jnp.concatenate([jnp.array([-1], jnp.int32), final_slots])
+            cand_valid = jnp.concatenate([jnp.array([True], bool),     final_valid])
             return cand_slots, cand_valid
 
         all_cand_slots, all_cand_valid = jax.vmap(_select_cands)(src_slots)
