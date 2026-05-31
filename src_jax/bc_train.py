@@ -63,7 +63,8 @@ def _bc_step(
     sb: jax.Array,   # [N]  int32  ship bucket
 ) -> tuple[TrainState, jax.Array, jax.Array, jax.Array]:
     def loss_fn(params):
-        out = state.apply_fn(params, sf, cf, gf, cm)
+        sv = jnp.ones(sf.shape[0], dtype=jnp.bool_)
+        out = state.apply_fn(params, sf, cf, gf, cm, sv)
         N   = ti.shape[0]
 
         # Target cross-entropy

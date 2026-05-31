@@ -42,11 +42,11 @@ _SUN_BLOCK_MARGIN: float = 1.01
 
 
 def self_feature_dim() -> int:
-    return 11
+    return 7
 
 
 def candidate_feature_dim() -> int:
-    return 14
+    return 15
 
 
 def global_feature_dim() -> int:
@@ -423,29 +423,18 @@ def _make_env_encoder(K: int, env_cfg):
         src_orb_radius = jnp.hypot(src_init_x - CENTER, src_init_y - CENTER)
         src_rotating  = (src_orb_radius + state.p_radius[src_slots]) < ROTATION_RADIUS_LIMIT
 
-        src_per_planet_feats = jnp.stack([
+        src_orbit_r  = jnp.hypot(src_x - CENTER, src_y - CENTER) / (board_size * jnp.float32(0.5))
+        src_rot_flag = src_rotating.astype(jnp.float32)
+
+        self_feats = jnp.stack([
             jnp.ones(MAX_BASE_PLANETS, jnp.float32),                              # [0] bias term
             src_x / board_size,                                                    # [1] normalized board-x position
             src_y / board_size,                                                    # [2] normalized board-y position
             jnp.clip(state.p_ships[src_slots], 0.0, max_ships) / max_ships,      # [3] current garrison
             state.p_production[src_slots] / max_production,                       # [4] income rate
-        ], axis=1)  # [MAX_SRC, 5]
-
-        src_global_stats = jnp.stack([
-            n_my_planets / max_planets,     # [6] friendly planet count
-            n_enemy_planets / max_planets,  # [7] enemy planet count
-            my_planet_ships / ship_norm,    # [8] total friendly fleet strength
-            enemy_planet_ships / ship_norm, # [9] total enemy fleet strength
-        ])
-        src_orbit_r  = jnp.hypot(src_x - CENTER, src_y - CENTER) / (board_size * jnp.float32(0.5))
-        src_rot_flag = src_rotating.astype(jnp.float32)
-
-        self_feats = jnp.concatenate([
-            src_per_planet_feats,
-            jnp.broadcast_to(src_global_stats[None, :], (MAX_BASE_PLANETS, 4)),
-            src_orbit_r[:, None],    # [9]  orbit radius — inner vs outer ring
-            src_rot_flag[:, None],   # [10] 1 if rotating planet, 0 if static/comet
-        ], axis=1)  # [MAX_SRC, 11]
+            src_orbit_r,             # [5] orbit radius — inner vs outer ring
+            src_rot_flag,            # [6] 1 if rotating planet, 0 if static/comet
+        ], axis=1)  # [MAX_SRC, 7]
 
         # ── Candidate features  [MAX_SRC, K, 14] ────────────────────────
         tgt_x   = state.p_x[safe_slots]         # [MAX_SRC, K]
@@ -550,7 +539,8 @@ def _make_env_encoder(K: int, env_cfg):
             my_inbound_ships,                                           # [11] friendly inbound ships
             opp_inbound_ships,                                          # [12] enemy inbound ships
             will_be_mine,                                               # [13] planet projected mine at eta (no action)
-        ], axis=2).at[:, 0, :].set(0.0)  # [MAX_SRC, K, 14]; no-op slot = zeros
+            t_hat / episode_steps,                                      # [14] normalized ETA (dist/speed — larger fleet → faster → shorter)
+        ], axis=2).at[:, 0, :].set(0.0)  # [MAX_SRC, K, 15]; no-op slot = zeros
 
         # ── Fleet features  [MAX_FLEETS, 6] ──────────────────────────────
         # Velocity (not pure heading) so the cross-attention can extrapolate

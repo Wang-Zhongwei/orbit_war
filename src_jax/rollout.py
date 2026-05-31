@@ -190,13 +190,14 @@ def make_rollout_fn(
         cf = enc.cand_feats   # [N, MAX_SRC, K, CAND_DIM]
         gf = jnp.broadcast_to(enc.global_feat[:, None, :], (N_ENVS, MAX_SRC, GLOB_DIM))
         cm = enc.cand_mask    # [N, MAX_SRC, K]
+        sv = enc.src_valid    # [N, MAX_SRC] bool
 
-        outputs = module.apply(
-            params,
-            sf.reshape(N_ENVS * MAX_SRC, SELF_DIM),
-            cf.reshape(N_ENVS * MAX_SRC, K, CAND_DIM),
-            gf.reshape(N_ENVS * MAX_SRC, GLOB_DIM),
-            cm.reshape(N_ENVS * MAX_SRC, K),
+        # vmap over envs so cross-source attention stays within each env's turn.
+        out_per_env = jax.vmap(
+            lambda sf_i, cf_i, gf_i, cm_i, sv_i: module.apply(params, sf_i, cf_i, gf_i, cm_i, sv_i)
+        )(sf, cf, gf, cm, sv)                                               # [N, MAX_SRC, ...]
+        outputs = jax.tree_util.tree_map(
+            lambda x: x.reshape(N_ENVS * MAX_SRC, *x.shape[2:]), out_per_env
         )
         key, subkey = jax.random.split(key)
         ti_f, sb_f, lp_f, _, _ = sample_actions(outputs, subkey, deterministic=deterministic)
@@ -216,10 +217,11 @@ def make_rollout_fn(
         cf = enc.cand_feats  # [N, MAX_SRC, K, CAND_DIM]
         gf = jnp.broadcast_to(enc.global_feat[:, None, :], (N_ENVS, MAX_SRC, GLOB_DIM))
         cm = enc.cand_mask   # [N, MAX_SRC, K]
+        sv = enc.src_valid   # [N, MAX_SRC] bool
 
-        outputs = jax.vmap(lambda p, sf_i, cf_i, gf_i, cm_i: module.apply(p, sf_i, cf_i, gf_i, cm_i))(
-            per_env_params, sf, cf, gf, cm
-        )  # each leaf: [N, MAX_SRC, ...]
+        outputs = jax.vmap(
+            lambda p, sf_i, cf_i, gf_i, cm_i, sv_i: module.apply(p, sf_i, cf_i, gf_i, cm_i, sv_i)
+        )(per_env_params, sf, cf, gf, cm, sv)                               # [N, MAX_SRC, ...]
 
         flat = jax.tree_util.tree_map(lambda x: x.reshape(N_ENVS * MAX_SRC, *x.shape[2:]), outputs)
         key, subkey = jax.random.split(key)
@@ -370,15 +372,12 @@ def compute_bootstrap_val(
     """Average critic value over valid source planets for each env. Returns [N]."""
     enc = encode_batch(state, learner_players)
     gf  = jnp.broadcast_to(enc.global_feat[:, None, :], (N_ENVS, MAX_SRC, GLOB_DIM))
-    outputs = policy.apply(
-        params,
-        enc.self_feats.reshape(N_ENVS * MAX_SRC, SELF_DIM),
-        enc.cand_feats.reshape(N_ENVS * MAX_SRC, K, CAND_DIM),
-        gf.reshape(N_ENVS * MAX_SRC, GLOB_DIM),
-        enc.cand_mask.reshape(N_ENVS * MAX_SRC, K),
-    )
-    val   = outputs.value.reshape(N_ENVS, MAX_SRC)
-    valid = enc.src_valid.astype(jnp.float32)
+    sv  = enc.src_valid   # [N_ENVS, MAX_SRC] bool
+    out_per_env = jax.vmap(
+        lambda sf_i, cf_i, gf_i, cm_i, sv_i: policy.apply(params, sf_i, cf_i, gf_i, cm_i, sv_i)
+    )(enc.self_feats, enc.cand_feats, gf, enc.cand_mask, sv)
+    val   = out_per_env.value                                               # [N_ENVS, MAX_SRC]
+    valid = sv.astype(jnp.float32)
     count = jnp.maximum(valid.sum(axis=1), 1.0)
     return (val * valid).sum(axis=1) / count  # [N]
 

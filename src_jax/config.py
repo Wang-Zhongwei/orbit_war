@@ -18,11 +18,17 @@ def _setstate(instance: Any, state: Any) -> None:
     slot_state: dict = state[1] if isinstance(state, tuple) else (state or {})
     for f in fields(type(instance)):
         if f.name in slot_state:
-            object.__setattr__(instance, f.name, slot_state[f.name])
+            value = slot_state[f.name]
         elif f.default is not MISSING:
-            object.__setattr__(instance, f.name, f.default)
+            value = f.default
         elif f.default_factory is not MISSING:  # type: ignore[misc]
-            object.__setattr__(instance, f.name, f.default_factory())
+            value = f.default_factory()
+        else:
+            continue
+        try:
+            object.__setattr__(instance, f.name, value)
+        except AttributeError:
+            setattr(instance, f.name, value)
 
 
 @dataclass(slots=True)

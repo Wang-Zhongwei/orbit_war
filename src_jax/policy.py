@@ -34,6 +34,7 @@ class _PolicyHead(nn.Module):
         candidate_features: jax.Array,  # [N, K, cand_dim]
         global_features: jax.Array,     # [N, global_dim]
         candidate_mask: jax.Array,      # [N, K] bool
+        src_valid: jax.Array,           # [N] bool
     ) -> tuple[jax.Array, jax.Array]:
         H, K = self.hidden_size, self.candidate_count
         N = self_features.shape[0]
@@ -43,6 +44,18 @@ class _PolicyHead(nn.Module):
         global_h = nn.gelu(nn.Dense(H)(nn.gelu(nn.Dense(H)(global_features))))
         cand_flat = candidate_features.reshape(N * K, candidate_features.shape[-1])
         cand_h   = nn.gelu(nn.Dense(H)(nn.gelu(nn.Dense(H)(cand_flat)))).reshape(N, K, H)
+
+        # Within-turn cross-source coordination: each source attends to all valid
+        # sibling sources so it can learn coalition attacks and avoid double-sending.
+        # Mask [1,1,1,N] broadcasts to [N, n_heads, N_q, N_k]; invalid sources are
+        # masked as keys so padding doesn't pollute the coalition signal.
+        cs_mask    = src_valid[None, None, None, :]
+        cs_normed  = nn.LayerNorm()(self_h)
+        self_h     = (self_h + nn.MultiHeadDotProductAttention(
+            num_heads=self.n_heads, out_features=H,
+        )(cs_normed, mask=cs_mask)).reshape(N, H)
+        cs_normed2 = nn.LayerNorm()(self_h)
+        self_h     = self_h + nn.Dense(H)(nn.gelu(nn.Dense(4 * H)(cs_normed2)))
 
         # Inject source + global context into candidate tokens before attention.
         ctx = (
@@ -86,8 +99,7 @@ class _PolicyHead(nn.Module):
 
 
 class _ValueNet(nn.Module):
-    """Value network: fully separate parameters from _PolicyHead.
-    Receives stop_gradient inputs so value gradients cannot reach policy weights."""
+    """Value network: fully separate parameters from _PolicyHead."""
     hidden_size: int
     candidate_count: int
     n_heads: int
@@ -99,6 +111,7 @@ class _ValueNet(nn.Module):
         candidate_features: jax.Array,  # [N, K, cand_dim]
         global_features: jax.Array,     # [N, global_dim]
         candidate_mask: jax.Array,      # [N, K] bool
+        src_valid: jax.Array,           # [N] bool
     ) -> jax.Array:
         H, K = self.hidden_size, self.candidate_count
         N = self_features.shape[0]
@@ -107,6 +120,14 @@ class _ValueNet(nn.Module):
         global_h = nn.gelu(nn.Dense(H)(nn.gelu(nn.Dense(H)(global_features))))
         cand_flat = candidate_features.reshape(N * K, candidate_features.shape[-1])
         cand_h   = nn.gelu(nn.Dense(H)(nn.gelu(nn.Dense(H)(cand_flat)))).reshape(N, K, H)
+
+        cs_mask    = src_valid[None, None, None, :]
+        cs_normed  = nn.LayerNorm()(self_h)
+        self_h     = (self_h + nn.MultiHeadDotProductAttention(
+            num_heads=self.n_heads, out_features=H,
+        )(cs_normed, mask=cs_mask)).reshape(N, H)
+        cs_normed2 = nn.LayerNorm()(self_h)
+        self_h     = self_h + nn.Dense(H)(nn.gelu(nn.Dense(4 * H)(cs_normed2)))
 
         ctx = (
             nn.Dense(H)(jnp.broadcast_to(self_h[:, None, :],   (N, K, H)))
@@ -146,26 +167,20 @@ class PlanetPolicy(nn.Module):
         candidate_features: jax.Array,  # [N, K, candidate_dim]
         global_features: jax.Array,     # [N, global_dim]
         candidate_mask: jax.Array,      # [N, K] bool
+        src_valid: jax.Array,           # [N] bool
     ) -> PolicyOutput:
         target_logits, ships_logits = _PolicyHead(
             hidden_size      = self.hidden_size,
             candidate_count  = self.candidate_count,
             ship_bucket_count= self.ship_bucket_count,
             n_heads          = self.n_heads,
-        )(self_features, candidate_features, global_features, candidate_mask)
+        )(self_features, candidate_features, global_features, candidate_mask, src_valid)
 
-        # stop_gradient ensures value-loss gradients cannot reach policy weights
-        # even if a future refactor accidentally shares a sub-module.
         value = _ValueNet(
             hidden_size     = self.hidden_size,
             candidate_count = self.candidate_count,
             n_heads         = self.n_heads,
-        )(
-            jax.lax.stop_gradient(self_features),
-            jax.lax.stop_gradient(candidate_features),
-            jax.lax.stop_gradient(global_features),
-            candidate_mask,
-        )
+        )(self_features, candidate_features, global_features, candidate_mask, src_valid)
 
         return PolicyOutput(
             target_logits = target_logits,
@@ -193,5 +208,6 @@ def init_params(module: PlanetPolicy, seed: int = 0) -> dict:
         jnp.zeros((1, K, module.candidate_dim)),
         jnp.zeros((1, module.global_dim)),
         jnp.ones((1, K), dtype=bool),
+        jnp.ones((1,), dtype=bool),
     )
     return module.init(jax.random.PRNGKey(seed), *dummy)

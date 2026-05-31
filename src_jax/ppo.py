@@ -137,7 +137,10 @@ def _minibatch_update(
     kl_coef: jax.Array,
 ) -> tuple[TrainState, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     def loss_fn(params):
-        outputs = state.apply_fn(params, sf, cf, gf, cm)
+        # Minibatch mixes samples from different (env, timestep) groups, so
+        # cross-source attention sees an all-valid flat batch here.
+        sv = jnp.ones(sf.shape[0], dtype=jnp.bool_)
+        outputs = state.apply_fn(params, sf, cf, gf, cm, sv)
         new_lp, ent = action_log_prob_and_entropy(outputs, ti, sb)
         ratio = jnp.exp(new_lp - old_lp)
         pg = jnp.maximum(
@@ -150,7 +153,7 @@ def _minibatch_update(
         # KL(ref || new) across both action heads.
         # ref_params is closed over (not differentiated), so gradients only
         # flow through new policy outputs.
-        ref_out = state.apply_fn(ref_params, sf, cf, gf, cm)
+        ref_out = state.apply_fn(ref_params, sf, cf, gf, cm, sv)
         ref_tgt = _safe_target_logits(ref_out.target_logits)
         new_tgt = _safe_target_logits(outputs.target_logits)
         kl_tgt   = _categorical_kl(ref_tgt, new_tgt).mean()                # scalar

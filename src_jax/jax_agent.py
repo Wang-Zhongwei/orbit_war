@@ -67,8 +67,8 @@ def build_agent(
     MAX_SRC = MAX_BASE_PLANETS
 
     @jax.jit
-    def _forward(sf, cf, gf, cm):
-        return module.apply(params, sf, cf, gf, cm)
+    def _forward(sf, cf, gf, cm, sv):
+        return module.apply(params, sf, cf, gf, cm, sv)
 
     _reaim_all = jax.jit(aim_fleets)
 
@@ -82,12 +82,13 @@ def build_agent(
         batched = jax.tree_util.tree_map(lambda x: x[None], state)
         enc     = encode_fn(batched, player)
 
-        sf = enc.self_feats.reshape(MAX_SRC, SELF_DIM)
-        cf = enc.cand_feats.reshape(MAX_SRC, K, CAND_DIM)
+        sf = enc.self_feats[0]               # [MAX_SRC, SELF_DIM]
+        cf = enc.cand_feats[0]               # [MAX_SRC, K, CAND_DIM]
         gf = jnp.broadcast_to(enc.global_feat[0][None, :], (MAX_SRC, GLOB_DIM))
-        cm = enc.cand_mask.reshape(MAX_SRC, K)
+        cm = enc.cand_mask[0]                # [MAX_SRC, K]
+        sv = enc.src_valid[0]
 
-        out = _forward(sf, cf, gf, cm)
+        out = _forward(sf, cf, gf, cm, sv)
 
         target_logits = _safe_target_logits(out.target_logits)
         if deterministic:
