@@ -8,12 +8,20 @@ import yaml
 
 
 def _setstate(instance: Any, state: Any) -> None:
-    """Backward-compatible __setstate__ for slots dataclasses.
+    """Backward-compatible __setstate__ for these config dataclasses.
 
-    Handles both old non-slots checkpoints (state is a plain dict) and new
-    slots checkpoints (state is (dict_state, slot_state) tuple).  Fields
-    missing from the stored state get their declared default values, so
-    adding a new field never breaks loading an older checkpoint.
+    Handles both checkpoint shapes: a plain dict (non-slots pickles) and the
+    ``(dict_state, slot_state)`` tuple produced by older ``slots=True``
+    checkpoints.  Fields missing from the stored state get their declared
+    default values, so adding a new field never breaks loading an older
+    checkpoint.
+
+    These classes deliberately do NOT use ``slots=True``: a slots dataclass
+    exposes its fields as member descriptors that can become read-only during
+    unpickling (e.g. when a stale module copy is loaded), which raised
+    ``AttributeError: '...' object attribute '...' is read-only``.  Plain
+    ``__dict__``-backed instances are always writable, so unpickling can never
+    hit that failure.
     """
     slot_state: dict = state[1] if isinstance(state, tuple) else (state or {})
     for f in fields(type(instance)):
@@ -31,7 +39,7 @@ def _setstate(instance: Any, state: Any) -> None:
             setattr(instance, f.name, value)
 
 
-@dataclass(slots=True)
+@dataclass
 class EnvConfig:
     episode_steps: int = 500
     candidate_count: int = 8
@@ -42,32 +50,34 @@ class EnvConfig:
     def __setstate__(self, state) -> None: _setstate(self, state)
 
 
-@dataclass(slots=True)
+@dataclass
 class ModelConfig:
     hidden_size: int = 128
 
     def __setstate__(self, state) -> None: _setstate(self, state)
 
 
-@dataclass(slots=True)
+@dataclass
 class PPOConfig:
     rollout_steps: int = 64
     num_envs: int = -1
     total_updates: int = 1000
     epochs: int = 4
-    minibatch_size: int = 2048
+    minibatch_size: int = 256
     gamma: float = 0.99
+    gae_lambda: float = 0.95  # 1.0 = full Monte-Carlo return; <1 trades variance for bias
     clip_coef: float = 0.2
     ent_coef: float = 0.05
     vf_coef: float = 0.5
     kl_coef: float = 0.0
     lr: float = 3e-4
     max_grad_norm: float = 0.5
+    augment: bool = False
 
     def __setstate__(self, state) -> None: _setstate(self, state)
 
 
-@dataclass(slots=True)
+@dataclass
 class BCConfig:
     epochs: int = 1
     batch_size: int = 2048
@@ -83,7 +93,7 @@ class BCConfig:
     def __setstate__(self, state) -> None: _setstate(self, state)
 
 
-@dataclass(slots=True)
+@dataclass
 class TrainConfig:
     seed: int = 42
     run_name: str = "default"
@@ -93,8 +103,9 @@ class TrainConfig:
     opponents: list[str] = field(default_factory=lambda: ["self"])
     eval_opponents: list[str] = field(default_factory=list)
     self_play_update_interval: int = 50
-    self_eval_update_interval: int = 50
+    eval_update_interval: int = 50
     eval_rounds: int = 10
+    eval_workers: int = -1  # CPU processes for eval matches; -1 = all cores
     self_play_deterministic: bool = False
     alternate_player_sides: bool = True
     env: EnvConfig = field(default_factory=EnvConfig)
@@ -108,6 +119,9 @@ class TrainConfig:
         if "opponent" in slot_state and "opponents" not in slot_state:
             slot_state = dict(slot_state)
             slot_state["opponents"] = [slot_state.pop("opponent")]
+        if "self_eval_update_interval" in slot_state and "eval_update_interval" not in slot_state:
+            slot_state = dict(slot_state)
+            slot_state["eval_update_interval"] = slot_state.pop("self_eval_update_interval")
         _setstate(self, slot_state)
 
 

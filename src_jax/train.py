@@ -23,16 +23,15 @@ from .rollout import (
     make_rollout_fn,
 )
 
-N_BOARDS = 1024
+N_BOARDS = 2048
 _EVAL_BASE_SEED = 1000
 
 def run_eval(params, cfg, base_seed: int = _EVAL_BASE_SEED) -> dict[str, float]:
-    from .jax_agent import build_agent
-    from src.evaluation import AGENTS, eval_agent
+    # Matches are fanned out across CPU worker processes (see eval_mp); the
+    # trainer keeps the GPU to itself.
+    from .eval_mp import run_eval_mp
 
-    agent = build_agent(params, cfg, deterministic=True)
-    opponent_fns = {opp: AGENTS[opp] for opp in cfg.eval_opponents}
-    return eval_agent(agent, opponent_fns, cfg.eval_rounds, base_seed)
+    return run_eval_mp(params, cfg, base_seed, workers=cfg.eval_workers)
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,6 +42,8 @@ def parse_args() -> argparse.Namespace:
                         help="Frozen reference policy for KL regularization. "
                              "Defaults to the --resume checkpoint when kl_coef > 0.")
     parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--total_updates", type=int, default=None)
+    parser.add_argument("--augment", action="store_true", default=False)
     parser.add_argument("--no_wandb", action="store_true")
     return parser.parse_args()
 
@@ -69,6 +70,10 @@ def main() -> None:
     K     = cfg.env.candidate_count
     use_wandb = not args.no_wandb
     run_name = args.run_name or cfg.run_name
+    if args.total_updates:
+        cfg.ppo.total_updates = args.total_updates
+    if args.augment:
+        cfg.ppo.augment = True
 
     if use_wandb:
         import wandb
@@ -155,6 +160,7 @@ def main() -> None:
         rollout_steps       = cfg.ppo.rollout_steps,
         n_opponents         = len(opp_pool),
         heuristic_opp_mask  = heuristic_opp_mask,
+        augment             = cfg.ppo.augment,
     )
 
     # ── Initial carry ─────────────────────────────────────────────────────────
@@ -173,6 +179,8 @@ def main() -> None:
             t_update = time.time()
             # ── Collect rollout ───────────────────────────────────────────────
             carry, steps = collect(train_state.params, stacked_opp_params, carry)
+            jax.block_until_ready(steps)
+            t_collect = time.time() - t_update
 
             # ── Bootstrap value from last carry state ─────────────────────────
             boot_val = compute_bootstrap_val(
@@ -183,11 +191,14 @@ def main() -> None:
 
             # ── Returns and advantages ────────────────────────────────────────
             step_returns = compute_returns(
-                steps.reward, steps.done, boot_val, cfg.ppo.gamma
+                steps.reward, steps.done, steps.values, steps.src_valid,
+                boot_val, cfg.ppo.gamma, cfg.ppo.gae_lambda,
             )
 
             # ── Build TrainingBatch ───────────────────────────────────────────
             batch = build_training_batch(steps, step_returns)
+            jax.block_until_ready(batch.self_features)
+            t_batch = time.time() - t_update - t_collect
 
             # ── PPO update ────────────────────────────────────────────────────
             train_state, metrics, key = ppo_update(
@@ -201,6 +212,8 @@ def main() -> None:
                 ref_params=ref_params,
                 kl_coef=cfg.ppo.kl_coef,
             )
+            jax.block_until_ready(train_state.params)
+            t_ppo = time.time() - t_update - t_collect - t_batch
 
             # ── Self-play sync: refresh all "self" slots in the stacked pool ───
             if any(n == "self" for n, _ in opp_pool) and update % cfg.self_play_update_interval == 0:
@@ -212,7 +225,7 @@ def main() -> None:
 
             # ── Eval vs rule-based opponents ──────────────────────────────────
             eval_results: dict[str, float] = {}
-            if cfg.eval_opponents and update % cfg.self_eval_update_interval == 0:
+            if cfg.eval_opponents and update % cfg.eval_update_interval == 0:
                 eval_results = run_eval(train_state.params, cfg)
                 for opp, wr in eval_results.items():
                     print(f"  eval vs {opp}: win_rate={wr:.3f}")
@@ -233,6 +246,7 @@ def main() -> None:
                     f" entropy={metrics['entropy']:.3f}"
                     f" clip={metrics['clip_fraction']:.3f}"
                     f"  {elapsed:.0f}s ({updates_per_s:.2f} updates/s, {update_time:.1f}s/update)"
+                    f"  [collect={t_collect:.2f}s batch={t_batch:.2f}s ppo={t_ppo:.2f}s]"
                 )
                 if use_wandb:
                     import wandb

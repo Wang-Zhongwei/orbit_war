@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from flax.training import train_state
 
@@ -30,15 +32,27 @@ def build_train_state(cfg, seed: int = 0) -> TrainState:
 
 @dataclass(slots=True)
 class TrainingBatch:
-    self_features: jax.Array        # [N, self_dim]
-    candidate_features: jax.Array   # [N, K, cand_dim]
-    global_features: jax.Array      # [N, global_dim]
-    candidate_mask: jax.Array       # [N, K]  bool
-    target_index: jax.Array         # [N]     int32
-    ships_bucket: jax.Array         # [N]     int32
-    log_prob: jax.Array             # [N]     float32
-    returns: jax.Array              # [N]     float32
-    advantages: jax.Array           # [N]     float32
+    self_features: jax.Array        # [B, MAX_SRC, self_dim]
+    candidate_features: jax.Array   # [B, MAX_SRC, K, cand_dim]
+    global_features: jax.Array      # [B, global_dim]
+    candidate_mask: jax.Array       # [B, MAX_SRC, K]  bool
+    target_index: jax.Array         # [B, MAX_SRC]     int32
+    ships_bucket: jax.Array         # [B, MAX_SRC]     int32
+    log_prob: jax.Array             # [B, MAX_SRC]     float32
+    returns: jax.Array              # [B]              float32
+    advantages: jax.Array           # [B, MAX_SRC]     float32
+    src_valid: jax.Array            # [B, MAX_SRC]     bool
+
+
+_TB_FIELDS = [
+    'self_features', 'candidate_features', 'global_features', 'candidate_mask',
+    'target_index', 'ships_bucket', 'log_prob', 'returns', 'advantages', 'src_valid',
+]
+jax.tree_util.register_pytree_node(
+    TrainingBatch,
+    lambda b: ([getattr(b, f) for f in _TB_FIELDS], None),
+    lambda _, xs: TrainingBatch(*xs),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -115,62 +129,156 @@ def sample_actions(
 
 
 # ---------------------------------------------------------------------------
-# JIT-compiled single-minibatch update step
+# PPO update — jitted, lax.scan over epochs × minibatches (no Python loop overhead)
 # ---------------------------------------------------------------------------
 
-@jax.jit
-def _minibatch_update(
+@functools.partial(jax.jit, static_argnames=('epochs', 'minibatch_size', 'use_kl'))
+def _ppo_update_jit(
     state: TrainState,
-    sf: jax.Array,
-    cf: jax.Array,
-    gf: jax.Array,
-    cm: jax.Array,
-    old_lp: jax.Array,
-    ti: jax.Array,
-    sb: jax.Array,
-    ret: jax.Array,
-    adv: jax.Array,
-    clip_coef: jax.Array,
-    ent_coef: jax.Array,
-    vf_coef: jax.Array,
+    batch: TrainingBatch,
+    *,
+    clip_coef: float,
+    ent_coef: float,
+    vf_coef: float,
+    epochs: int,
+    minibatch_size: int,
+    key: jax.Array,
     ref_params: dict,
-    kl_coef: jax.Array,
-) -> tuple[TrainState, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    def loss_fn(params):
-        # Minibatch mixes samples from different (env, timestep) groups, so
-        # cross-source attention sees an all-valid flat batch here.
-        sv = jnp.ones(sf.shape[0], dtype=jnp.bool_)
-        outputs = state.apply_fn(params, sf, cf, gf, cm, sv)
-        new_lp, ent = action_log_prob_and_entropy(outputs, ti, sb)
-        ratio = jnp.exp(new_lp - old_lp)
-        pg = jnp.maximum(
-            -adv * ratio,
-            -adv * jnp.clip(ratio, 1.0 - clip_coef, 1.0 + clip_coef),
-        ).mean()
-        vl = 0.5 * jnp.mean((ret - outputs.value) ** 2)
-        em = ent.mean()
+    kl_coef: float,
+    use_kl: bool,
+) -> tuple[TrainState, jax.Array, jax.Array]:
+    sf      = batch.self_features        # [B, MAX_SRC, self_dim]
+    cf      = batch.candidate_features   # [B, MAX_SRC, K, cand_dim]
+    gf      = batch.global_features      # [B, glob_dim]
+    cm      = batch.candidate_mask       # [B, MAX_SRC, K]
+    sv      = batch.src_valid            # [B, MAX_SRC] bool
+    old_lp  = batch.log_prob             # [B, MAX_SRC]
+    ti      = batch.target_index         # [B, MAX_SRC]
+    sb      = batch.ships_bucket         # [B, MAX_SRC]
+    ret     = batch.returns              # [B]
+    adv_raw = batch.advantages           # [B, MAX_SRC]
 
-        # KL(ref || new) across both action heads.
-        # ref_params is closed over (not differentiated), so gradients only
-        # flow through new policy outputs.
-        ref_out = state.apply_fn(ref_params, sf, cf, gf, cm, sv)
-        ref_tgt = _safe_target_logits(ref_out.target_logits)
-        new_tgt = _safe_target_logits(outputs.target_logits)
-        kl_tgt   = _categorical_kl(ref_tgt, new_tgt).mean()                # scalar
-        kl_ships = _categorical_kl(ref_out.ships_logits, outputs.ships_logits).mean()  # [N,K]→scalar
-        kl = 0.5 * (kl_tgt + kl_ships)
+    valid   = sv.astype(jnp.float32)
+    n_valid = valid.sum() + 1e-8
 
-        loss = pg + vf_coef * vl - ent_coef * em + kl_coef * kl
-        return loss, (pg, vl, em, kl, ratio, new_lp)
+    adv_mean = (adv_raw * valid).sum() / n_valid
+    adv_var  = ((adv_raw - adv_mean) ** 2 * valid).sum() / n_valid
+    adv_std  = jnp.sqrt(adv_var + 1e-8)
+    adv      = (adv_raw - adv_mean) / adv_std
+    ev_jax   = 1.0 - adv_var / (ret.var() + 1e-8)
 
-    (loss, (pg, vl, em, kl, ratio, new_lp)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
-    state = state.apply_gradients(grads=grads)
-    return state, loss, pg, vl, em, kl, ratio, new_lp
+    B    = sf.shape[0]
+    mb   = min(B, max(1, minibatch_size))
+    n_mb = B // mb  # drop any remainder
 
+    cc = jnp.float32(clip_coef)
+    ec = jnp.float32(ent_coef)
+    vc = jnp.float32(vf_coef)
+    kc = jnp.float32(kl_coef)
 
-# ---------------------------------------------------------------------------
-# PPO update — Python loop over epochs × minibatches
-# ---------------------------------------------------------------------------
+    MAX_SRC  = sf.shape[1]
+    GLOB_DIM = gf.shape[-1]
+    K        = cm.shape[-1]
+
+    # Precompute ref policy logits for the full batch once (outside any loop).
+    # Avoids epochs×n_mb redundant forward passes when KL regularisation is active.
+    if use_kl:
+        gf_exp_full  = jnp.broadcast_to(gf[:, None, :], (B, MAX_SRC, GLOB_DIM))
+        ref_out_full = jax.vmap(
+            lambda sf_i, cf_i, gf_i, cm_i, sv_i: state.apply_fn(
+                ref_params, sf_i, cf_i, gf_i, cm_i, sv_i
+            )
+        )(sf, cf, gf_exp_full, cm, sv)
+        # [B, MAX_SRC, K] — apply _safe_target_logits once over the flat B*MAX_SRC axis
+        ref_tgt_all   = _safe_target_logits(
+            ref_out_full.target_logits.reshape(B * MAX_SRC, K)
+        ).reshape(B, MAX_SRC, K)
+        ref_ships_all = ref_out_full.ships_logits  # [B, MAX_SRC, K, B_ships]
+    else:
+        ref_tgt_all   = None
+        ref_ships_all = None
+
+    # Pre-split one key per epoch so the scan carries only the TrainState.
+    key, *epoch_keys = jax.random.split(key, epochs + 1)
+    epoch_keys = jnp.stack(epoch_keys)   # [epochs, 2]
+
+    # ── Inner scan body: one minibatch gradient step ──────────────────────────
+    def mb_step(state: TrainState, idx: jax.Array) -> tuple[TrainState, jax.Array]:
+        """idx: [mb] int32 — row indices into the full batch."""
+        sv_mb = sv[idx]
+
+        def _fwd(params):
+            gf_exp = jnp.broadcast_to(gf[idx][:, None, :], (mb, MAX_SRC, GLOB_DIM))
+            return jax.vmap(
+                lambda sf_i, cf_i, gf_i, cm_i, sv_i: state.apply_fn(
+                    params, sf_i, cf_i, gf_i, cm_i, sv_i
+                )
+            )(sf[idx], cf[idx], gf_exp, cm[idx], sv_mb)
+
+        def loss_fn(params):
+            outputs  = _fwd(params)
+            B_ships  = outputs.ships_logits.shape[-1]
+            flat_out = PolicyOutput(
+                target_logits = outputs.target_logits.reshape(mb * MAX_SRC, K),
+                ships_logits  = outputs.ships_logits.reshape(mb * MAX_SRC, K, B_ships),
+                value         = outputs.value.reshape(-1),
+            )
+            new_lp_f, ent_f = action_log_prob_and_entropy(
+                flat_out, ti[idx].reshape(-1), sb[idx].reshape(-1)
+            )
+            new_lp  = new_lp_f.reshape(mb, MAX_SRC)
+            ent     = ent_f.reshape(mb, MAX_SRC)
+            valid_m = sv_mb.astype(jnp.float32)
+            n_v     = valid_m.sum() + 1e-8
+
+            ratio = jnp.exp(new_lp - old_lp[idx])
+            pg = (jnp.maximum(
+                -adv[idx] * ratio,
+                -adv[idx] * jnp.clip(ratio, 1.0 - cc, 1.0 + cc),
+            ) * valid_m).sum() / n_v
+            vl = 0.5 * ((ret[idx][:, None] - outputs.value) ** 2 * valid_m).sum() / n_v
+            em = (ent * valid_m).sum() / n_v
+
+            if use_kl:
+                ref_tgt   = ref_tgt_all[idx].reshape(mb * MAX_SRC, K)
+                new_tgt   = _safe_target_logits(flat_out.target_logits)
+                kl_tgt    = (_categorical_kl(ref_tgt, new_tgt).reshape(mb, MAX_SRC) * valid_m).sum() / n_v
+                ref_ships = ref_ships_all[idx].reshape(mb * MAX_SRC, K, B_ships)
+                kl_ships  = (
+                    _categorical_kl(ref_ships, flat_out.ships_logits)
+                    .reshape(mb, MAX_SRC, K).mean(axis=-1) * valid_m
+                ).sum() / n_v
+                kl = 0.5 * (kl_tgt + kl_ships)
+            else:
+                kl = jnp.float32(0.0)
+
+            loss = pg + vc * vl - ec * em + kc * kl
+            return loss, (pg, vl, em, kl, ratio, new_lp)
+
+        (loss, (pg, vl, em, kl, ratio, new_lp)), grads = jax.value_and_grad(
+            loss_fn, has_aux=True
+        )(state.params)
+        state = state.apply_gradients(grads=grads)
+
+        valid_m = sv_mb.astype(jnp.float32)
+        n_vm    = valid_m.sum() + 1e-8
+        cf_mb   = ((jnp.abs(ratio - 1.0) > cc) * valid_m).sum() / n_vm
+        kd_mb   = ((old_lp[idx] - new_lp) * valid_m).sum() / n_vm
+        return state, jnp.stack([loss, pg, vl, em, kl, cf_mb, kd_mb])
+
+    # ── Outer scan body: one epoch ────────────────────────────────────────────
+    def epoch_step(state: TrainState, epoch_key: jax.Array) -> tuple[TrainState, jax.Array]:
+        perm = jax.random.permutation(epoch_key, B)[: n_mb * mb].reshape(n_mb, mb)
+        state, mb_metrics = jax.lax.scan(mb_step, state, perm)
+        return state, mb_metrics   # mb_metrics: [n_mb, 7]
+
+    state, all_metrics = jax.lax.scan(epoch_step, state, epoch_keys)
+    # all_metrics: [epochs, n_mb, 7]
+    m = all_metrics.mean(axis=(0, 1))   # [7]
+
+    # Pack ev_jax as 8th element so the caller can sync everything in one np.asarray call.
+    return state, jnp.append(m, ev_jax), key
+
 
 def ppo_update(
     state: TrainState,
@@ -192,68 +300,25 @@ def ppo_update(
             "kl_ref": 0.0, "explained_variance": 0.0,
         }, key
 
-    sf      = batch.self_features
-    cf      = batch.candidate_features
-    gf      = batch.global_features
-    cm      = batch.candidate_mask
-    old_lp  = batch.log_prob
-    ti      = batch.target_index
-    sb      = batch.ships_bucket
-    ret     = batch.returns
-    adv_raw = batch.advantages
+    use_kl      = ref_params is not None and kl_coef > 0.0
+    _ref_params = ref_params if use_kl else state.params
 
-    ev_jax = 1.0 - adv_raw.var() / (ret.var() + 1e-8)
-    adv = (adv_raw - adv_raw.mean()) / (adv_raw.std() + 1e-8)
+    state, m, key = _ppo_update_jit(
+        state, batch,
+        clip_coef=clip_coef, ent_coef=ent_coef, vf_coef=vf_coef,
+        epochs=epochs, minibatch_size=minibatch_size,
+        key=key, ref_params=_ref_params, kl_coef=kl_coef, use_kl=use_kl,
+    )
 
-    size = sf.shape[0]
-    mb   = min(size, max(1, minibatch_size))
-
-    cc = jnp.float32(clip_coef)
-    ec = jnp.float32(ent_coef)
-    vc = jnp.float32(vf_coef)
-    # When ref_params is None, pass current params as a dummy and zero the coefficient
-    # so the KL term drops out without any Python control flow inside the JIT.
-    _ref_params = ref_params if ref_params is not None else state.params
-    kc = jnp.float32(kl_coef if ref_params is not None else 0.0)
-
-    acc_loss = jnp.float32(0.0)
-    acc_pg   = jnp.float32(0.0)
-    acc_vl   = jnp.float32(0.0)
-    acc_em   = jnp.float32(0.0)
-    acc_kl   = jnp.float32(0.0)
-    acc_cf   = jnp.float32(0.0)
-    acc_kd   = jnp.float32(0.0)
-    n_updates = 0
-
-    for _ in range(epochs):
-        key, subkey = jax.random.split(key)
-        order = jax.random.permutation(subkey, size)
-        for start in range(0, size, mb):
-            idx = order[start : start + mb]
-            state, loss, pg, vl, em, kl, ratio, new_lp = _minibatch_update(
-                state,
-                sf[idx], cf[idx], gf[idx], cm[idx],
-                old_lp[idx], ti[idx], sb[idx], ret[idx], adv[idx],
-                cc, ec, vc, _ref_params, kc,
-            )
-            acc_loss = acc_loss + loss
-            acc_pg   = acc_pg + pg
-            acc_vl   = acc_vl + vl
-            acc_em   = acc_em + em
-            acc_kl   = acc_kl + kl
-            acc_cf   = acc_cf + (jnp.abs(ratio - 1.0) > clip_coef).mean()
-            acc_kd   = acc_kd + (old_lp[idx] - new_lp).mean()
-            n_updates += 1
-
-    n = max(n_updates, 1)
-    metrics = {
-        "loss":               float(acc_loss / n),
-        "policy_loss":        float(acc_pg / n),
-        "value_loss":         float(acc_vl / n),
-        "entropy":            float(acc_em / n),
-        "kl_ref":             float(acc_kl / n),
-        "clip_fraction":      float(acc_cf / n),
-        "kl_divergence":      float(acc_kd / n),
-        "explained_variance": float(ev_jax),
-    }
-    return state, metrics, key
+    # Single device→host transfer for all 8 metric values.
+    m_np = np.asarray(m)
+    return state, {
+        "loss":               float(m_np[0]),
+        "policy_loss":        float(m_np[1]),
+        "value_loss":         float(m_np[2]),
+        "entropy":            float(m_np[3]),
+        "kl_ref":             float(m_np[4]),
+        "clip_fraction":      float(m_np[5]),
+        "kl_divergence":      float(m_np[6]),
+        "explained_variance": float(m_np[7]),
+    }, key

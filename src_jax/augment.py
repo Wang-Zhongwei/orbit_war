@@ -42,6 +42,26 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 
+# ---------------------------------------------------------------------------
+# D4 lookup tables for dynamic (JIT-compatible) per-env augmentation
+# ---------------------------------------------------------------------------
+
+# Rotation/reflection matrices for centered coords (cx, cy) = (x-0.5, y-0.5)
+# Shape [8, 2, 2]: _D4_MATS[aug_id] @ [cx, cy]^T = [cx', cy']^T
+_D4_MATS = jnp.array([
+    [[ 1,  0], [ 0,  1]],  # 0 — identity
+    [[ 0, -1], [ 1,  0]],  # 1 — rotate 90° CCW
+    [[-1,  0], [ 0, -1]],  # 2 — rotate 180°
+    [[ 0,  1], [-1,  0]],  # 3 — rotate 270° CCW
+    [[-1,  0], [ 0,  1]],  # 4 — flip-X
+    [[ 1,  0], [ 0, -1]],  # 5 — flip-Y
+    [[ 0,  1], [ 1,  0]],  # 6 — flip diagonal
+    [[ 0, -1], [-1,  0]],  # 7 — flip anti-diagonal
+], dtype=jnp.float32)  # [8, 2, 2]
+
+# Reflections (aug_id >= 4) reverse orbital handedness → negate angular_velocity
+_D4_OMEGA_SIGN = jnp.array([1, 1, 1, 1, -1, -1, -1, -1], dtype=jnp.float32)  # [8]
+
 
 # ---------------------------------------------------------------------------
 # Primitive coordinate / vector transforms
@@ -205,3 +225,37 @@ def expand_with_augmentations(
         return sf_out, cf_out, gf_out, cm_out, ti_out, sb_out, ff_out, fm_out
 
     return sf_out, cf_out, gf_out, cm_out, ti_out, sb_out
+
+
+# ---------------------------------------------------------------------------
+# Per-env dynamic augmentation (JIT-compatible — no Python if/elif on aug_id)
+# ---------------------------------------------------------------------------
+
+def apply_augmentation_batched(
+    sf: jnp.ndarray,       # [N, MAX_SRC, SELF_DIM]
+    cf: jnp.ndarray,       # [N, MAX_SRC, K, CAND_DIM]
+    gf: jnp.ndarray,       # [N, GLOB_DIM]
+    aug_ids: jnp.ndarray,  # [N] int32, values 0–7
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Apply independent D4 transforms to each env in a batch.
+
+    Implements the same transforms as apply_augmentation but fully vectorised
+    via matrix lookups — no Python branching, safe inside jax.lax.scan / @jax.jit.
+    """
+    mats        = _D4_MATS[aug_ids]       # [N, 2, 2]
+    omega_signs = _D4_OMEGA_SIGN[aug_ids] # [N]
+
+    # self_feats: absolute position dims [1, 2] — [N, MAX_SRC, SELF_DIM]
+    xy   = sf[..., 1:3] - 0.5                              # [N, MAX_SRC, 2]
+    xy_t = jnp.einsum('nij,nsj->nsi', mats, xy) + 0.5     # [N, MAX_SRC, 2]
+    sf   = sf.at[..., 1:3].set(xy_t)
+
+    # cand_feats: delta vector dims [4, 5] — [N, MAX_SRC, K, CAND_DIM]
+    dxy   = cf[..., 4:6]                                    # [N, MAX_SRC, K, 2]
+    dxy_t = jnp.einsum('nij,nskj->nski', mats, dxy)        # [N, MAX_SRC, K, 2]
+    cf    = cf.at[..., 4:6].set(dxy_t)
+
+    # global_feat: angular_velocity dim [11] — negate for reflections
+    gf = gf.at[:, 11].mul(omega_signs)
+
+    return sf, cf, gf

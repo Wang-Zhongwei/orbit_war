@@ -26,6 +26,7 @@ from .features import (
     MIN_SOURCE_SHIPS, _make_env_encoder, aim_fleets,
     self_feature_dim, candidate_feature_dim, global_feature_dim,
 )
+from .augment import apply_augmentation_batched
 from .ppo import TrainingBatch, sample_actions
 from .env import select_boards
 from .heuristic import heuristic_actions
@@ -144,6 +145,7 @@ def make_rollout_fn(
     rollout_steps: int,
     n_opponents: int = 1,
     heuristic_opp_mask: tuple[bool, ...] = (),
+    augment: bool = False,
 ):
     """
     Build and return a JIT-compiled rollout collector.
@@ -278,6 +280,13 @@ def make_rollout_fn(
 
         # Encode and run learner policy
         l_enc = encode_batch(state, learner_players)
+        if augment:
+            key, aug_key = jax.random.split(key)
+            aug_ids = jax.random.randint(aug_key, (N_ENVS,), 0, 8)
+            sf_aug, cf_aug, gf_aug = apply_augmentation_batched(
+                l_enc.self_feats, l_enc.cand_feats, l_enc.global_feat, aug_ids,
+            )
+            l_enc = l_enc._replace(self_feats=sf_aug, cand_feats=cf_aug, global_feat=gf_aug)
         ti, sb, lp, val, key = _run_policy(params, l_enc, key, deterministic=False)
         l_acts = _enc_to_actions(l_enc, state, ti, sb)
 
@@ -388,18 +397,42 @@ def compute_bootstrap_val(
 
 @jax.jit
 def compute_returns(
-    reward: jnp.ndarray,  # [T, N]
-    done: jnp.ndarray,    # [T, N] bool
-    boot_val: jnp.ndarray,  # [N]
+    reward: jnp.ndarray,    # [T, N]
+    done: jnp.ndarray,      # [T, N] bool
+    values: jnp.ndarray,    # [T, N, MAX_SRC] per-source critic values
+    src_valid: jnp.ndarray, # [T, N, MAX_SRC] bool
+    boot_val: jnp.ndarray,  # [N] env-level bootstrap value
     gamma: float,
+    gae_lambda: float,
 ) -> jnp.ndarray:
-    """Return step-level returns [T, N] via reverse discount scan."""
-    def scan_fn(future_ret, step):
-        r, d = step
-        new_fut = r + gamma * future_ret * (1.0 - d.astype(jnp.float32))
-        return new_fut, new_fut
+    """Step-level λ-returns [T, N] via reverse GAE scan.
 
-    _, rets = jax.lax.scan(scan_fn, boot_val, (reward, done), reverse=True)
+    Computes the TD(λ) / GAE return target
+        R_t^λ = r_t + γ·[(1−λ)·V_{t+1} + λ·R_{t+1}^λ]·(1−done_t)
+    so the value-function target blends the (low-variance) one-step bootstrap
+    with the (low-bias) Monte-Carlo return. λ=1 recovers the pure Monte-Carlo
+    return (the previous behaviour); λ<1 leans on the critic to cut variance,
+    which matters most with short rollout horizons where the full return is
+    truncated early. The per-source advantage downstream stays R_t − V_source,
+    so this is a drop-in change to the return target only.
+
+    V_t is the env-level critic value = mean over valid source planets (same
+    aggregation as ``boot_val`` in ``compute_bootstrap_val``).
+    """
+    valid = src_valid.astype(jnp.float32)
+    count = jnp.maximum(valid.sum(axis=-1), 1.0)
+    v_env = (values * valid).sum(axis=-1) / count   # [T, N]
+
+    def scan_fn(carry, step):
+        next_v, next_ret = carry            # V_{t+1}, R_{t+1}^λ
+        r, d, v_t = step
+        nonterminal = 1.0 - d.astype(jnp.float32)
+        blended = (1.0 - gae_lambda) * next_v + gae_lambda * next_ret
+        new_ret = r + gamma * blended * nonterminal
+        return (v_t, new_ret), new_ret
+
+    init = (boot_val, boot_val)
+    _, rets = jax.lax.scan(scan_fn, init, (reward, done, v_env), reverse=True)
     return rets  # [T, N]
 
 
@@ -409,53 +442,43 @@ def compute_returns(
 
 def build_training_batch(steps: RolloutStep, step_returns: jnp.ndarray) -> TrainingBatch:
     """
-    Filter padded rows and pack into TrainingBatch.
+    Pack rollout steps into a TrainingBatch, preserving per-env grouping.
 
-    steps.* : [T, N, MAX_SRC, ...] (or [T, N] for scalars)
-    step_returns : [T, N]  (from compute_returns)
+    Keeping [B, MAX_SRC, ...] structure (B = T*N) ensures the cross-source
+    attention in _minibatch_update operates within each env's planets rather
+    than across unrelated decisions from different environments.
+
+    steps.* : [T, N, MAX_SRC, ...] (or [T, N] for env-level fields)
+    step_returns : [T, N]
     """
     T, N = step_returns.shape
+    B    = T * N
 
-    sf_all    = steps.self_features      # [T, N, MAX_SRC, SELF_DIM]
-    cf_all    = steps.candidate_features # [T, N, MAX_SRC, K, CAND_DIM]
-    gf_env    = steps.global_features   # [T, N, GLOB_DIM]
-    cm_all    = steps.candidate_masks   # [T, N, MAX_SRC, K]
-    ti_all    = steps.target_indices    # [T, N, MAX_SRC]
-    sb_all    = steps.ships_buckets
-    lp_all    = steps.log_probs
-    val_all   = steps.values
-    valid_all = steps.src_valid   # [T, N, MAX_SRC] bool
-    rets_all  = step_returns      # [T, N]
+    def _r(x):
+        return x.reshape(B, *x.shape[2:])
 
-    # Filter indices: (t, n, s) where src_valid
-    valid_flat = valid_all.reshape(-1)
-    idx = jnp.where(valid_flat)[0]
-
-    sf_f  = sf_all.reshape(-1, sf_all.shape[-1])[idx]
-    cf_f  = cf_all.reshape(-1, cf_all.shape[-2], cf_all.shape[-1])[idx]
-    cm_f  = cm_all.reshape(-1, cm_all.shape[-1])[idx]
-    ti_f  = ti_all.reshape(-1)[idx]
-    sb_f  = sb_all.reshape(-1)[idx]
-    lp_f  = lp_all.reshape(-1)[idx]
-    val_f = val_all.reshape(-1)[idx]
-
-    # For each valid (t, n, s): global feats and return are env-level (per t, n).
-    # tn_idx maps flat decision index → flat (t*N + n) index.
-    tn_idx = idx // sf_all.shape[2]              # [N_valid] in [0, T*N)
-    gf_f   = gf_env.reshape(T * N, -1)[tn_idx]  # [N_valid, GLOB_DIM]
-    ret_f  = rets_all.reshape(-1)[tn_idx]        # [N_valid]
-    adv_f  = ret_f - val_f
+    sf  = _r(steps.self_features)       # [B, MAX_SRC, self_dim]
+    cf  = _r(steps.candidate_features)  # [B, MAX_SRC, K, cand_dim]
+    gf  = _r(steps.global_features)     # [B, glob_dim]
+    cm  = _r(steps.candidate_masks)     # [B, MAX_SRC, K]
+    ti  = _r(steps.target_indices)      # [B, MAX_SRC]
+    sb  = _r(steps.ships_buckets)       # [B, MAX_SRC]
+    lp  = _r(steps.log_probs)           # [B, MAX_SRC]
+    val = _r(steps.values)              # [B, MAX_SRC]
+    sv  = _r(steps.src_valid)           # [B, MAX_SRC]
+    ret = step_returns.reshape(B)       # [B]
 
     return TrainingBatch(
-        self_features      = sf_f,
-        candidate_features = cf_f,
-        global_features    = gf_f,
-        candidate_mask     = cm_f,
-        target_index       = ti_f.astype(jnp.int32),
-        ships_bucket       = sb_f.astype(jnp.int32),
-        log_prob           = lp_f,
-        returns            = ret_f,
-        advantages         = adv_f,
+        self_features      = sf,
+        candidate_features = cf,
+        global_features    = gf,
+        candidate_mask     = cm,
+        target_index       = ti.astype(jnp.int32),
+        ships_bucket       = sb.astype(jnp.int32),
+        log_prob           = lp,
+        returns            = ret,
+        advantages         = ret[:, None] - val,  # [B, MAX_SRC]
+        src_valid          = sv,
     )
 
 
