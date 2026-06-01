@@ -28,7 +28,7 @@ _EVAL_BASE_SEED = 1000
 
 def run_eval(params, cfg, base_seed: int = _EVAL_BASE_SEED) -> dict[str, float]:
     # Matches are fanned out across CPU worker processes (see eval_mp); the
-    # trainer keeps the GPU to itself.
+    # trainer keeps the accelerator (GPU/TPU) to itself.
     from .eval_mp import run_eval_mp
 
     return run_eval_mp(params, cfg, base_seed, workers=cfg.eval_workers)
@@ -63,6 +63,9 @@ def save_checkpoint(save_dir: Path, run_name: str, update: int, train_state: Tra
 
 
 def main() -> None:
+    from .accel import setup_accelerator
+    setup_accelerator()  # CPU / GPU / TPU — pins matmul precision for backend parity
+
     args  = parse_args()
     cfg   = load_train_config(args.config)
     N     = cfg.ppo.num_envs if cfg.ppo.num_envs > 0 else 10
@@ -70,6 +73,9 @@ def main() -> None:
     K     = cfg.env.candidate_count
     use_wandb = not args.no_wandb
     run_name = args.run_name or cfg.run_name
+    # CLI flags take precedence over yaml config for resume / KL reference.
+    resume = args.resume or cfg.resume
+    ref_policy = args.ref_policy or cfg.ref_policy
     if args.total_updates:
         cfg.ppo.total_updates = args.total_updates
     if args.augment:
@@ -106,24 +112,32 @@ def main() -> None:
 
     start_update = 1
     ref_params = None
-    if args.resume:
-        with open(args.resume, "rb") as f:
+    if resume:
+        with open(resume, "rb") as f:
             ckpt = pickle.load(f)
         restored = {"params": jax.tree_util.tree_map(jnp.asarray, ckpt["params"])}
         if "opt_state" in ckpt:
-            restored["opt_state"] = jax.tree_util.tree_map(jnp.asarray, ckpt["opt_state"])
+            restored_opt = jax.tree_util.tree_map(jnp.asarray, ckpt["opt_state"])
+            # Only reuse the saved optimizer state if it matches the current
+            # optimizer; the structure changes when e.g. weight_decay turns
+            # Adam into AdamW. Otherwise keep params but start the optimizer fresh.
+            if jax.tree_util.tree_structure(restored_opt) == jax.tree_util.tree_structure(train_state.opt_state):
+                restored["opt_state"] = restored_opt
+            else:
+                print("  optimizer structure changed since checkpoint "
+                      "(e.g. weight_decay / Adam→AdamW); reinitializing optimizer state.")
         train_state = train_state.replace(**restored)
         start_update = ckpt["update"] + 1
-        print(f"Resumed from {args.resume} (update {ckpt['update']})")
-        if cfg.ppo.kl_coef > 0 and args.ref_policy is None:
+        print(f"Resumed from {resume} (update {ckpt['update']})")
+        if cfg.ppo.kl_coef > 0 and ref_policy is None:
             ref_params = restored["params"]
             print(f"KL reference: resume checkpoint (kl_coef={cfg.ppo.kl_coef})")
 
-    if args.ref_policy:
-        with open(args.ref_policy, "rb") as f:
+    if ref_policy:
+        with open(ref_policy, "rb") as f:
             ref_ckpt = pickle.load(f)
         ref_params = jax.tree_util.tree_map(jnp.asarray, ref_ckpt["params"])
-        print(f"KL reference: {args.ref_policy} (kl_coef={cfg.ppo.kl_coef})")
+        print(f"KL reference: {ref_policy} (kl_coef={cfg.ppo.kl_coef})")
 
     # Build opponent pool — "self", "heuristic", or "ckpt:PATH".
     # Heuristic slots store dummy params (learner params) that are never used;

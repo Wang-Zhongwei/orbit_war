@@ -571,7 +571,7 @@ _worker_ship_bucket_count: int = 0
 def _worker_init(encode_fn_factory, factory_args, ship_bucket_count: int) -> None:
     """Called once per worker process. Builds encode_fn locally (avoids pickling JAX fn)."""
     import os
-    os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
     global _worker_encode_fn, _worker_ship_bucket_count
     _worker_encode_fn = encode_fn_factory(*factory_args)
     _worker_ship_bucket_count = ship_bucket_count

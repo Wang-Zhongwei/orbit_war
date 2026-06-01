@@ -27,7 +27,7 @@ from .physics import (
 )
 from .constants import CENTER, ROTATION_RADIUS_LIMIT, SUN_RADIUS
 
-MIN_SOURCE_SHIPS: int = 1
+MIN_SOURCE_SHIPS: int = 10
 _MAX_TICKS: int = 25
 _T_INBOUND: int = 25  # tick horizon for inbound fleet simulation
 _BUFFER_TICKS: int = 3 # buffer ticks for will_be_mine calculation is target is enemy

@@ -18,22 +18,23 @@ eval_workers: -1  # CPU processes for eval matches; -1 = all cores
 
 env:
   candidate_count: 8
-  ship_bucket_count: 8
+  ship_bucket_count: 4
 
 model:
   hidden_size: 128
 
 ppo:
   rollout_steps: 64
-  num_envs: 512
-  total_updates: 1000
+  num_envs: 1024
+  total_updates: 200
   epochs: 4
-  minibatch_size: 512
+  minibatch_size: 2048
   gamma: 0.99
   gae_lambda: 1.00
   clip_coef: 0.2
   ent_coef: 0.01
   vf_coef: 0.5
   lr: 0.0003
+  weight_decay: 0.0
   max_grad_norm: 0.5
   augment: false

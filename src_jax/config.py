@@ -71,6 +71,7 @@ class PPOConfig:
     vf_coef: float = 0.5
     kl_coef: float = 0.0
     lr: float = 3e-4
+    weight_decay: float = 0.0  # AdamW decoupled weight decay; 0.0 = plain Adam
     max_grad_norm: float = 0.5
     augment: bool = False
 
@@ -100,6 +101,8 @@ class TrainConfig:
     save_dir: str = "artifacts/ppo"
     checkpoint_every: int = 50
     log_every: int = 1
+    resume: str | None = None       # checkpoint path to resume training from (CLI --resume overrides)
+    ref_policy: str | None = None   # frozen KL reference checkpoint (CLI --ref_policy overrides)
     opponents: list[str] = field(default_factory=lambda: ["self"])
     eval_opponents: list[str] = field(default_factory=list)
     self_play_update_interval: int = 50

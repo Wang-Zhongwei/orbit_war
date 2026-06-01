@@ -23,9 +23,11 @@ class TrainState(train_state.TrainState):
 def build_train_state(cfg, seed: int = 0) -> TrainState:
     module = build_policy(cfg)
     params = init_params(module, seed)
+    wd = cfg.ppo.weight_decay
+    opt = optax.adamw(cfg.ppo.lr, weight_decay=wd) if wd > 0.0 else optax.adam(cfg.ppo.lr)
     tx = optax.chain(
         optax.clip_by_global_norm(cfg.ppo.max_grad_norm),
-        optax.adam(cfg.ppo.lr),
+        opt,
     )
     return TrainState.create(apply_fn=module.apply, params=params, tx=tx)
 

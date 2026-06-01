@@ -558,6 +558,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    from .accel import setup_accelerator
+    setup_accelerator()  # CPU / GPU / TPU — pins matmul precision for backend parity
+
     args = parse_args()
 
     cfg = load_train_config(args.config) if args.config is not None else TrainConfig()

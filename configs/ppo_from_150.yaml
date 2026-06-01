@@ -1,0 +1,41 @@
+
+seed: 42
+run_name: resume_from_150
+device: auto
+save_dir: ./artifacts/ppo
+checkpoint_every: 50
+log_every: 1
+opponents: 
+  - self
+  - heuristic
+self_play_update_interval: 50
+self_play_deterministic: false
+alternate_player_sides: true
+eval_opponents: 
+  - never_miss
+  - stateful
+eval_rounds: 10
+eval_update_interval: 50
+eval_workers: -1  # CPU processes for eval matches; -1 = all cores
+
+env:
+  candidate_count: 8
+  ship_bucket_count: 4
+
+model:
+  hidden_size: 128
+
+ppo:
+  rollout_steps: 64
+  num_envs: 1024
+  total_updates: 350
+  epochs: 4
+  minibatch_size: 2048
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  ent_coef: 0.03
+  vf_coef: 0.5
+  lr: 0.0001
+  max_grad_norm: 0.5
+  augment: false
