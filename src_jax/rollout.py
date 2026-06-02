@@ -173,6 +173,9 @@ def make_rollout_fn(
     episode_steps      = cfg.env.episode_steps
     alternate_sides    = cfg.alternate_player_sides
     opp_deterministic  = cfg.self_play_deterministic
+    fleet_penalty      = jnp.float32(cfg.ppo.fleet_penalty)
+    capture_bonus      = jnp.float32(cfg.ppo.capture_bonus)
+    capture_time_weight = jnp.float32(cfg.ppo.capture_time_weight)
 
     if not heuristic_opp_mask:
         heuristic_opp_mask = (False,) * n_opponents
@@ -322,6 +325,25 @@ def make_rollout_fn(
 
         # Reward / done
         done, reward = _reward_and_done(learner_players, statuses, rewards)
+
+        # Reward shaping (skipped when both coefficients are 0)
+        def _shape_one(prev_s, next_s, lp, acts):
+            # Fleet dispatch penalty: count non-no-op actions (planet_id >= 0)
+            n_dispatches = (acts[:, 0] >= 0).astype(jnp.float32).sum()
+            penalty = -fleet_penalty * n_dispatches
+
+            # Capture bonus: planets that flipped to mine this tick
+            was_not_mine = (prev_s.p_owner != lp) & prev_s.p_alive
+            now_mine     = (next_s.p_owner == lp)
+            n_captures   = (was_not_mine & now_mine).astype(jnp.float32).sum()
+            t_frac       = prev_s.step.astype(jnp.float32) / jnp.float32(episode_steps)
+            time_mult    = jnp.float32(1.0) + capture_time_weight * (jnp.float32(1.0) - t_frac)
+            bonus = capture_bonus * n_captures * time_mult
+
+            return penalty + bonus
+
+        shaping = jax.vmap(_shape_one)(state, new_state, learner_players, l_acts)
+        reward  = reward + jnp.where(done, jnp.zeros_like(shaping), shaping)
 
         # Episode tracking
         ep_reward = ep_reward + reward

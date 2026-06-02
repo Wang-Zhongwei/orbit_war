@@ -74,6 +74,9 @@ class PPOConfig:
     weight_decay: float = 0.0  # AdamW decoupled weight decay; 0.0 = plain Adam
     max_grad_norm: float = 0.5
     augment: bool = False
+    fleet_penalty:        float = 0.0    # per-fleet dispatch penalty (0 = disabled)
+    capture_bonus:        float = 0.0    # per-planet capture bonus (0 = disabled)
+    capture_time_weight:  float = 0.5    # extra bonus fraction awarded for early captures
 
     def __setstate__(self, state) -> None: _setstate(self, state)
 

@@ -12,7 +12,7 @@ alternate_player_sides: true
 eval_opponents: 
   - never_miss
   - stateful
-eval_rounds: 10
+eval_rounds: 20
 eval_update_interval: 50
 eval_workers: -1  # CPU processes for eval matches; -1 = all cores
 
@@ -37,3 +37,6 @@ ppo:
   lr: 0.0001
   max_grad_norm: 0.5
   augment: true
+  fleet_penalty: 0.0003
+  capture_bonus: 0.01
+  capture_time_weight: 0.5
