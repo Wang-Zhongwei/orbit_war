@@ -156,10 +156,8 @@ def generate_comet_paths(
         op_r_arr = np.array([p[4] for p in orbiting_planets], dtype=np.float64)
         dx_init = op_x0 - CENTER
         dy_init = op_y0 - CENTER
-        op_orb_r = np.hypot(dx_init, dy_init)
-        op_init_angle = np.arctan2(dy_init, dx_init)
     else:
-        op_r_arr = op_orb_r = op_init_angle = None
+        op_r_arr = dx_init = dy_init = None
 
     if static_planets:
         sp_x = np.array([p[2] for p in static_planets], dtype=np.float64)
@@ -240,12 +238,14 @@ def generate_comet_paths(
                 valid = False
 
         # Orbiting planet collision (vectorized, planet position varies per step)
-        if valid and op_orb_r is not None:
+        if valid and dx_init is not None:
             V = len(visible)
             game_steps = (spawn_step - 1) + np.arange(V, dtype=np.float64)  # [V]
-            cur_angles = op_init_angle[None, :] + angular_velocity * game_steps[:, None]  # [V, Q]
-            px = CENTER + op_orb_r[None, :] * np.cos(cur_angles)  # [V, Q]
-            py = CENTER + op_orb_r[None, :] * np.sin(cur_angles)
+            angles = angular_velocity * game_steps[:, None]  # [V, 1]
+            c = np.cos(angles)
+            s = np.sin(angles)
+            px = CENTER + c * dx_init[None, :] - s * dy_init[None, :]  # [V, Q]
+            py = CENTER + s * dx_init[None, :] + c * dy_init[None, :]
             dx = sym0[:, :, None] - px[:, None, :]  # [V, 4, Q]
             dy = sym1[:, :, None] - py[:, None, :]
             if np.any(np.hypot(dx, dy) < (op_r_arr[None, None, :] + COMET_RADIUS)):

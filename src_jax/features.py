@@ -91,35 +91,51 @@ def _find_angle_single(
     spd = _fleet_speed(ships)
 
     # --- Rotating target: binary-search intercept via fixed scan ---
-    # Use current position for init_ang so ang_t = init_ang + av*t predicts
-    # where the planet will be t ticks from NOW, not t ticks from game start.
+    # Carry the current orbit basis through the scan so the loop pays one
+    # sin/cos pair for the fixed angular-velocity step instead of per tick.
     dx0 = tgt_x - CENTER
     dy0 = tgt_y - CENTER
     orb_r = jnp.sqrt(dx0 * dx0 + dy0 * dy0)
     rotating = orb_r + tgt_radius < ROTATION_RADIUS_LIMIT
-    init_ang = jnp.arctan2(dy0, dx0)
+    inv_orb_r = jnp.reciprocal(jnp.maximum(orb_r, jnp.float32(1e-6)))
+    c_now = dx0 * inv_orb_r
+    s_now = dy0 * inv_orb_r
+    c_step = jnp.cos(angular_velocity)
+    s_step = jnp.sin(angular_velocity)
+    c_tick1 = c_step * c_now - s_step * s_now
+    s_tick1 = s_step * c_now + c_step * s_now
 
     def scan_body(carry, tick):
-        best_angle, best_tx, best_ty, found = carry
+        best_angle, best_tx, best_ty, found, c_t, s_t = carry
         t = tick.astype(jnp.float32)
-        ang_t = init_ang + angular_velocity * t
-        tx = CENTER + orb_r * jnp.cos(ang_t)
-        ty = CENTER + orb_r * jnp.sin(ang_t)
+        tx = CENTER + orb_r * c_t
+        ty = CENTER + orb_r * s_t
         dx = tx - src_x
         dy = ty - src_y
         gap = spd * t - (jnp.sqrt(dx * dx + dy * dy) - src_radius)
         valid = (~found) & (jnp.abs(gap) < tgt_radius)
         angle_t = jnp.arctan2(dy, dx)
+        next_c_t = c_step * c_t - s_step * s_t
+        next_s_t = s_step * c_t + c_step * s_t
         return (
             jnp.where(valid, angle_t, best_angle),
             jnp.where(valid, tx, best_tx),
             jnp.where(valid, ty, best_ty),
             found | valid,
+            next_c_t,
+            next_s_t,
         ), None
 
-    (rot_angle, rot_tx, rot_ty, rot_found), _ = jax.lax.scan(
+    (rot_angle, rot_tx, rot_ty, rot_found, _, _), _ = jax.lax.scan(
         scan_body,
-        (jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0), jnp.bool_(False)),
+        (
+            jnp.float32(0.0),
+            jnp.float32(0.0),
+            jnp.float32(0.0),
+            jnp.bool_(False),
+            c_tick1,
+            s_tick1,
+        ),
         jnp.arange(1, _MAX_TICKS + 1, dtype=jnp.int32),
     )
 
@@ -469,15 +485,16 @@ def _make_env_encoder(K: int, env_cfg):
         # garrison == 0 so a battle-draw planet still produces for its last owner.
         _prev_owner_init = state.p_owner.astype(jnp.int32)
 
+        tick_rot_c = jnp.cos(state.angular_velocity)
+        tick_rot_s = jnp.sin(state.angular_velocity)
+
         def _sim_tick(carry, t):
-            acc, acc_5, acc_10, acc_15, garrison, owner, prev_owner, owner_5, owner_10, owner_15 = carry
+            acc, acc_5, acc_10, acc_15, garrison, owner, prev_owner, owner_5, owner_10, owner_15, c_t, s_t = carry
             t_f  = t.astype(jnp.float32)
             fx_t = state.f_x + t_f * f_vx_1d                              # [MAX_FLEETS]
             fy_t = state.f_y + t_f * f_vy_1d
-            ang  = state.angular_velocity * t_f
-            c, s = jnp.cos(ang), jnp.sin(ang)
-            px_t = CENTER + jnp.where(all_rotating, c * all_orb_dx - s * all_orb_dy, all_orb_dx)
-            py_t = CENTER + jnp.where(all_rotating, s * all_orb_dx + c * all_orb_dy, all_orb_dy)
+            px_t = CENTER + jnp.where(all_rotating, c_t * all_orb_dx - s_t * all_orb_dy, all_orb_dx)
+            py_t = CENTER + jnp.where(all_rotating, s_t * all_orb_dx + c_t * all_orb_dy, all_orb_dy)
             dx   = px_t[:, None] - fx_t[None, :]                          # [MAX_PLANETS, MAX_FLEETS]
             dy   = py_t[:, None] - fy_t[None, :]
             already_landed = jnp.any(acc, axis=0)                              # [MAX_FLEETS]
@@ -514,6 +531,8 @@ def _make_env_encoder(K: int, env_cfg):
             garrison = jnp.abs(garrison)
             owner    = jnp.where(flipped, top_idx, owner)
             prev_owner = jnp.where(garrison > 0, owner, prev_owner)
+            next_c_t = tick_rot_c * c_t - tick_rot_s * s_t
+            next_s_t = tick_rot_s * c_t + tick_rot_c * s_t
             return (
                 new_acc,
                 jnp.where(t <= 5,  new_acc, acc_5),
@@ -525,12 +544,27 @@ def _make_env_encoder(K: int, env_cfg):
                 jnp.where(t == 5,  owner, owner_5),
                 jnp.where(t == 10, owner, owner_10),
                 jnp.where(t == 15, owner, owner_15),
+                next_c_t,
+                next_s_t,
             ), None
 
         _zeros_pf = jnp.zeros((MAX_PLANETS, MAX_FLEETS), dtype=jnp.bool_)
-        (inbound_all, inbound_5_all, inbound_10_all, inbound_15_all, _, owner_final, _, owner_5_all, owner_10_all, owner_15_all), _ = jax.lax.scan(
+        (inbound_all, inbound_5_all, inbound_10_all, inbound_15_all, _, owner_final, _, owner_5_all, owner_10_all, owner_15_all, _, _), _ = jax.lax.scan(
             _sim_tick,
-            (_zeros_pf, _zeros_pf, _zeros_pf, _zeros_pf, _garrison_init, _owner_init, _prev_owner_init, _owner_init, _owner_init, _owner_init),
+            (
+                _zeros_pf,
+                _zeros_pf,
+                _zeros_pf,
+                _zeros_pf,
+                _garrison_init,
+                _owner_init,
+                _prev_owner_init,
+                _owner_init,
+                _owner_init,
+                _owner_init,
+                tick_rot_c,
+                tick_rot_s,
+            ),
             jnp.arange(1, _T_INBOUND + 1, dtype=jnp.int32),
         )  # [MAX_PLANETS, MAX_FLEETS] / [MAX_PLANETS]
 

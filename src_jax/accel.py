@@ -11,31 +11,40 @@ gotcha that bites silently is matmul precision:
     destabilize PPO value/advantage estimates and make a run that was healthy
     on GPU diverge on TPU.
 
-``setup_accelerator`` pins the default matmul precision to full float32 so the
-numerics match across backends.  The model here is tiny (hidden_size≈128), so
-the extra passes cost essentially nothing while buying GPU/TPU parity.
+``setup_accelerator`` sets the default matmul precision: TF32 on GPU (matches
+PyTorch default; unlocks Tensor Cores on Ampere/Ada), full float32 on TPU/CPU
+(guards against TPU's silent bfloat16 downgrade).
 
 Call it once, before any rollout / training function is compiled.
 """
 from __future__ import annotations
 
 
-def setup_accelerator(precision: str = "highest", *, verbose: bool = True) -> str:
+def setup_accelerator(precision: str | None = None, *, verbose: bool = True) -> str:
     """Configure JAX for the active backend and return the platform name.
 
     ``precision`` maps to ``jax_default_matmul_precision``:
       - ``"highest"`` / ``"float32"`` → full float32 matmuls (GPU/CPU parity).
-      - ``"high"``    / ``"tensorfloat32"`` → 3-pass bf16 (faster, ~tf32 accuracy).
+      - ``"high"``    / ``"tensorfloat32"`` → TF32 Tensor Cores on Ampere/Ada GPUs
+                                              (matches PyTorch default; safe for RL).
       - ``"default"`` / ``"bfloat16"`` → 1-pass bf16 (fastest, lowest accuracy).
+
+    When ``precision`` is None (default), GPU uses ``"high"`` to enable TF32 Tensor
+    Cores (standard practice; PyTorch does this automatically on A100/RTX).  TPU and
+    CPU use ``"highest"`` because TPU silently degrades matmuls to bfloat16 at
+    ``"default"``/``"high"``, which destabilises PPO value estimates.
 
     x64 is deliberately left disabled: the compute path is float32 throughout,
     and float64 is unsupported on TPU.
     """
     import jax
 
+    platform = jax.default_backend()
+    if precision is None:
+        precision = "high" if platform == "gpu" else "highest"
+
     jax.config.update("jax_default_matmul_precision", precision)
 
-    platform = jax.default_backend()
     if verbose:
         devices = jax.devices()
         print(

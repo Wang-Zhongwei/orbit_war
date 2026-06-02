@@ -494,10 +494,10 @@ def _compute_planet_new_positions(state: EnvState):
     dy        = state.p_init_y - CENTER
     orb_r     = jnp.sqrt(dx * dx + dy * dy)
     rotating  = (orb_r + state.p_radius < ROTATION_RADIUS_LIMIT) & state.p_alive & ~state.p_is_comet
-    init_ang  = jnp.arctan2(dy, dx)
-    cur_ang   = init_ang + av * cur_step.astype(jnp.float32)
-    rot_new_x = CENTER + orb_r * jnp.cos(cur_ang)
-    rot_new_y = CENTER + orb_r * jnp.sin(cur_ang)
+    cur_ang   = av * cur_step.astype(jnp.float32)
+    c, s      = jnp.cos(cur_ang), jnp.sin(cur_ang)
+    rot_new_x = CENTER + c * dx - s * dy
+    rot_new_y = CENTER + s * dx + c * dy
 
     new_x = jnp.where(rotating, rot_new_x, state.p_x)
     new_y = jnp.where(rotating, rot_new_y, state.p_y)

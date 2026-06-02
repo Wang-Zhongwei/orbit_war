@@ -72,7 +72,13 @@ def _find_angles_for_action(
     dy0 = tgt_y - CENTER
     orb_r = np.sqrt(dx0 * dx0 + dy0 * dy0)
     rotating  = (orb_r + tgt_radius) < ROTATION_RADIUS_LIMIT  # [K]
-    init_ang  = np.arctan2(dy0, dx0)                           # [K]
+    inv_orb_r = np.reciprocal(np.maximum(orb_r, 1e-6))
+    c_now     = dx0 * inv_orb_r
+    s_now     = dy0 * inv_orb_r
+    c_step    = math.cos(angular_velocity)
+    s_step    = math.sin(angular_velocity)
+    c_t       = c_step * c_now - s_step * s_now
+    s_t       = s_step * c_now + c_step * s_now
 
     # Static fallback — non-rotating targets and rotating ones with no intercept
     angles = np.arctan2(tgt_y - src_y, tgt_x - src_x)         # [K]
@@ -84,15 +90,15 @@ def _find_angles_for_action(
         if not remaining.any():
             break
         t    = float(tick)
-        ang_t = init_ang + angular_velocity * t
-        tx   = CENTER + orb_r * np.cos(ang_t)
-        ty   = CENTER + orb_r * np.sin(ang_t)
+        tx   = CENTER + orb_r * c_t
+        ty   = CENTER + orb_r * s_t
         dx   = tx - src_x
         dy   = ty - src_y
         gap  = spd * t - (np.sqrt(dx * dx + dy * dy) - src_radius)
         hit  = remaining & (np.abs(gap) < tgt_radius)
         angles = np.where(hit, np.arctan2(dy, dx), angles)
         found |= hit
+        c_t, s_t = c_step * c_t - s_step * s_t, s_step * c_t + c_step * s_t
 
     return angles  # [K]
 
