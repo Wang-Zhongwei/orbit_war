@@ -126,8 +126,8 @@ def _rot_vec(
 # ---------------------------------------------------------------------------
 
 def apply_augmentation(
-    sf: jnp.ndarray,                    # [N, SELF_DIM=11]
-    cf: jnp.ndarray,                    # [N, K, CAND_DIM=14]
+    sf: jnp.ndarray,                    # [N, SELF_DIM=18]
+    cf: jnp.ndarray,                    # [N, K, CAND_DIM=23]
     gf: jnp.ndarray,                    # [N, GLOB_DIM=12]
     aug_id: int,                        # 0–7
     # ff: jnp.ndarray | None = None,      # [N, MAX_FLEETS, 6]  optional

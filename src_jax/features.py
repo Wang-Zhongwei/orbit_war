@@ -30,7 +30,6 @@ from .constants import CENTER, ROTATION_RADIUS_LIMIT, SUN_RADIUS
 MIN_SOURCE_SHIPS: int = 10
 _MAX_TICKS: int = 25
 _T_INBOUND: int = 25  # tick horizon for inbound fleet simulation
-_BUFFER_TICKS: int = 3 # buffer ticks for will_be_mine calculation is target is enemy
 
 # Conservative buffer beyond SUN_RADIUS in cand_mask. Absorbs the fact that
 # the encoder's speed estimate (src_ships//2 ships) can differ from what the
@@ -42,11 +41,11 @@ _SUN_BLOCK_MARGIN: float = 1.01
 
 
 def self_feature_dim() -> int:
-    return 7
+    return 25
 
 
 def candidate_feature_dim() -> int:
-    return 15
+    return 30
 
 
 def global_feature_dim() -> int:
@@ -206,13 +205,13 @@ class _EncodedTurn(NamedTuple):
     src_valid:       jnp.ndarray  # [MAX_SRC]       bool
     src_ids:         jnp.ndarray  # [MAX_SRC]       int32
     src_ships:       jnp.ndarray  # [MAX_SRC]       int32
-    self_feats:      jnp.ndarray  # [MAX_SRC, 11]
+    self_feats:      jnp.ndarray  # [MAX_SRC, 25]
     src_slots:       jnp.ndarray  # [MAX_SRC]       int32 — planet slot for each source
     cand_slots_safe: jnp.ndarray  # [MAX_SRC, K]    int32 (no-op clamped to 0)
     cand_ids:        jnp.ndarray  # [MAX_SRC, K]    int32 (-1 for no-op/invalid)
     cand_mask:       jnp.ndarray  # [MAX_SRC, K]    bool
     angles:          jnp.ndarray  # [MAX_SRC, K]    float32
-    cand_feats:      jnp.ndarray  # [MAX_SRC, K, 14]
+    cand_feats:      jnp.ndarray  # [MAX_SRC, K, 30]
     global_feat:     jnp.ndarray  # [12]
     # fleet_feats:     jnp.ndarray  # [MAX_FLEETS, 6]
     # fleet_mask:      jnp.ndarray  # [MAX_FLEETS]    bool
@@ -426,17 +425,7 @@ def _make_env_encoder(K: int, env_cfg):
         src_orbit_r  = jnp.hypot(src_x - CENTER, src_y - CENTER) / (board_size * jnp.float32(0.5))
         src_rot_flag = src_rotating.astype(jnp.float32)
 
-        self_feats = jnp.stack([
-            jnp.ones(MAX_BASE_PLANETS, jnp.float32),                              # [0] bias term
-            src_x / board_size,                                                    # [1] normalized board-x position
-            src_y / board_size,                                                    # [2] normalized board-y position
-            jnp.clip(state.p_ships[src_slots], 0.0, max_ships) / max_ships,      # [3] current garrison
-            state.p_production[src_slots] / max_production,                       # [4] income rate
-            src_orbit_r,             # [5] orbit radius — inner vs outer ring
-            src_rot_flag,            # [6] 1 if rotating planet, 0 if static/comet
-        ], axis=1)  # [MAX_SRC, 7]
-
-        # ── Candidate features  [MAX_SRC, K, 14] ────────────────────────
+        # ── Candidate features  [MAX_SRC, K, 23] ───────────────────────
         tgt_x   = state.p_x[safe_slots]         # [MAX_SRC, K]
         tgt_y   = state.p_y[safe_slots]
         delta_x = tgt_x - src_x[:, None]
@@ -468,7 +457,20 @@ def _make_env_encoder(K: int, env_cfg):
         all_rotating = (all_orb_r + state.p_radius) < ROTATION_RADIUS_LIMIT  # [MAX_PLANETS]
         all_r_sq    = state.p_radius ** 2                                  # [MAX_PLANETS]
 
-        def _sim_tick(acc, t):
+        # Signed garrison: positive = player owns, negative = enemy/neutral owns.
+        # Production applied each tick in the sign direction; fleet arrivals add
+        # (player) or subtract (enemy) from the signed value. Ownership flips
+        # when the sign changes. Computed alongside the inbound accumulator in
+        # the same scan so planet positions are only computed once per tick.
+        _f_ships_f       = state.f_ships.astype(jnp.float32)                  # [MAX_FLEETS]
+        _garrison_init   = jnp.where(state.p_alive, state.p_ships, jnp.float32(0.0))
+        _owner_init      = state.p_owner.astype(jnp.int32)                    # -1 for neutral
+        # prev_owner: last owner before garrison hit 0; used for production when
+        # garrison == 0 so a battle-draw planet still produces for its last owner.
+        _prev_owner_init = state.p_owner.astype(jnp.int32)
+
+        def _sim_tick(carry, t):
+            acc, acc_5, acc_10, acc_15, garrison, owner, prev_owner, owner_5, owner_10, owner_15 = carry
             t_f  = t.astype(jnp.float32)
             fx_t = state.f_x + t_f * f_vx_1d                              # [MAX_FLEETS]
             fy_t = state.f_y + t_f * f_vy_1d
@@ -478,16 +480,64 @@ def _make_env_encoder(K: int, env_cfg):
             py_t = CENTER + jnp.where(all_rotating, s * all_orb_dx + c * all_orb_dy, all_orb_dy)
             dx   = px_t[:, None] - fx_t[None, :]                          # [MAX_PLANETS, MAX_FLEETS]
             dy   = py_t[:, None] - fy_t[None, :]
-            hit  = (dx ** 2 + dy ** 2) < all_r_sq[:, None]
-            return acc | hit, None
+            already_landed = jnp.any(acc, axis=0)                              # [MAX_FLEETS]
+            hit     = ((dx ** 2 + dy ** 2) < all_r_sq[:, None]) & ~already_landed[None, :]
+            new_acc = acc | hit
+            # Production: any owned planet produces. When garrison == 0 (draw),
+            # fall back to prev_owner so the planet keeps producing.
+            prod_owner = jnp.where(garrison > 0, owner, prev_owner)
+            garrison   = garrison + state.p_production * (prod_owner != -1).astype(jnp.float32)
+            # Mirror _phase_resolve_combat exactly:
+            #   1. Sum arriving ships grouped by player → combat_ships [MAX_P, 4]
+            #   2. top player = argmax; survivor = top − second_largest
+            #   3. survivor > 0 only: friendly → reinforce garrison, hostile → attack garrison
+            #   4. Garrison goes negative → top player takes over
+            alive_hit = hit & state.f_alive[None, :]                      # [MAX_PLANETS, MAX_FLEETS]
+            combat_ships = jnp.stack([
+                jnp.where(alive_hit & (state.f_owner[None, :] == pid),
+                          _f_ships_f[None, :], jnp.float32(0.0)).sum(axis=1)
+                for pid in range(4)
+            ], axis=1)                                                     # [MAX_PLANETS, 4]
+            has_combat   = jnp.any(combat_ships > 0, axis=1)              # [MAX_PLANETS]
+            top_idx      = jnp.argmax(combat_ships, axis=1).astype(jnp.int32)
+            top_ships    = jnp.max(combat_ships, axis=1)
+            second_ships = jnp.sort(combat_ships, axis=1)[:, -2]
+            survivor     = top_ships - second_ships                        # net after inter-fleet battle
+            apply        = has_combat & (survivor > jnp.float32(0.0))
+            friendly     = (top_idx == owner)
+            garrison     = jnp.where(
+                apply,
+                jnp.where(friendly, garrison + survivor, garrison - survivor),
+                garrison,
+            )
+            flipped  = apply & ~friendly & (garrison < jnp.float32(0.0))
+            garrison = jnp.abs(garrison)
+            owner    = jnp.where(flipped, top_idx, owner)
+            prev_owner = jnp.where(garrison > 0, owner, prev_owner)
+            return (
+                new_acc,
+                jnp.where(t <= 5,  new_acc, acc_5),
+                jnp.where(t <= 10, new_acc, acc_10),
+                jnp.where(t <= 15, new_acc, acc_15),
+                garrison,
+                owner,
+                prev_owner,
+                jnp.where(t == 5,  owner, owner_5),
+                jnp.where(t == 10, owner, owner_10),
+                jnp.where(t == 15, owner, owner_15),
+            ), None
 
-        inbound_all, _ = jax.lax.scan(
+        _zeros_pf = jnp.zeros((MAX_PLANETS, MAX_FLEETS), dtype=jnp.bool_)
+        (inbound_all, inbound_5_all, inbound_10_all, inbound_15_all, _, owner_final, _, owner_5_all, owner_10_all, owner_15_all), _ = jax.lax.scan(
             _sim_tick,
-            jnp.zeros((MAX_PLANETS, MAX_FLEETS), dtype=jnp.bool_),
+            (_zeros_pf, _zeros_pf, _zeros_pf, _zeros_pf, _garrison_init, _owner_init, _prev_owner_init, _owner_init, _owner_init, _owner_init),
             jnp.arange(1, _T_INBOUND + 1, dtype=jnp.int32),
-        )  # [MAX_PLANETS, MAX_FLEETS]
+        )  # [MAX_PLANETS, MAX_FLEETS] / [MAX_PLANETS]
 
-        inbound_sim = inbound_all[safe_slots]                              # [MAX_SRC, K, MAX_FLEETS]
+        inbound_sim    = inbound_all[safe_slots]                           # [MAX_SRC, K, MAX_FLEETS]
+        inbound_5_sim  = inbound_5_all[safe_slots]                        # [MAX_SRC, K, MAX_FLEETS]
+        inbound_10_sim = inbound_10_all[safe_slots]                       # [MAX_SRC, K, MAX_FLEETS]
+        inbound_15_sim = inbound_15_all[safe_slots]                       # [MAX_SRC, K, MAX_FLEETS]
 
         f_alive_3d  = state.f_alive[None, None, :]
         is_my_3d    = (state.f_owner == player)[None, None, :]
@@ -498,49 +548,160 @@ def _make_env_encoder(K: int, env_cfg):
         my_inbound_ships  = ((inbound & is_my_3d).astype(jnp.float32) * f_ships_clipped).sum(axis=2) / max_ships
         opp_inbound_ships = ((inbound & is_opp_3d).astype(jnp.float32) * f_ships_clipped).sum(axis=2) / max_ships
 
-        # ── can_capture ───────────────────────────────────────────────────
-        # True when source ships > projected garrison at arrival:
-        #   garrison = current_ships + production*eta (enemy-owned only)
-        #              + enemy_inbound_before_eta − my_inbound_before_eta
-        # ETA per fleet uses first-order distance to current target position.
-        f_x_3d      = state.f_x[None, None, :]                            # [1, 1, MAX_FLEETS]
-        f_y_3d      = state.f_y[None, None, :]
-        dx_f2t      = tgt_x[:, :, None] - f_x_3d                          # [MAX_SRC, K, MAX_FLEETS]
-        dy_f2t      = tgt_y[:, :, None] - f_y_3d
-        dist_f2t    = jnp.sqrt(dx_f2t ** 2 + dy_f2t ** 2 + jnp.float32(1e-12))
-        v_src_full  = _fleet_speed(state.p_ships[src_slots][:, None].astype(jnp.float32))
-        eta_mine    = tgt_dist / v_src_full                                # [MAX_SRC, K]
-        eta_fleet   = dist_f2t / f_spd_1d[None, None, :]                  # [MAX_SRC, K, MAX_FLEETS]
-        early       = eta_fleet < eta_mine[:, :, None]
-        f_ships_raw = state.f_ships[None, None, :].astype(jnp.float32)
-        my_early    = ((inbound & is_my_3d & early).astype(jnp.float32) * f_ships_raw).sum(axis=2)
-        opp_early   = ((inbound & is_opp_3d & early).astype(jnp.float32) * f_ships_raw).sum(axis=2)
-        prod_at_eta  = state.p_production[safe_slots] * eta_mine             # [MAX_SRC, K]
-        buffer_prod  = _BUFFER_TICKS * state.p_production[safe_slots]
-        tgt_ships_f  = tgt_ships_2d.astype(jnp.float32)
-        # Our side: friendly garrison + production (if we own it) + inbound allies
-        our_force    = is_friendly * (tgt_ships_f + prod_at_eta) + my_early
-        # Their side: enemy garrison + production (if they own it) + inbound enemies
-        their_force  = is_enemy * (tgt_ships_f + prod_at_eta + buffer_prod) + is_neutral * tgt_ships_f + opp_early
-        will_be_mine = (our_force > their_force).astype(jnp.float32)
+        inbound_5  = inbound_5_sim  & f_alive_3d
+        inbound_10 = inbound_10_sim & f_alive_3d
+        inbound_15 = inbound_15_sim & f_alive_3d
+        my_inbound_5_ships   = ((inbound_5  & is_my_3d).astype(jnp.float32) * f_ships_clipped).sum(axis=2) / max_ships
+        opp_inbound_5_ships  = ((inbound_5  & is_opp_3d).astype(jnp.float32) * f_ships_clipped).sum(axis=2) / max_ships
+        my_inbound_10_ships  = ((inbound_10 & is_my_3d).astype(jnp.float32) * f_ships_clipped).sum(axis=2) / max_ships
+        opp_inbound_10_ships = ((inbound_10 & is_opp_3d).astype(jnp.float32) * f_ships_clipped).sum(axis=2) / max_ships
+        my_inbound_15_ships  = ((inbound_15 & is_my_3d).astype(jnp.float32) * f_ships_clipped).sum(axis=2) / max_ships
+        opp_inbound_15_ships = ((inbound_15 & is_opp_3d).astype(jnp.float32) * f_ships_clipped).sum(axis=2) / max_ships
 
+        would_be_mine_5  = (owner_5_all[safe_slots]  == player).astype(jnp.float32)    # [MAX_SRC, K]
+        would_be_mine_10 = (owner_10_all[safe_slots] == player).astype(jnp.float32)    # [MAX_SRC, K]
+        would_be_mine_15 = (owner_15_all[safe_slots] == player).astype(jnp.float32)    # [MAX_SRC, K]
+        would_be_mine_25 = (owner_final[safe_slots]  == player).astype(jnp.float32)    # [MAX_SRC, K]
+
+        # ── Nearby-planet reachability features ─────────────────────────────
+        # For each candidate target, sum garrison ships from my/enemy planets
+        # whose estimated travel time ceil(dist / fleet_speed(garrison)) is ≤ 5
+        # or ≤ 10 ticks. Gives the model a signal about how "contested" or
+        # "reinforceable" the target area is in the very near term.
+        speed_p      = _fleet_speed(state.p_ships.astype(jnp.float32))        # [MAX_PLANETS]
+        dist_p2c     = jnp.hypot(
+            tgt_x[:, :, None] - state.p_x[None, None, :],                     # [MAX_SRC, K, MAX_PLANETS]
+            tgt_y[:, :, None] - state.p_y[None, None, :],
+        )
+        eta_p2c      = jnp.ceil(dist_p2c / jnp.maximum(speed_p[None, None, :], jnp.float32(1e-6)))
+
+        p_alive_3d    = state.p_alive[None, None, :]                          # [1, 1, MAX_PLANETS]
+        is_my_p3d     = (state.p_owner == player)[None, None, :]
+        is_enemy_p3d  = ((state.p_owner != player) & (state.p_owner != -1))[None, None, :]
+        p_ships_3d    = jnp.clip(state.p_ships, jnp.float32(0.0), max_ships)[None, None, :]
+
+        can_reach_5   = (eta_p2c <= 5)  & p_alive_3d
+        can_reach_10  = (eta_p2c <= 10) & p_alive_3d
+        can_reach_15  = (eta_p2c <= 15) & p_alive_3d
+        my_nearby_5_ships     = ((can_reach_5  & is_my_p3d).astype(jnp.float32)    * p_ships_3d).sum(axis=2) / max_ships
+        enemy_nearby_5_ships  = ((can_reach_5  & is_enemy_p3d).astype(jnp.float32) * p_ships_3d).sum(axis=2) / max_ships
+        my_nearby_10_ships    = ((can_reach_10 & is_my_p3d).astype(jnp.float32)    * p_ships_3d).sum(axis=2) / max_ships
+        enemy_nearby_10_ships = ((can_reach_10 & is_enemy_p3d).astype(jnp.float32) * p_ships_3d).sum(axis=2) / max_ships
+        my_nearby_15_ships    = ((can_reach_15 & is_my_p3d).astype(jnp.float32)    * p_ships_3d).sum(axis=2) / max_ships
+        enemy_nearby_15_ships = ((can_reach_15 & is_enemy_p3d).astype(jnp.float32) * p_ships_3d).sum(axis=2) / max_ships
+
+        # ── Self features  [MAX_SRC, 25] ────────────────────────────────
+        # Inbound fleets for each source planet (gathered from simulation above).
+        inbound_src    = inbound_all[src_slots]                                # [MAX_SRC, MAX_FLEETS]
+        inbound_5_src  = inbound_5_all[src_slots]
+        inbound_10_src = inbound_10_all[src_slots]
+        inbound_15_src = inbound_15_all[src_slots]
+
+        f_alive_s = state.f_alive[None, :]                                     # [1, MAX_FLEETS]
+        is_my_fs  = (state.f_owner == player)[None, :]
+        is_opp_fs = (state.f_owner != player)[None, :]
+        f_ships_s = jnp.clip(state.f_ships, jnp.float32(0.0), max_ships)[None, :]
+
+        self_my_inb_5   = ((inbound_5_src  & f_alive_s & is_my_fs).astype(jnp.float32)  * f_ships_s).sum(axis=1) / max_ships
+        self_opp_inb_5  = ((inbound_5_src  & f_alive_s & is_opp_fs).astype(jnp.float32) * f_ships_s).sum(axis=1) / max_ships
+        self_my_inb_10  = ((inbound_10_src & f_alive_s & is_my_fs).astype(jnp.float32)  * f_ships_s).sum(axis=1) / max_ships
+        self_opp_inb_10 = ((inbound_10_src & f_alive_s & is_opp_fs).astype(jnp.float32) * f_ships_s).sum(axis=1) / max_ships
+        self_my_inb_15  = ((inbound_15_src & f_alive_s & is_my_fs).astype(jnp.float32)  * f_ships_s).sum(axis=1) / max_ships
+        self_opp_inb_15 = ((inbound_15_src & f_alive_s & is_opp_fs).astype(jnp.float32) * f_ships_s).sum(axis=1) / max_ships
+        self_my_inb_25  = ((inbound_src    & f_alive_s & is_my_fs).astype(jnp.float32)  * f_ships_s).sum(axis=1) / max_ships
+        self_opp_inb_25 = ((inbound_src    & f_alive_s & is_opp_fs).astype(jnp.float32) * f_ships_s).sum(axis=1) / max_ships
+
+        # Nearby planets for each source planet.
+        dist_p2src  = jnp.hypot(
+            src_x[:, None] - state.p_x[None, :],                              # [MAX_SRC, MAX_PLANETS]
+            src_y[:, None] - state.p_y[None, :],
+        )
+        eta_p2src   = jnp.ceil(dist_p2src / jnp.maximum(speed_p[None, :], jnp.float32(1e-6)))
+        p_alive_s   = state.p_alive[None, :]
+        is_my_ps    = (state.p_owner == player)[None, :]
+        is_enemy_ps = ((state.p_owner != player) & (state.p_owner != -1))[None, :]
+        p_ships_s   = jnp.clip(state.p_ships, jnp.float32(0.0), max_ships)[None, :]
+        src_reach_5   = (eta_p2src <= 5)  & p_alive_s
+        src_reach_10  = (eta_p2src <= 10) & p_alive_s
+        src_reach_15  = (eta_p2src <= 15) & p_alive_s
+        self_my_near5     = ((src_reach_5  & is_my_ps).astype(jnp.float32)    * p_ships_s).sum(axis=1) / max_ships
+        self_enemy_near5  = ((src_reach_5  & is_enemy_ps).astype(jnp.float32) * p_ships_s).sum(axis=1) / max_ships
+        self_my_near10    = ((src_reach_10 & is_my_ps).astype(jnp.float32)    * p_ships_s).sum(axis=1) / max_ships
+        self_enemy_near10 = ((src_reach_10 & is_enemy_ps).astype(jnp.float32) * p_ships_s).sum(axis=1) / max_ships
+        self_my_near15    = ((src_reach_15 & is_my_ps).astype(jnp.float32)    * p_ships_s).sum(axis=1) / max_ships
+        self_enemy_near15 = ((src_reach_15 & is_enemy_ps).astype(jnp.float32) * p_ships_s).sum(axis=1) / max_ships
+
+        self_feats = jnp.stack([
+            # ── static ──────────────────────────────────────────────────────
+            jnp.ones(MAX_BASE_PLANETS, jnp.float32),                          # [0]  bias
+            src_x / board_size,                                                # [1]  x position
+            src_y / board_size,                                                # [2]  y position
+            src_orbit_r,                                                       # [3]  orbit radius
+            src_rot_flag,                                                      # [4]  is rotating
+            jnp.clip(state.p_ships[src_slots], 0.0, max_ships) / max_ships,  # [5]  garrison
+            state.p_production[src_slots] / max_production,                   # [6]  production rate
+            # ── inbound fleets ──────────────────────────────────────────────
+            self_my_inb_5,                                                     # [7]  friendly inbound (5-tick)
+            self_opp_inb_5,                                                    # [8]  enemy inbound (5-tick)
+            self_my_inb_10,                                                    # [9]  friendly inbound (10-tick)
+            self_opp_inb_10,                                                   # [10] enemy inbound (10-tick)
+            self_my_inb_15,                                                    # [11] friendly inbound (15-tick)
+            self_opp_inb_15,                                                   # [12] enemy inbound (15-tick)
+            self_my_inb_25,                                                    # [13] friendly inbound (25-tick)
+            self_opp_inb_25,                                                   # [14] enemy inbound (25-tick)
+            # ── nearby planets ──────────────────────────────────────────────
+            self_my_near5,                                                     # [15] my garrison reachable in 5 ticks
+            self_enemy_near5,                                                  # [16] enemy garrison reachable in 5 ticks
+            self_my_near10,                                                    # [17] my garrison reachable in 10 ticks
+            self_enemy_near10,                                                 # [18] enemy garrison reachable in 10 ticks
+            self_my_near15,                                                    # [19] my garrison reachable in 15 ticks
+            self_enemy_near15,                                                 # [20] enemy garrison reachable in 15 ticks
+            # ── prediction ──────────────────────────────────────────────────
+            (owner_5_all[src_slots]  == player).astype(jnp.float32),          # [21] will still be mine after 5 ticks
+            (owner_10_all[src_slots] == player).astype(jnp.float32),          # [22] will still be mine after 10 ticks
+            (owner_15_all[src_slots] == player).astype(jnp.float32),          # [23] will still be mine after 15 ticks
+            (owner_final[src_slots]  == player).astype(jnp.float32),          # [24] will still be mine after 25 ticks
+        ], axis=1)  # [MAX_SRC, 25]
+
+        # ── Candidate features  [MAX_SRC, K, 30] ────────────────────────
         cand_feats = jnp.stack([
-            jnp.ones((MAX_BASE_PLANETS, K), jnp.float32),             # [0]  bias
-            is_neutral,                                                 # [1]  neutral target
-            is_friendly,                                                # [2]  friendly target
-            is_enemy,                                                   # [3]  enemy target
-            delta_x / board_size,                                       # [4]  x-offset
-            delta_y / board_size,                                       # [5]  y-offset
-            tgt_dist / board_size,                                      # [6]  Euclidean distance
-            jnp.clip(tgt_ships_2d, 0.0, max_ships) / max_ships,       # [7]  target garrison
-            state.p_production[safe_slots] / max_production,           # [8]  target income rate
-            tgt_orbit_r,                                                # [9]  orbit radius
-            tgt_rot_flag,                                               # [10] is rotating
-            my_inbound_ships,                                           # [11] friendly inbound ships
-            opp_inbound_ships,                                          # [12] enemy inbound ships
-            will_be_mine,                                               # [13] planet projected mine at eta (no action)
-            t_hat / episode_steps,                                      # [14] normalized ETA (dist/speed — larger fleet → faster → shorter)
-        ], axis=2).at[:, 0, :].set(0.0)  # [MAX_SRC, K, 15]; no-op slot = zeros
+            # ── identity ────────────────────────────────────────────────────
+            jnp.ones((MAX_BASE_PLANETS, K), jnp.float32),                     # [0]  bias
+            is_neutral,                                                        # [1]  neutral target
+            is_friendly,                                                       # [2]  friendly target
+            is_enemy,                                                          # [3]  enemy target
+            # ── geometry ────────────────────────────────────────────────────
+            delta_x / board_size,                                              # [4]  x offset from source
+            delta_y / board_size,                                              # [5]  y offset from source
+            tgt_dist / board_size,                                             # [6]  Euclidean distance
+            t_hat / episode_steps,                                             # [7]  normalized ETA
+            # ── target static properties ────────────────────────────────────
+            jnp.clip(tgt_ships_2d, 0.0, max_ships) / max_ships,              # [8]  garrison
+            state.p_production[safe_slots] / max_production,                  # [9]  production rate
+            tgt_orbit_r,                                                       # [10] orbit radius
+            tgt_rot_flag,                                                      # [11] is rotating
+            # ── inbound fleets ──────────────────────────────────────────────
+            my_inbound_5_ships,                                                # [12] friendly inbound (5-tick)
+            opp_inbound_5_ships,                                               # [13] enemy inbound (5-tick)
+            my_inbound_10_ships,                                               # [14] friendly inbound (10-tick)
+            opp_inbound_10_ships,                                              # [15] enemy inbound (10-tick)
+            my_inbound_15_ships,                                               # [16] friendly inbound (15-tick)
+            opp_inbound_15_ships,                                              # [17] enemy inbound (15-tick)
+            my_inbound_ships,                                                  # [18] friendly inbound (25-tick)
+            opp_inbound_ships,                                                 # [19] enemy inbound (25-tick)
+            # ── nearby planets ──────────────────────────────────────────────
+            my_nearby_5_ships,                                                 # [20] my garrison reachable in 5 ticks
+            enemy_nearby_5_ships,                                              # [21] enemy garrison reachable in 5 ticks
+            my_nearby_10_ships,                                                # [22] my garrison reachable in 10 ticks
+            enemy_nearby_10_ships,                                             # [23] enemy garrison reachable in 10 ticks
+            my_nearby_15_ships,                                                # [24] my garrison reachable in 15 ticks
+            enemy_nearby_15_ships,                                             # [25] enemy garrison reachable in 15 ticks
+            # ── prediction ──────────────────────────────────────────────────
+            would_be_mine_5,                                                   # [26] will be mine after 5-tick sim
+            would_be_mine_10,                                                  # [27] will be mine after 10-tick sim
+            would_be_mine_15,                                                  # [28] will be mine after 15-tick sim
+            would_be_mine_25,                                                  # [29] will be mine after 25-tick sim
+        ], axis=2).at[:, 0, :].set(0.0)  # [MAX_SRC, K, 30]; no-op slot = zeros
 
         # ── Fleet features  [MAX_FLEETS, 6] ──────────────────────────────
         # Velocity (not pure heading) so the cross-attention can extrapolate

@@ -13,7 +13,7 @@ import torch
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
-from .agents.rule_based import agent_1000_score, never_miss_agent, nearest_planet_sniper, roi_agent, stateful_agent
+from .agents.rule_based import agent_1000_score, never_miss_agent, nearest_planet_sniper, roi_agent, stateful_agent, exp30_agent
 from .config import TrainConfig
 from .agents.rl.ppo_agent import build_moves, build_policy
 from .features import encode_turn
@@ -106,6 +106,7 @@ AGENTS: dict[str, object] = {
     "sub_v5":     sub_stateful_v5,
     "sub_v51":    sub_stateful_v51,
     "sub_v52":    sub_stateful_v52,
+    "exp30":      exp30_agent,
     "random":     _make_random_opponent(),
 }
 

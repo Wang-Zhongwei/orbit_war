@@ -325,13 +325,13 @@ class GameContext:
 
     def ships_to_defend(
         self, p, mine_en_route: list[DirectedFleet], enemy_en_route: list[DirectedFleet],
-        min_ships: int, helper
+        min_ships: int, helper, max_ships: int = 200
     ) -> tuple[float | None, int | None, int | None]:
         """Find minimum ships to send from helper so that p stays owned by the player.
 
         Returns (angle, ships, arrive_tick), or (None, None, None) if helper cannot save p.
         """
-        lo, hi = min_ships, 200
+        lo, hi = min_ships, max_ships
         while lo < hi:
             mid = (lo + hi) // 2
             angle, arrive_tick, is_blocked = self.aim(helper, p, mid)
@@ -356,13 +356,13 @@ class GameContext:
 
     def ships_to_capture(
         self, src, tgt, mine_en_route: list[DirectedFleet], enemy_en_route: list[DirectedFleet],
-    min_ships: int) -> tuple[float | None, int | None, int | None]:
+        min_ships: int, max_ships: int = 200) -> tuple[float | None, int | None, int | None]:
         """Refine ship count to account for enemy production during travel.
 
         Returns (angle, ships, arrive_tick), or (None, None, None) if unreachable.
         """
         # Binary search for minimum ships regardless of being blocked
-        lo, hi = min_ships, 200
+        lo, hi = min_ships, max_ships
         while lo < hi:
             mid = (lo + hi) // 2
             angle, arrive_tick, is_blocked = self.aim(src, tgt, mid)
