@@ -24,7 +24,6 @@ Features modified per aug_id (all others are invariant):
 
 Augmentation does NOT change:
   • candidate ordering / target_idx labels
-  • ship_bucket labels
   • candidate_mask
   • any scalar (bias, ship counts, production, ownership flags, distances,
     orbit radii, inbound-fleet sums, game-time, …)
@@ -32,8 +31,8 @@ Augmentation does NOT change:
 Usage (BC training):
     from src_jax.augment import expand_with_augmentations
 
-    sf, cf, gf, cm, ti, sb = expand_with_augmentations(sf, cf, gf, cm, ti, sb)
-    # now N is 4× the original for 4-rotation augmentation
+    sf, cf, gf, cm, ti = expand_with_augmentations(sf, cf, gf, cm, ti)
+    # now N is 8× the original for full D4 augmentation
 
 Reference: Team Durrett (4th, Lux AI 2021) used 4-rotation augmentation in BC,
 which was one of the key factors behind their strong imitation-learning baseline.
@@ -182,18 +181,12 @@ def expand_with_augmentations(
     gf: jnp.ndarray,               # [N, GLOB_DIM]
     cm: jnp.ndarray,               # [N, K]   — unchanged
     ti: jnp.ndarray,               # [N]      — unchanged
-    sb: jnp.ndarray,               # [N]      — unchanged
     aug_ids: list[int] | None = None,
-    ff: jnp.ndarray | None = None, # [N, MAX_FLEETS, 6]  optional
-    fm: jnp.ndarray | None = None, # [N, MAX_FLEETS]      optional
 ) -> tuple:
     """Expand a batch by stacking K augmented copies along the batch axis.
 
-    With the default 4 rotations the batch grows from N to 4N samples.
-
-    Returns:
-        (sf', cf', gf', cm', ti', sb')                 — if ff is None
-        (sf', cf', gf', cm', ti', sb', ff', fm')       — if ff and fm are given
+    With the default 8 transforms the batch grows from N to 8N samples.
+    Returns (sf', cf', gf', cm', ti').
     """
     if aug_ids is None:
         aug_ids = DEFAULT_AUG_IDS
@@ -201,15 +194,12 @@ def expand_with_augmentations(
     sf_list: list[jnp.ndarray] = []
     cf_list: list[jnp.ndarray] = []
     gf_list: list[jnp.ndarray] = []
-    ff_list: list[jnp.ndarray] = [] if ff is not None else None  # type: ignore[assignment]
 
     for a in aug_ids:
         sf_a, cf_a, gf_a = apply_augmentation(sf, cf, gf, a)
         sf_list.append(sf_a)
         cf_list.append(cf_a)
         gf_list.append(gf_a)
-        # if ff_list is not None:
-        #     ff_list.append(ff_a)
 
     n = len(aug_ids)
     sf_out = jnp.concatenate(sf_list, axis=0)   # [N*n, SELF_DIM]
@@ -217,14 +207,8 @@ def expand_with_augmentations(
     gf_out = jnp.concatenate(gf_list, axis=0)   # [N*n, GLOB_DIM]
     cm_out = jnp.concatenate([cm] * n, axis=0)  # [N*n, K]
     ti_out = jnp.concatenate([ti] * n, axis=0)  # [N*n]
-    sb_out = jnp.concatenate([sb] * n, axis=0)  # [N*n]
 
-    if ff is not None and fm is not None:
-        ff_out = jnp.concatenate(ff_list, axis=0)   # type: ignore[arg-type]
-        fm_out = jnp.concatenate([fm] * n, axis=0)
-        return sf_out, cf_out, gf_out, cm_out, ti_out, sb_out, ff_out, fm_out
-
-    return sf_out, cf_out, gf_out, cm_out, ti_out, sb_out
+    return sf_out, cf_out, gf_out, cm_out, ti_out
 
 
 # ---------------------------------------------------------------------------

@@ -3,16 +3,10 @@ JAX-accelerated feature encoding, operating directly on EnvState.
 
 Encodes observations for all envs in one JIT+vmap call:
   - Reads EnvState arrays directly (no dict conversion).
-  - Game-design rule: only the sun can block fleets. Planets and comets are
-    treated as transparent to fleet trajectories. This makes the cand_mask
-    check closed-form (no iteration) and decouples it from the expensive
-    intercept solver.
-  - cand_mask: cheap sun-segment test using first-order extrapolation of
-    rotating-planet position with a per-source speed estimate
-    (max(src_ships//2, MIN_SOURCE_SHIPS) ships).
-  - The accurate intercept angle (and the second sun check) is computed
-    once per dispatched fleet in rollout.py with the policy's actual ships
-    choice — not in the encoder.
+  - Fleet size = full source-planet ships, so speed is exact at encode time.
+  - cand_mask and angles: computed once via the iterative intercept solver
+    (sun + static-planet blocking) for all [MAX_SRC, K] candidate pairs.
+    No re-aim is needed after policy output.
 """
 from __future__ import annotations
 
@@ -31,14 +25,6 @@ MIN_SOURCE_SHIPS: int = 10
 _MAX_TICKS: int = 25
 _T_INBOUND: int = 25  # tick horizon for inbound fleet simulation
 
-# Conservative buffer beyond SUN_RADIUS in cand_mask. Absorbs the fact that
-# the encoder's speed estimate (src_ships//2 ships) can differ from what the
-# ships head eventually picks — bigger ships → faster fleet → shorter t_hat →
-# predicted target closer to current position. Margin biases the mask toward
-# false-positive rejection (small action-space loss) rather than false-negative
-# acceptance (which reintroduces gradient-noise on rejected dispatches).
-_SUN_BLOCK_MARGIN: float = 1.01
-
 
 def self_feature_dim() -> int:
     return 25
@@ -51,13 +37,6 @@ def candidate_feature_dim() -> int:
 def global_feature_dim() -> int:
     return 12
 
-
-def fleet_feature_dim() -> int:
-    return 6
-
-
-def fleet_count() -> int:
-    return MAX_FLEETS
 
 
 # ---------------------------------------------------------------------------
@@ -80,13 +59,16 @@ def _find_angle_single(
     all_p_r: jnp.ndarray,
     all_p_alive: jnp.ndarray,
     all_p_is_comet: jnp.ndarray,  # [MAX_PLANETS] bool — comets excluded as blockers
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Return (angle float32, is_blocked bool) for this (src, tgt) pair.
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Return (angle float32, is_blocked bool, eta_ticks float32) for this (src, tgt) pair.
 
-    Called once per dispatched fleet (rollout.py / jax_agent.py) with the
-    policy's actual ship count. Iteratively solves the lead-angle for rotating
-    targets, then checks the chord src → intercept-point against sun and static
-    (non-rotating, non-comet) planet blockers.
+    Rotating targets: iterative tick-scan for the lead angle; single blocking
+    check at the predicted intercept point.
+    Static targets: tries three directions — center, left-tangent edge,
+    right-tangent edge (each 95% of the half-angle to the planet rim). Uses
+    the first unblocked direction (center preferred). is_blocked=True only if
+    all three are blocked.
+    eta_ticks: intercept tick for rotating targets; snapshot dist/speed for static.
     """
     spd = _fleet_speed(ships)
 
@@ -106,7 +88,7 @@ def _find_angle_single(
     s_tick1 = s_step * c_now + c_step * s_now
 
     def scan_body(carry, tick):
-        best_angle, best_tx, best_ty, found, c_t, s_t = carry
+        best_angle, best_tx, best_ty, best_tick, found, c_t, s_t = carry
         t = tick.astype(jnp.float32)
         tx = CENTER + orb_r * c_t
         ty = CENTER + orb_r * s_t
@@ -121,14 +103,16 @@ def _find_angle_single(
             jnp.where(valid, angle_t, best_angle),
             jnp.where(valid, tx, best_tx),
             jnp.where(valid, ty, best_ty),
+            jnp.where(valid, t, best_tick),
             found | valid,
             next_c_t,
             next_s_t,
         ), None
 
-    (rot_angle, rot_tx, rot_ty, rot_found, _, _), _ = jax.lax.scan(
+    (rot_angle, rot_tx, rot_ty, rot_tick, rot_found, _, _), _ = jax.lax.scan(
         scan_body,
         (
+            jnp.float32(0.0),
             jnp.float32(0.0),
             jnp.float32(0.0),
             jnp.float32(0.0),
@@ -139,54 +123,90 @@ def _find_angle_single(
         jnp.arange(1, _MAX_TICKS + 1, dtype=jnp.int32),
     )
 
-    # --- Static / fallback angle ---
+    # --- Static candidate angles ---
     dx_s = tgt_x - src_x
     dy_s = tgt_y - src_y
-    static_angle = jnp.arctan2(dy_s, dx_s)
+    d_s  = jnp.sqrt(dx_s * dx_s + dy_s * dy_s + 1e-12)
+    center_ang = jnp.arctan2(dy_s, dx_s)
+    # Half-angle of the tangent cone: asin(r / d). Aiming within ±half_ang
+    # of center_ang still lands inside the planet's disc.
+    half_ang = jnp.arcsin(jnp.clip(tgt_radius / jnp.maximum(d_s, tgt_radius + 1e-6), 0.0, 1.0))
 
     no_intercept = rotating & ~rot_found
-    use_rot = rotating & rot_found
-    angle = jnp.where(use_rot, rot_angle, static_angle)
+    use_rot      = rotating & rot_found
 
-    # --- Blocking: segment from src centre to intercept point ---
-    # For rotating targets the fleet aims at the predicted future position, so
-    # the collision segment must use that endpoint.
-    end_x = jnp.where(use_rot, rot_tx, tgt_x)
-    end_y = jnp.where(use_rot, rot_ty, tgt_y)
-    seg_dx = end_x - src_x
-    seg_dy = end_y - src_y
-    seg_l2 = seg_dx * seg_dx + seg_dy * seg_dy + 1e-30
-
-    # Sun
-    t_sun = jnp.clip(
-        ((CENTER - src_x) * seg_dx + (CENTER - src_y) * seg_dy) / seg_l2, 0.0, 1.0
-    )
-    proj_x = src_x + t_sun * seg_dx
-    proj_y = src_y + t_sun * seg_dy
-    sun_blocked = (proj_x - CENTER) ** 2 + (proj_y - CENTER) ** 2 <= SUN_RADIUS ** 2
-
-    # Static (non-rotating, non-comet) planets only. Moving planets are ignored —
-    # their per-tick positions can't be cheaply evaluated against the straight-line
-    # segment, and a current-snapshot check produces false positives/negatives.
+    # --- Shared blocker mask (same for all segment checks) ---
     planet_slots = jnp.arange(MAX_PLANETS, dtype=jnp.int32)
-    p_orb_r = jnp.hypot(all_p_x - CENTER, all_p_y - CENTER)
-    is_static = (p_orb_r + all_p_r >= ROTATION_RADIUS_LIMIT) & ~all_p_is_comet
+    p_orb_r      = jnp.hypot(all_p_x - CENTER, all_p_y - CENTER)
+    is_static_p  = (p_orb_r + all_p_r >= ROTATION_RADIUS_LIMIT) & ~all_p_is_comet
     blocker_mask = (
         all_p_alive
-        & is_static
+        & is_static_p
         & (planet_slots != src_slot)
         & (planet_slots != tgt_slot)
     )
-    t_b = jnp.clip(
-        ((all_p_x - src_x) * seg_dx + (all_p_y - src_y) * seg_dy) / seg_l2, 0.0, 1.0
-    )
-    proj_bx = src_x + t_b * seg_dx
-    proj_by = src_y + t_b * seg_dy
-    dist_sq = (all_p_x - proj_bx) ** 2 + (all_p_y - proj_by) ** 2
-    planet_blocked = jnp.any(blocker_mask & (dist_sq <= all_p_r ** 2))
 
-    is_blocked = sun_blocked | planet_blocked | no_intercept
-    return angle, is_blocked
+    def _seg_blocked(end_x, end_y):
+        """True if the chord src→end passes through the sun or a blocking planet."""
+        seg_dx = end_x - src_x
+        seg_dy = end_y - src_y
+        seg_l2 = seg_dx * seg_dx + seg_dy * seg_dy + 1e-30
+        t_sun  = jnp.clip(
+            ((CENTER - src_x) * seg_dx + (CENTER - src_y) * seg_dy) / seg_l2, 0.0, 1.0
+        )
+        sun_b = (
+            (src_x + t_sun * seg_dx - CENTER) ** 2
+            + (src_y + t_sun * seg_dy - CENTER) ** 2
+        ) <= SUN_RADIUS ** 2
+        t_b     = jnp.clip(
+            ((all_p_x - src_x) * seg_dx + (all_p_y - src_y) * seg_dy) / seg_l2, 0.0, 1.0
+        )
+        proj_bx = src_x + t_b * seg_dx
+        proj_by = src_y + t_b * seg_dy
+        planet_b = jnp.any(
+            blocker_mask & ((all_p_x - proj_bx) ** 2 + (all_p_y - proj_by) ** 2 <= all_p_r ** 2)
+        )
+        return sun_b | planet_b
+
+    def _static_endpoint(theta):
+        """First contact point on the static target planet for aim angle theta."""
+        dxr     = jnp.cos(theta)
+        dyr     = jnp.sin(theta)
+        t_c     = dx_s * dxr + dy_s * dyr
+        perp_sq = jnp.maximum(dx_s * dx_s + dy_s * dy_s - t_c * t_c, 0.0)
+        t_hit   = t_c - jnp.sqrt(jnp.maximum(tgt_radius * tgt_radius - perp_sq, 0.0))
+        return src_x + t_hit * dxr, src_y + t_hit * dyr
+
+    # Three candidate aim angles for static targets.
+    # 0.95 factor keeps the fleet inside the planet disc (not a true tangent miss).
+    _TANG = jnp.float32(0.95)
+    ang_c = center_ang
+    ang_l = center_ang - half_ang * _TANG
+    ang_r = center_ang + half_ang * _TANG
+
+    ec_x, ec_y = _static_endpoint(ang_c)
+    el_x, el_y = _static_endpoint(ang_l)
+    er_x, er_y = _static_endpoint(ang_r)
+
+    blk_c = _seg_blocked(ec_x, ec_y)
+    blk_l = _seg_blocked(el_x, el_y)
+    blk_r = _seg_blocked(er_x, er_y)
+
+    # Prefer center; fall back to left then right. Blocked iff all three fail.
+    static_ang = jnp.where(~blk_c, ang_c, jnp.where(~blk_l, ang_l, ang_r))
+    static_blk = blk_c & blk_l & blk_r
+
+    # --- Rotating case: single blocking check at predicted intercept point ---
+    rot_end_x = jnp.where(use_rot, rot_tx, tgt_x)
+    rot_end_y = jnp.where(use_rot, rot_ty, tgt_y)
+    rot_blk   = _seg_blocked(rot_end_x, rot_end_y)
+
+    # --- Final selection ---
+    angle      = jnp.where(use_rot, rot_angle, static_ang)
+    is_blocked = no_intercept | jnp.where(rotating, rot_blk, static_blk)
+    static_eta = d_s / jnp.maximum(spd, jnp.float32(1e-6))
+    eta_ticks  = jnp.where(use_rot, rot_tick, static_eta)
+    return angle, is_blocked, eta_ticks
 
 
 def aim_fleets(
@@ -202,12 +222,13 @@ def aim_fleets(
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Vmapped re-aim for encoder-selected non-comet targets."""
     def _per(src_slot, tgt_slot, n_ships):
-        return _find_angle_single(
+        angle, is_blocked, _ = _find_angle_single(
             p_x[src_slot], p_y[src_slot], p_r[src_slot], src_slot,
             p_x[tgt_slot], p_y[tgt_slot], p_r[tgt_slot], tgt_slot,
             n_ships.astype(jnp.float32), angular_velocity,
             p_x, p_y, p_r, p_alive, p_is_comet,
         )
+        return angle, is_blocked
     return jax.vmap(_per)(src_slots, tgt_slots, ships_send)
 
 
@@ -229,8 +250,6 @@ class _EncodedTurn(NamedTuple):
     angles:          jnp.ndarray  # [MAX_SRC, K]    float32
     cand_feats:      jnp.ndarray  # [MAX_SRC, K, 30]
     global_feat:     jnp.ndarray  # [12]
-    # fleet_feats:     jnp.ndarray  # [MAX_FLEETS, 6]
-    # fleet_mask:      jnp.ndarray  # [MAX_FLEETS]    bool
     step:            jnp.ndarray  # []              int32
 
 
@@ -324,68 +343,27 @@ def _make_env_encoder(K: int, env_cfg):
         # ── Ship counts (per-candidate offensive estimate, unused for blocking) ──
         tgt_ships_2d  = state.p_ships[safe_slots]                             # [MAX_SRC, K]
 
-        # ── Source-level state needed by the cand_mask geometry ──────────
-        src_ships        = jnp.round(state.p_ships[src_slots]).astype(jnp.int32)  # [MAX_SRC]
-        has_enough_ships = src_ships[:, None] >= MIN_SOURCE_SHIPS                 # [MAX_SRC, K]
+        # ── Source ships (actual full fleet size) ───────────────────────────
+        src_ships = jnp.round(state.p_ships[src_slots]).astype(jnp.int32)    # [MAX_SRC]
 
-        # Estimated fleet speed for the sun-block check. Use src_ships//2 (the
-        # median over uniform ships-buckets) clamped to MIN_SOURCE_SHIPS — this
-        # matches what the policy is most likely to dispatch on average. The
-        # margin on SUN_RADIUS below absorbs the residual variance.
-        n_ships_est = jnp.maximum(src_ships // 2, MIN_SOURCE_SHIPS)               # [MAX_SRC]
-        v_est_src   = _fleet_speed(n_ships_est.astype(jnp.float32))               # [MAX_SRC]
+        # ── Exact aim angles + blocking for all [MAX_SRC, K] pairs ─────────
+        # Fleet size = full src_ships so speed is known exactly. The iterative
+        # intercept solver checks sun + static-planet blocking — no re-aim
+        # needed after policy output.
+        def _row(src_slot, tgt_slots_row, n_ships):
+            def _pair(tgt_slot):
+                return _find_angle_single(
+                    state.p_x[src_slot], state.p_y[src_slot], state.p_radius[src_slot], src_slot,
+                    state.p_x[tgt_slot], state.p_y[tgt_slot], state.p_radius[tgt_slot], tgt_slot,
+                    n_ships.astype(jnp.float32), state.angular_velocity,
+                    state.p_x, state.p_y, state.p_radius, state.p_alive, state.p_is_comet,
+                )
+            return jax.vmap(_pair)(tgt_slots_row)
 
-        # ── Closed-form sun-block check + aim angle ──────────────────────
-        # Predicts where the candidate will be when a fleet arrives, then tests
-        # whether the chord src → predicted_tgt passes inside SUN_RADIUS.
-        # Game rule: only the sun blocks fleets; planets/comets are transparent.
-        src_x_b = state.p_x[src_slots][:, None]                                   # [MAX_SRC, 1]
-        src_y_b = state.p_y[src_slots][:, None]
-        tgt_x_b = state.p_x[safe_slots]                                            # [MAX_SRC, K]
-        tgt_y_b = state.p_y[safe_slots]
+        angles, blocked_2d, eta_ticks = jax.vmap(_row)(src_slots, safe_slots, src_ships)
+        # angles: [MAX_SRC, K], blocked_2d: [MAX_SRC, K], eta_ticks_2d: [MAX_SRC, K]
 
-        # First-order arrival time estimate using current src→tgt distance.
-        dx_now = tgt_x_b - src_x_b
-        dy_now = tgt_y_b - src_y_b
-        d_now  = jnp.sqrt(dx_now * dx_now + dy_now * dy_now + 1e-12)
-        t_hat  = d_now / v_est_src[:, None]                                        # [MAX_SRC, K]
-
-        # Comets are excluded from candidates upstream, so this only needs the
-        # static inner-orbit criterion for planets that rotate around the sun.
-        tgt_orb_dx = tgt_x_b - CENTER
-        tgt_orb_dy = tgt_y_b - CENTER
-        tgt_orb_r  = jnp.sqrt(tgt_orb_dx * tgt_orb_dx + tgt_orb_dy * tgt_orb_dy)
-        is_rotating = tgt_orb_r + state.p_radius[safe_slots] < ROTATION_RADIUS_LIMIT
-
-        # Exact rotation (not Taylor) — same FLOPs, no radial drift bug.
-        # For non-rotating targets angle_step = 0 → predicted = current.
-        angle_step = jnp.where(is_rotating, state.angular_velocity * t_hat, jnp.float32(0.0))
-        c_a = jnp.cos(angle_step)
-        s_a = jnp.sin(angle_step)
-        pred_dx = c_a * tgt_orb_dx - s_a * tgt_orb_dy
-        pred_dy = s_a * tgt_orb_dx + c_a * tgt_orb_dy
-        pred_tx = CENTER + pred_dx                                                 # [MAX_SRC, K]
-        pred_ty = CENTER + pred_dy
-
-        # Aim angle the BC label extractor matches against expert launch angles.
-        # Static targets: pred = current, so angle is just arctan2(tgt - src).
-        # Rotating targets: lead-corrected via first-order prediction.
-        angles = jnp.arctan2(pred_ty - src_y_b, pred_tx - src_x_b)                # [MAX_SRC, K]
-
-        # Sun chord-test: point-segment distance from CENTER to src→pred_tgt.
-        seg_dx = pred_tx - src_x_b
-        seg_dy = pred_ty - src_y_b
-        seg_l2 = seg_dx * seg_dx + seg_dy * seg_dy + 1e-12
-        t_proj = jnp.clip(
-            ((CENTER - src_x_b) * seg_dx + (CENTER - src_y_b) * seg_dy) / seg_l2,
-            0.0, 1.0,
-        )
-        proj_x = src_x_b + t_proj * seg_dx
-        proj_y = src_y_b + t_proj * seg_dy
-        sun_dist_sq = (proj_x - CENTER) ** 2 + (proj_y - CENTER) ** 2
-        blocked = sun_dist_sq < (SUN_RADIUS * _SUN_BLOCK_MARGIN) ** 2              # [MAX_SRC, K]                        # no-op sends 0 ships
-
-        cand_mask = (all_cand_valid & ~blocked & has_enough_ships).at[:, 0].set(True)  # no-op always valid
+        cand_mask = (all_cand_valid & ~blocked_2d).at[:, 0].set(True)
 
         # ── Candidate IDs ─────────────────────────────────────────────────
         cand_ids = jnp.where(
@@ -459,7 +437,7 @@ def _make_env_encoder(K: int, env_cfg):
         tgt_rotating = (tgt_orb_r + state.p_radius[safe_slots]) < ROTATION_RADIUS_LIMIT
 
         tgt_orbit_r  = tgt_orb_r / (board_size * jnp.float32(0.5))   # [MAX_SRC, K] orbit radius feature
-        tgt_rot_flag = tgt_rotating.astype(jnp.float32)
+        tgt_rot_flag = tgt_rotating.astype(jnp.float32)                                                 # [MAX_SRC, K]
 
         # ── Inbound fleet detection via forward simulation ────────────────
         # Simulate over all MAX_PLANETS planets (carry [MAX_PLANETS, MAX_FLEETS])
@@ -708,7 +686,7 @@ def _make_env_encoder(K: int, env_cfg):
             delta_x / board_size,                                              # [4]  x offset from source
             delta_y / board_size,                                              # [5]  y offset from source
             tgt_dist / board_size,                                             # [6]  Euclidean distance
-            t_hat / episode_steps,                                             # [7]  normalized ETA
+            eta_ticks / episode_steps,                                             # [7]  normalized ETA
             # ── target static properties ────────────────────────────────────
             jnp.clip(tgt_ships_2d, 0.0, max_ships) / max_ships,              # [8]  garrison
             state.p_production[safe_slots] / max_production,                  # [9]  production rate
@@ -737,21 +715,6 @@ def _make_env_encoder(K: int, env_cfg):
             would_be_mine_25,                                                  # [29] will be mine after 25-tick sim
         ], axis=2).at[:, 0, :].set(0.0)  # [MAX_SRC, K, 30]; no-op slot = zeros
 
-        # ── Fleet features  [MAX_FLEETS, 6] ──────────────────────────────
-        # Velocity (not pure heading) so the cross-attention can extrapolate
-        # "fleet_pos + t·vel" geometrically without re-learning _fleet_speed.
-        # f_is_enemy = (state.f_owner != player).astype(jnp.float32)
-        # f_spd      = _fleet_speed(state.f_ships)                              # [MAX_FLEETS]
-        # fleet_feats = jnp.stack([
-        #     f_is_enemy,                                                       # [0] 1 if enemy fleet, else 0
-        #     jnp.clip(state.f_ships, 0.0, max_ships) / max_ships,             # [1] fleet size — damage potential
-        #     state.f_x / board_size,                                           # [2] normalized x position
-        #     state.f_y / board_size,                                           # [3] normalized y position
-        #     f_spd * jnp.cos(state.f_angle) / board_size,                      # [4] vx per tick, board-normalized
-        #     f_spd * jnp.sin(state.f_angle) / board_size,                      # [5] vy per tick, board-normalized
-        # ], axis=1).astype(jnp.float32)                                        # [MAX_FLEETS, 6]
-        # fleet_mask = state.f_alive                                            # [MAX_FLEETS]
-
         return _EncodedTurn(
             src_valid       = src_valid,
             src_ids         = state.p_id[src_slots],
@@ -764,8 +727,6 @@ def _make_env_encoder(K: int, env_cfg):
             angles          = angles,
             cand_feats      = cand_feats,
             global_feat     = global_feat,
-            # fleet_feats     = fleet_feats,
-            # fleet_mask      = fleet_mask,
             step            = state.step,
         )
 

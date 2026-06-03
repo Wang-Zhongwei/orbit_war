@@ -311,6 +311,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_match.set_defaults(_handler="match")
 
     real_agents = [a for a in AGENTS if a != "random"]
+    real_agents.append('jax')
     p_tour = sub.add_parser("tournament", help="Round-robin 1v1 with randomized slots.")
     p_tour.add_argument(
         "--agents", nargs="+", default=real_agents,

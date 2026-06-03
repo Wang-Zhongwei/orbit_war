@@ -16,15 +16,13 @@ MASK_LOGIT = -1e9
 
 class PolicyOutput(NamedTuple):
     target_logits: jax.Array   # [N, K]
-    ships_logits: jax.Array    # [N, K, B]
     value: jax.Array           # [N]
 
 
 class _PolicyHead(nn.Module):
-    """Policy network: target_logits and ships_logits. No shared weights with _ValueNet."""
+    """Policy network: target_logits. No shared weights with _ValueNet."""
     hidden_size: int
     candidate_count: int
-    ship_bucket_count: int
     n_heads: int
 
     @nn.compact
@@ -35,7 +33,7 @@ class _PolicyHead(nn.Module):
         global_features: jax.Array,     # [N, global_dim]
         candidate_mask: jax.Array,      # [N, K] bool
         src_valid: jax.Array,           # [N] bool
-    ) -> tuple[jax.Array, jax.Array]:
+    ) -> jax.Array:
         H, K = self.hidden_size, self.candidate_count
         N = self_features.shape[0]
 
@@ -91,11 +89,8 @@ class _PolicyHead(nn.Module):
         # exp(log_p) * log_p = 0 * -inf = NaN, which poisons the PPO loss and
         # every gradient after it. A finite floor gives prob≈0 with finite log_p.
         target_logits = jnp.where(candidate_mask, target_logits, MASK_LOGIT)
-        ships_logits  = nn.Dense(self.ship_bucket_count)(
-            nn.gelu(nn.Dense(H)(joint))
-        )                                                                       # [N, K, B]
 
-        return target_logits, ships_logits
+        return target_logits
 
 
 class _ValueNet(nn.Module):
@@ -156,7 +151,6 @@ class PlanetPolicy(nn.Module):
     candidate_dim: int
     global_dim: int
     candidate_count: int
-    ship_bucket_count: int = 8
     hidden_size: int = 128
     n_heads: int = 4
 
@@ -169,11 +163,10 @@ class PlanetPolicy(nn.Module):
         candidate_mask: jax.Array,      # [N, K] bool
         src_valid: jax.Array,           # [N] bool
     ) -> PolicyOutput:
-        target_logits, ships_logits = _PolicyHead(
-            hidden_size      = self.hidden_size,
-            candidate_count  = self.candidate_count,
-            ship_bucket_count= self.ship_bucket_count,
-            n_heads          = self.n_heads,
+        target_logits = _PolicyHead(
+            hidden_size     = self.hidden_size,
+            candidate_count = self.candidate_count,
+            n_heads         = self.n_heads,
         )(self_features, candidate_features, global_features, candidate_mask, src_valid)
 
         value = _ValueNet(
@@ -184,20 +177,18 @@ class PlanetPolicy(nn.Module):
 
         return PolicyOutput(
             target_logits = target_logits,
-            ships_logits  = ships_logits,
             value         = value,
         )
 
 
 def build_policy(cfg) -> PlanetPolicy:
     return PlanetPolicy(
-        self_dim         = self_feature_dim(),
-        candidate_dim    = candidate_feature_dim(),
-        global_dim       = global_feature_dim(),
-        candidate_count  = cfg.env.candidate_count,
-        ship_bucket_count= cfg.env.ship_bucket_count,
-        hidden_size      = cfg.model.hidden_size,
-        n_heads          = getattr(cfg.model, 'n_heads', 4),
+        self_dim        = self_feature_dim(),
+        candidate_dim   = candidate_feature_dim(),
+        global_dim      = global_feature_dim(),
+        candidate_count = cfg.env.candidate_count,
+        hidden_size     = cfg.model.hidden_size,
+        n_heads         = getattr(cfg.model, 'n_heads', 4),
     )
 
 

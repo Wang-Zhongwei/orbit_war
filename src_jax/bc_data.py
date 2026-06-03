@@ -54,6 +54,20 @@ _ANGLE_MATCH_THRESHOLD: float = 0.6
 _MAX_TICKS_PY: int = 25  # must match features.py's _MAX_TICKS
 
 
+def _pad_size_for(n: int) -> int:
+    """Return the smallest _PAD_SIZES bucket ≥ n, or n itself for very long episodes."""
+    for s in _PAD_SIZES:
+        if n <= s:
+            return s
+    return n  # >512 states: unique shape, one extra compile
+
+# Ordered pad sizes used to bucket episode batch sizes.  The smallest size that
+# fits the episode is chosen so encode_fn compiles at most len(_PAD_SIZES) times
+# instead of once per distinct episode length (each XLA recompilation costs 2-5s).
+# From the 2026-05-24 data: p50=89, p95=247, p99=471, max=481 states/episode.
+_PAD_SIZES: tuple[int, ...] = (256, 512)
+
+
 def _find_angles_for_action(
     src_x: float, src_y: float, src_radius: float,
     tgt_x: np.ndarray, tgt_y: np.ndarray, tgt_radius: np.ndarray,  # [K]
@@ -187,32 +201,34 @@ def obs_to_env_state(obs: dict, num_agents: int = 2) -> EnvState:
     dummy_ships_cg  = np.zeros(N_COMET_GROUPS, dtype=np.float32)
     dummy_path_idx  = np.full(N_COMET_GROUPS, -2, dtype=np.int32)
 
+    # Keep as numpy — caller does one batch jnp.asarray() after stacking all states.
+    # Avoids ~20 JAX dispatch calls per state (was the dominant bottleneck in bc_encode).
     return EnvState(
-        p_id          = jnp.asarray(p_id),
-        p_owner       = jnp.asarray(p_owner),
-        p_x           = jnp.asarray(p_x),
-        p_y           = jnp.asarray(p_y),
-        p_radius      = jnp.asarray(p_radius),
-        p_ships       = jnp.asarray(p_ships),
-        p_production  = jnp.asarray(p_production),
-        p_alive       = jnp.asarray(p_alive),
-        p_init_x      = jnp.asarray(p_init_x),
-        p_init_y      = jnp.asarray(p_init_y),
-        p_is_comet    = jnp.asarray(p_is_comet),
-        f_owner       = jnp.asarray(f_owner),
-        f_x           = jnp.asarray(f_x),
-        f_y           = jnp.asarray(f_y),
-        f_angle       = jnp.asarray(f_angle),
-        f_ships       = jnp.asarray(f_ships),
-        f_alive       = jnp.asarray(f_alive),
-        comet_paths     = jnp.asarray(dummy_paths),
-        comet_path_lens = jnp.asarray(dummy_path_lens),
-        comet_ships     = jnp.asarray(dummy_ships_cg),
-        comet_path_idx  = jnp.asarray(dummy_path_idx),
-        step             = jnp.int32(obs["step"]),
-        angular_velocity = jnp.float32(obs["angular_velocity"]),
-        num_agents       = jnp.int32(num_agents),
-        comet_id_base    = jnp.int32(n_base),
+        p_id          = p_id,
+        p_owner       = p_owner,
+        p_x           = p_x,
+        p_y           = p_y,
+        p_radius      = p_radius,
+        p_ships       = p_ships,
+        p_production  = p_production,
+        p_alive       = p_alive,
+        p_init_x      = p_init_x,
+        p_init_y      = p_init_y,
+        p_is_comet    = p_is_comet,
+        f_owner       = f_owner,
+        f_x           = f_x,
+        f_y           = f_y,
+        f_angle       = f_angle,
+        f_ships       = f_ships,
+        f_alive       = f_alive,
+        comet_paths     = dummy_paths,
+        comet_path_lens = dummy_path_lens,
+        comet_ships     = dummy_ships_cg,
+        comet_path_idx  = dummy_path_idx,
+        step             = np.int32(obs["step"]),
+        angular_velocity = np.float32(obs["angular_velocity"]),
+        num_agents       = np.int32(num_agents),
+        comet_id_base    = np.int32(n_base),
     )
 
 
@@ -242,15 +258,20 @@ def extract_labels(
     angular_velocity: float,
     src_slots: np.ndarray,      # [MAX_BASE_PLANETS] int32 — planet slot per source
     cand_slots: np.ndarray,     # [MAX_BASE_PLANETS, K] int32 — planet slot per candidate
-) -> list[tuple[int, int, int]]:
-    """Return (src_slot_idx, cand_idx, ship_bucket) for each matched action entry.
+) -> list[tuple[int, int, int, int, int]]:
+    """Return (src_idx, cand_idx, ship_bucket, act_ships, src_ships_count) per action.
+
+    act_ships and src_ships_count are stored in shards so that ship_bucket can be
+    recomputed for a different ship_bucket_count B without re-encoding.
+    act_ships=0 marks no-ops (either explicit out-of-pool or the implicit hold label
+    added by the caller); in that case ship_bucket is always 0 regardless of B.
 
     If the expert's launch angle is beyond _ANGLE_MATCH_THRESHOLD from every candidate
     (i.e. the target was outside the candidate pool), the action is labelled as no-op
-    (cand_idx=0, ships_bucket=0) rather than dropped — preserving the training signal
-    that this state called for inaction within the modelled action space.
+    rather than dropped — preserving the training signal that this state called for
+    inaction within the modelled action space.
     """
-    labels: list[tuple[int, int, int]] = []
+    labels: list[tuple[int, int, int, int, int]] = []
 
     for act in action:
         from_pid  = int(act[0])
@@ -295,12 +316,13 @@ def extract_labels(
         best_dist = float(dists[best_k])
 
         if best_dist > _ANGLE_MATCH_THRESHOLD:
-            # Expert targeted a planet outside the candidate pool → label as no-op
-            labels.append((src_idx, 0, 0))
+            # Expert targeted a planet outside the candidate pool → label as no-op.
+            # act_ships=0 signals "no-op" so relabeling keeps ship_bucket=0.
+            labels.append((src_idx, 0, 0, 0, S))
             continue
 
         bucket = _ships_to_bucket(act_ships, S, B)
-        labels.append((src_idx, best_k, bucket))
+        labels.append((src_idx, best_k, bucket, act_ships, S))
 
     return labels
 
@@ -329,22 +351,33 @@ def episode_to_samples(
     if not batch_states:
         return None
 
-    # Batch all states and run encoder once per episode
-    batched = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *batch_states)
-    players_arr = jnp.array(batch_players, dtype=jnp.int32)
+    N = len(batch_states)
+    # Pad to the smallest _PAD_SIZES bucket that fits N so encode_fn reuses a
+    # cached XLA kernel instead of recompiling for every distinct episode length.
+    pad_target = _pad_size_for(N)
+    pad_n = pad_target - N
+    all_states  = batch_states  + [batch_states[-1]]  * pad_n
+    all_players = batch_players + [batch_players[-1]] * pad_n
+
+    # np.stack first (fast C loop), then single jnp.asarray per field — avoids
+    # the ~8000 JAX dispatch calls that jnp.stack(list_of_jax_arrays) would cause.
+    batched = jax.tree_util.tree_map(lambda *xs: jnp.asarray(np.stack(xs)), *all_states)
+    players_arr = jnp.array(all_players, dtype=jnp.int32)
     enc = encode_fn(batched, players_arr)
     enc_np     = jax.tree_util.tree_map(np.asarray, enc)
     batched_np = jax.tree_util.tree_map(np.asarray, batched)
 
     rows_sf, rows_cf, rows_gf, rows_cm = [], [], [], []
     rows_ff, rows_fm, rows_ti, rows_sb = [], [], [], []
+    rows_as, rows_ss = [], []   # act_ships, src_ships — for B-change relabeling
 
-    for i in range(len(batch_states)):
+    for i in range(N):  # only real states, not padding
+        src_ships_i = enc_np.src_ships[i]
         labels = extract_labels(
             batch_actions[i],
             src_ids          = enc_np.src_ids[i],
             src_valid        = enc_np.src_valid[i],
-            src_ships        = enc_np.src_ships[i],
+            src_ships        = src_ships_i,
             cand_mask        = enc_np.cand_mask[i],
             B                = ship_bucket_count,
             p_x              = batched_np.p_x[i],
@@ -357,12 +390,13 @@ def episode_to_samples(
         # Emit explicit no-op labels for valid sources the expert chose to hold.
         # Without these, the policy only sees "given expert decided to launch,
         # where to?" and collapses toward always-launch at inference.
-        acted_src = {src_idx for src_idx, _, _ in labels}
+        acted_src = {src_idx for src_idx, _, _, _, _ in labels}
         src_valid_i = enc_np.src_valid[i]
         for j in range(len(src_valid_i)):
             if bool(src_valid_i[j]) and j not in acted_src:
-                labels.append((j, 0, 0))
-        for src_idx, cand_idx, ship_bucket in labels:
+                # act_ships=0 marks implicit hold; ship_bucket stays 0 for any B
+                labels.append((j, 0, 0, 0, int(src_ships_i[j])))
+        for src_idx, cand_idx, ship_bucket, act_ships, ss in labels:
             rows_sf.append(enc_np.self_feats[i,   src_idx])
             rows_cf.append(enc_np.cand_feats[i,   src_idx])
             rows_gf.append(enc_np.global_feat[i])
@@ -371,6 +405,8 @@ def episode_to_samples(
             # rows_fm.append(enc_np.fleet_mask[i])
             rows_ti.append(cand_idx)
             rows_sb.append(ship_bucket)
+            rows_as.append(act_ships)
+            rows_ss.append(ss)
 
     if not rows_sf:
         return None
@@ -384,6 +420,10 @@ def episode_to_samples(
         # "fleet_mask":   np.stack(rows_fm),
         "target_idx":   np.array(rows_ti, dtype=np.int32),
         "ships_bucket": np.array(rows_sb, dtype=np.int32),
+        # Stored so ships_bucket can be recomputed for a new B without re-encoding.
+        # act_ships=0 means no-op (hold or out-of-pool); ship_bucket is always 0.
+        "act_ships":    np.array(rows_as, dtype=np.int32),
+        "src_ships":    np.array(rows_ss, dtype=np.int32),
     }
 
 
@@ -436,8 +476,14 @@ def episode_to_samples_jax(
     if not batch_states:
         return None
 
-    batched = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *batch_states)
-    players_arr = jnp.array(batch_players, dtype=jnp.int32)
+    N = len(batch_states)
+    pad_target = _pad_size_for(N)
+    pad_n = pad_target - N
+    all_states  = batch_states  + [batch_states[-1]]  * pad_n
+    all_players = batch_players + [batch_players[-1]] * pad_n
+
+    batched = jax.tree_util.tree_map(lambda *xs: jnp.asarray(np.stack(xs)), *all_states)
+    players_arr = jnp.array(all_players, dtype=jnp.int32)
     enc = encode_fn(batched, players_arr)
 
     # Transfer only the small arrays needed for label extraction
@@ -457,7 +503,7 @@ def episode_to_samples_jax(
     ci_list: list[int] = []
     bi_list: list[int] = []
 
-    for i in range(len(batch_states)):
+    for i in range(N):  # only real states, not padding
         labels = extract_labels(
             batch_actions[i],
             src_ids          = src_ids_np[i],
@@ -475,12 +521,12 @@ def episode_to_samples_jax(
         # Emit explicit no-op labels for valid sources the expert chose to hold.
         # Without these, the policy only sees "given expert decided to launch,
         # where to?" and collapses toward always-launch at inference.
-        acted_src = {src_idx for src_idx, _, _ in labels}
+        acted_src = {src_idx for src_idx, _, _, _, _ in labels}
         src_valid_i = src_valid_np[i]
         for j in range(len(src_valid_i)):
             if bool(src_valid_i[j]) and j not in acted_src:
-                labels.append((j, 0, 0))
-        for src_idx, cand_idx, bucket in labels:
+                labels.append((j, 0, 0, 0, int(src_ships_np[i][j])))
+        for src_idx, cand_idx, bucket, _as, _ss in labels:
             ts_list.append(i)
             si_list.append(src_idx)
             ci_list.append(cand_idx)
@@ -767,3 +813,40 @@ def shard_episode_counts(shard_paths: list[Path], episodes_per_shard_fallback: i
             counts.append(episodes_per_shard_fallback)
         d.close()
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Fast B-only relabeling — no re-encoding needed when ship_bucket_count changes
+# ---------------------------------------------------------------------------
+
+def relabel_ships_bucket(shard_paths: list[Path], B_new: int, *, inplace: bool = True) -> None:
+    """Rewrite the ships_bucket field in shards for a new ship_bucket_count B.
+
+    self_feats, cand_feats, target_idx, etc. are unchanged — only ships_bucket
+    is recomputed from stored act_ships / src_ships.  Runs in seconds since no
+    encode_fn call is needed.
+
+    Requires shards to have been written with act_ships and src_ships fields
+    (bc_encode version that stores these).  Older shards without those fields
+    will raise KeyError.
+
+    inplace=True  overwrites each shard file.
+    inplace=False writes a new file alongside: shard_NNNN_B{B_new}.npz.
+    """
+    for p in shard_paths:
+        d = dict(np.load(p))
+        act_ships = d["act_ships"]   # [N] int32, 0 = no-op / hold
+        src_ships = d["src_ships"]   # [N] int32
+
+        # Vectorised bucket computation — only relabel non-no-op samples
+        new_buckets = np.zeros(len(act_ships), dtype=np.int32)
+        active = act_ships > 0
+        for idx in np.where(active)[0]:
+            new_buckets[idx] = _ships_to_bucket(int(act_ships[idx]), int(src_ships[idx]), B_new)
+
+        d["ships_bucket"] = new_buckets
+        out_path = p if inplace else p.with_name(p.stem + f"_B{B_new}.npz")
+        np.savez(out_path, **d)
+        print(f"  relabeled {p.name} → B={B_new}")
+
+    print(f"Done: {len(shard_paths)} shards relabeled for ship_bucket_count={B_new}")

@@ -20,7 +20,6 @@ eval_workers: -1  # CPU processes for eval matches; -1 = all cores
 
 env:
   candidate_count: 8
-  ship_bucket_count: 4
 
 model:
   hidden_size: 128

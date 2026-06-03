@@ -18,10 +18,10 @@ import jax
 import jax.numpy as jnp
 
 from .bc_data import obs_to_env_state
-from .features import MIN_SOURCE_SHIPS, _make_env_encoder, aim_fleets
+from .features import MIN_SOURCE_SHIPS, _make_env_encoder
 from .physics import MAX_BASE_PLANETS
 from .policy import build_policy
-from .rollout import CAND_DIM, GLOB_DIM, SELF_DIM
+from .rollout import GLOB_DIM
 
 
 def _obs_to_dict(obs) -> dict:
@@ -59,7 +59,6 @@ def build_agent(
     rng_key = jax.random.PRNGKey(int(getattr(cfg, "seed", 0)))
 
     K = cfg.env.candidate_count
-    B = cfg.env.ship_bucket_count
 
     module    = build_policy(cfg)
     encode_fn = _make_env_encoder(K, cfg.env)
@@ -69,8 +68,6 @@ def build_agent(
     @jax.jit
     def _forward(sf, cf, gf, cm, sv):
         return module.apply(params, sf, cf, gf, cm, sv)
-
-    _reaim_all = jax.jit(aim_fleets)
 
     def agent(obs) -> list:
         nonlocal rng_key
@@ -98,31 +95,15 @@ def build_agent(
             ti = jax.random.categorical(subkey, target_logits)
 
         row_idx = jnp.arange(MAX_SRC)
-        shp_logits = out.ships_logits[row_idx, ti]
-        if deterministic:
-            sb = jnp.argmax(shp_logits, axis=-1)
-        else:
-            rng_key, subkey = jax.random.split(rng_key)
-            sb = jax.random.categorical(subkey, shp_logits)
 
-        src_valid       = enc.src_valid[0]
-        src_ids         = enc.src_ids[0]
-        src_ships       = enc.src_ships[0]
-        cand_mask       = enc.cand_mask[0]
-        src_slots       = enc.src_slots[0]
-        cand_slots_safe = enc.cand_slots_safe[0]
+        src_valid = enc.src_valid[0]
+        src_ids   = enc.src_ids[0]
+        src_ships = enc.src_ships[0]
+        cand_mask = enc.cand_mask[0]
+        angles    = enc.angles[0]            # [MAX_SRC, K] — exact, precomputed by encoder
 
-        # Re-aim with actual ship count and re-verify sun clearance.
-        frac       = (sb.astype(jnp.float32) + 1.0) / jnp.float32(B)
-        ships_send = jnp.maximum(MIN_SOURCE_SHIPS, jnp.floor(frac * src_ships.astype(jnp.float32)).astype(jnp.int32))
-        selected_tgt = cand_slots_safe[row_idx, ti]
-
-        reaim_angles, is_blocked = _reaim_all(
-            state.p_x, state.p_y, state.p_radius,
-            state.p_alive, state.p_is_comet,
-            state.angular_velocity,
-            src_slots, selected_tgt, ships_send,
-        )
+        ships_send      = jnp.maximum(MIN_SOURCE_SHIPS, src_ships)
+        selected_angles = angles[row_idx, ti]
 
         moves: list = []
         for i in range(MAX_SRC):
@@ -133,9 +114,7 @@ def build_agent(
                 continue
             if not bool(cand_mask[i, t]):
                 continue
-            if bool(is_blocked[i]):
-                continue
-            moves.append([int(src_ids[i]), float(reaim_angles[i]), int(ships_send[i])])
+            moves.append([int(src_ids[i]), float(selected_angles[i]), int(ships_send[i])])
 
         return moves
 

@@ -31,7 +31,6 @@ def _rollout_buffer_bytes(T: int, N: int, K: int) -> int:
         + _GLOB_DIM * 4                    # global_features    float32
         + _MAX_SRC * K                     # candidate_masks    bool (1 byte)
         + _MAX_SRC * 4                     # target_indices     int32
-        + _MAX_SRC * 4                     # ships_buckets      int32
         + _MAX_SRC * 4                     # log_probs          float32
         + _MAX_SRC * 4                     # values             float32
         + _MAX_SRC                         # src_valid          bool
@@ -49,7 +48,7 @@ def _minibatch_bytes(mb: int, K: int, H: int) -> tuple[int, int]:
         + K * _CAND_DIM * 4    # cf
         + _GLOB_DIM * 4        # gf
         + K                    # cm  bool
-        + 5 * 4                # old_lp, ti, sb, ret, adv  (int32/float32)
+        + 4 * 4                # old_lp, ti, ret, adv  (int32/float32)
     )
     # Approximate: activations stored for backprop across both policy + value heads.
     # Each head has ~2 MLP encoders + 1 transformer block (LN, QKV, FFN) + output head.
@@ -104,12 +103,11 @@ def print_model_info(cfg) -> None:
     info = model_info(cfg)
     H  = cfg.model.hidden_size
     K  = cfg.env.candidate_count
-    B  = cfg.env.ship_bucket_count
     T  = cfg.ppo.rollout_steps
     N  = cfg.ppo.num_envs
     mb = cfg.ppo.minibatch_size
 
-    print(f"Model config:  hidden={H}  K={K}  B={B}  T={T}  N={N}  mb={mb}  max_src={_MAX_SRC}")
+    print(f"Model config:  hidden={H}  K={K}  T={T}  N={N}  mb={mb}  max_src={_MAX_SRC}")
     print(f"  Parameters:            {info['n_params']:>10,}  ({info['param_mb']:.2f} MB)")
     print(f"  Optimizer (Adam):      {'':<10}  ({info['optimizer_mb']:.2f} MB  [grad+m1+m2])")
     print(f"  Rollout buffer:        {'':<10}  ({info['rollout_mb']:.2f} MB)")

@@ -23,8 +23,7 @@ from .physics import (
     N_AGENTS,
 )
 from .features import (
-    MIN_SOURCE_SHIPS, _make_env_encoder, aim_fleets,
-    self_feature_dim, candidate_feature_dim, global_feature_dim,
+    MIN_SOURCE_SHIPS, _make_env_encoder, global_feature_dim,
 )
 from .augment import apply_augmentation_batched
 from .ppo import TrainingBatch, sample_actions
@@ -32,8 +31,6 @@ from .env import select_boards
 from .heuristic import heuristic_actions
 
 MAX_SRC  = MAX_BASE_PLANETS   # alias for clarity
-SELF_DIM = self_feature_dim()
-CAND_DIM = candidate_feature_dim()
 GLOB_DIM = global_feature_dim()
 
 
@@ -55,7 +52,6 @@ class RolloutStep(NamedTuple):
     global_features: jnp.ndarray      # [N, GLOB_DIM]
     candidate_masks: jnp.ndarray      # [N, MAX_SRC, K] bool
     target_indices: jnp.ndarray       # [N, MAX_SRC] int32
-    ships_buckets: jnp.ndarray        # [N, MAX_SRC] int32
     log_probs: jnp.ndarray        # [N, MAX_SRC] float32
     values: jnp.ndarray       # [N, MAX_SRC] float32
     src_valid: jnp.ndarray # [N, MAX_SRC] bool
@@ -67,55 +63,19 @@ class RolloutStep(NamedTuple):
 # Pure-JAX action builder (one env, no batch dim)
 # ---------------------------------------------------------------------------
 
-def _compute_ships_and_angles_single(
-    src_ships: jnp.ndarray,       # [MAX_SRC] int32
-    ti: jnp.ndarray,              # [MAX_SRC] int32
-    sb: jnp.ndarray,              # [MAX_SRC] int32
-    ship_bucket_count: int,
-    src_slots: jnp.ndarray,       # [MAX_SRC] int32
-    cand_slots_safe: jnp.ndarray, # [MAX_SRC, K] int32
-    p_x: jnp.ndarray,             # [MAX_PLANETS]
-    p_y: jnp.ndarray,
-    p_r: jnp.ndarray,
-    p_alive: jnp.ndarray,
-    p_is_comet: jnp.ndarray,
-    angular_velocity: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Convert (target idx, ship bucket) → (ships_send, intercept angle, is_blocked).
-
-    Called once per selected dispatch with the policy's actual ship count.
-    Computes the lead-corrected angle for rotating targets (the encoder's
-    cand_mask used a coarser src_ships//2 speed estimate, so a residual
-    intercept-angle drift is fixed up here) and re-checks sun + static-planet
-    blocking on the actual chord — if blocked, the fleet is dropped at action assembly.
-    """
-    row_idx = jnp.arange(MAX_SRC, dtype=jnp.int32)
-
-    frac       = (sb.astype(jnp.float32) + 1.0) / jnp.float32(ship_bucket_count)
-    ships_send = jnp.maximum(MIN_SOURCE_SHIPS, jnp.floor(frac * src_ships.astype(jnp.float32)).astype(jnp.int32))
-
-    selected_tgt = cand_slots_safe[row_idx, ti]  # [MAX_SRC]
-
-    tgt_angles, is_blocked = aim_fleets(
-        p_x, p_y, p_r, p_alive, p_is_comet, angular_velocity,
-        src_slots, selected_tgt, ships_send,
-    )
-    return ships_send, tgt_angles, is_blocked
-
 
 def _build_actions_single(
     src_ids: jnp.ndarray,         # [MAX_SRC] int32
-    cand_mask: jnp.ndarray,       # [MAX_SRC, K] bool
+    cand_mask: jnp.ndarray,       # [MAX_SRC, K] bool — already encodes blocking
     src_valid: jnp.ndarray,       # [MAX_SRC] bool
     ti: jnp.ndarray,              # [MAX_SRC] int32
     ships_send: jnp.ndarray,      # [MAX_SRC] int32
-    tgt_angles: jnp.ndarray,      # [MAX_SRC] float32
-    is_blocked: jnp.ndarray,      # [MAX_SRC] bool — drop fleet if True
+    tgt_angles: jnp.ndarray,      # [MAX_SRC] float32 — precomputed by encoder
 ) -> jnp.ndarray:
     """Assemble [MAX_ACTIONS_PA, 3] action tensor from precomputed ships + angles."""
     row_idx = jnp.arange(MAX_SRC, dtype=jnp.int32)
 
-    tgt_ok    = (ti != 0) & cand_mask[row_idx, ti] & ~is_blocked
+    tgt_ok    = (ti != 0) & cand_mask[row_idx, ti]
     action_ok = src_valid & tgt_ok                               # [MAX_SRC]
 
     n_act = min(MAX_SRC, MAX_ACTIONS_PA)
@@ -169,7 +129,6 @@ def make_rollout_fn(
     """
     K                  = cfg.env.candidate_count
     N_ENVS             = cfg.ppo.num_envs
-    ship_bucket_count  = cfg.env.ship_bucket_count
     episode_steps      = cfg.env.episode_steps
     alternate_sides    = cfg.alternate_player_sides
     opp_deterministic  = cfg.self_play_deterministic
@@ -205,13 +164,12 @@ def make_rollout_fn(
             lambda x: x.reshape(N_ENVS * MAX_SRC, *x.shape[2:]), out_per_env
         )
         key, subkey = jax.random.split(key)
-        ti_f, sb_f, lp_f, _, _ = sample_actions(outputs, subkey, deterministic=deterministic)
+        ti_f, lp_f, _, _ = sample_actions(outputs, subkey, deterministic=deterministic)
 
         ti  = ti_f.reshape(N_ENVS, MAX_SRC)
-        sb  = sb_f.reshape(N_ENVS, MAX_SRC)
         lp  = lp_f.reshape(N_ENVS, MAX_SRC)
         val = outputs.value.reshape(N_ENVS, MAX_SRC)
-        return ti, sb, lp, val, key
+        return ti, lp, val, key
 
     def _run_opp_policy(stacked_opp_params, enc, key, deterministic):
         # stacked_opp_params: [n_opponents, ...] — select per env via round-robin
@@ -230,30 +188,17 @@ def make_rollout_fn(
 
         flat = jax.tree_util.tree_map(lambda x: x.reshape(N_ENVS * MAX_SRC, *x.shape[2:]), outputs)
         key, subkey = jax.random.split(key)
-        ti_f, sb_f, _, _, key = sample_actions(flat, subkey, deterministic=deterministic)
-        return ti_f.reshape(N_ENVS, MAX_SRC), sb_f.reshape(N_ENVS, MAX_SRC), key
+        ti_f, _, _, key = sample_actions(flat, subkey, deterministic=deterministic)
+        return ti_f.reshape(N_ENVS, MAX_SRC), key
 
-    def _enc_to_actions(enc, state, ti, sb):
-        def one_env(
-            src_ids, src_ships, cand_mask, valid, ti_i, sb_i,
-            src_slots, cand_slots_safe,
-            p_x, p_y, p_r, p_alive, p_is_comet, angular_velocity,
-        ):
-            ships_send, tgt_angles, is_blocked = _compute_ships_and_angles_single(
-                src_ships, ti_i, sb_i, ship_bucket_count,
-                src_slots, cand_slots_safe,
-                p_x, p_y, p_r, p_alive, p_is_comet, angular_velocity,
-            )
-            return _build_actions_single(
-                src_ids, cand_mask, valid, ti_i, ships_send, tgt_angles, is_blocked,
-            )
+    def _enc_to_actions(enc, ti):
+        def one_env(src_ids, src_ships, cand_mask, angles, valid, ti_i):
+            row_idx    = jnp.arange(MAX_SRC, dtype=jnp.int32)
+            ships_send = jnp.maximum(MIN_SOURCE_SHIPS, src_ships)
+            tgt_angles = angles[row_idx, ti_i]
+            return _build_actions_single(src_ids, cand_mask, valid, ti_i, ships_send, tgt_angles)
         return jax.vmap(one_env)(
-            enc.src_ids, enc.src_ships,
-            enc.cand_mask, enc.src_valid, ti, sb,
-            enc.src_slots, enc.cand_slots_safe,
-            state.p_x, state.p_y, state.p_radius,
-            state.p_alive, state.p_is_comet,
-            state.angular_velocity,
+            enc.src_ids, enc.src_ships, enc.cand_mask, enc.angles, enc.src_valid, ti,
         )  # [N, MAX_ACTIONS_PA, 3]
 
     def _joint_actions(learner_players, l_acts, o_acts):
@@ -290,8 +235,8 @@ def make_rollout_fn(
                 l_enc.self_feats, l_enc.cand_feats, l_enc.global_feat, aug_ids,
             )
             l_enc = l_enc._replace(self_feats=sf_aug, cand_feats=cf_aug, global_feat=gf_aug)
-        ti, sb, lp, val, key = _run_policy(params, l_enc, key, deterministic=False)
-        l_acts = _enc_to_actions(l_enc, state, ti, sb)
+        ti, lp, val, key = _run_policy(params, l_enc, key, deterministic=False)
+        l_acts = _enc_to_actions(l_enc, ti)
 
         # Opponent actions — heuristic and/or neural branches resolved at JIT time.
         opp_players = 1 - learner_players
@@ -304,10 +249,10 @@ def make_rollout_fn(
             if n_opponents == 1:
                 # All envs share the same params — use the efficient batched forward.
                 single_opp = jax.tree_util.tree_map(lambda p: p[0], opp_params)
-                oti, osb, _, _, key = _run_policy(single_opp, o_enc, key, deterministic=opp_deterministic)
+                oti, _, _, key = _run_policy(single_opp, o_enc, key, deterministic=opp_deterministic)
             else:
-                oti, osb, key = _run_opp_policy(opp_params, o_enc, key, deterministic=opp_deterministic)
-            n_acts = _enc_to_actions(o_enc, state, oti, osb)
+                oti, key = _run_opp_policy(opp_params, o_enc, key, deterministic=opp_deterministic)
+            n_acts = _enc_to_actions(o_enc, oti)
 
         if _any_heuristic and _any_neural:
             # Mixed pool: select per-env based on which opponent slot is assigned.
@@ -371,7 +316,7 @@ def make_rollout_fn(
             candidate_features=l_enc.cand_feats,
             global_features=l_enc.global_feat,
             candidate_masks=l_enc.cand_mask,
-            target_indices=ti, ships_buckets=sb, log_probs=lp, values=val,
+            target_indices=ti, log_probs=lp, values=val,
             src_valid=l_enc.src_valid,
             reward=reward, done=done,
         )
@@ -484,7 +429,6 @@ def build_training_batch(steps: RolloutStep, step_returns: jnp.ndarray) -> Train
     gf  = _r(steps.global_features)     # [B, glob_dim]
     cm  = _r(steps.candidate_masks)     # [B, MAX_SRC, K]
     ti  = _r(steps.target_indices)      # [B, MAX_SRC]
-    sb  = _r(steps.ships_buckets)       # [B, MAX_SRC]
     lp  = _r(steps.log_probs)           # [B, MAX_SRC]
     val = _r(steps.values)              # [B, MAX_SRC]
     sv  = _r(steps.src_valid)           # [B, MAX_SRC]
@@ -496,7 +440,6 @@ def build_training_batch(steps: RolloutStep, step_returns: jnp.ndarray) -> Train
         global_features    = gf,
         candidate_mask     = cm,
         target_index       = ti.astype(jnp.int32),
-        ships_bucket       = sb.astype(jnp.int32),
         log_prob           = lp,
         returns            = ret,
         advantages         = ret[:, None] - val,  # [B, MAX_SRC]

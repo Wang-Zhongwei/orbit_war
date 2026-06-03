@@ -12,7 +12,6 @@ alternate_player_sides: true
 
 env:
   candidate_count: 8
-  ship_bucket_count: 8
 
 model:
   hidden_size: 128

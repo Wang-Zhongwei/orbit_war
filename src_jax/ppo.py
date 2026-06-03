@@ -39,7 +39,6 @@ class TrainingBatch:
     global_features: jax.Array      # [B, global_dim]
     candidate_mask: jax.Array       # [B, MAX_SRC, K]  bool
     target_index: jax.Array         # [B, MAX_SRC]     int32
-    ships_bucket: jax.Array         # [B, MAX_SRC]     int32
     log_prob: jax.Array             # [B, MAX_SRC]     float32
     returns: jax.Array              # [B]              float32
     advantages: jax.Array           # [B, MAX_SRC]     float32
@@ -48,7 +47,7 @@ class TrainingBatch:
 
 _TB_FIELDS = [
     'self_features', 'candidate_features', 'global_features', 'candidate_mask',
-    'target_index', 'ships_bucket', 'log_prob', 'returns', 'advantages', 'src_valid',
+    'target_index', 'log_prob', 'returns', 'advantages', 'src_valid',
 ]
 jax.tree_util.register_pytree_node(
     TrainingBatch,
@@ -87,19 +86,10 @@ def _safe_target_logits(target_logits: jax.Array) -> jax.Array:
 def action_log_prob_and_entropy(
     outputs: PolicyOutput,
     target_index: jax.Array,
-    ships_bucket: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
     target_logits = _safe_target_logits(outputs.target_logits)
-    N = target_index.shape[0]
-    selected_ships = outputs.ships_logits[jnp.arange(N), target_index]
-    log_prob = (
-        _categorical_log_prob(target_logits, target_index)
-        + _categorical_log_prob(selected_ships, ships_bucket)
-    )
-    entropy = (
-        _categorical_entropy(target_logits)
-        + _categorical_entropy(selected_ships)
-    )
+    log_prob = _categorical_log_prob(target_logits, target_index)
+    entropy  = _categorical_entropy(target_logits)
     return log_prob, entropy
 
 
@@ -107,10 +97,9 @@ def sample_actions(
     outputs: PolicyOutput,
     key: jax.Array,
     deterministic: bool,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Sample (target_index, ships_bucket) and return (ti, sb, log_prob, entropy, new_key)."""
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Sample target_index and return (ti, log_prob, entropy, new_key)."""
     target_logits = _safe_target_logits(outputs.target_logits)
-    N = outputs.value.shape[0]
 
     if deterministic:
         target_index = jnp.argmax(target_logits, axis=-1)
@@ -118,16 +107,8 @@ def sample_actions(
         key, k1 = jax.random.split(key)
         target_index = jax.random.categorical(k1, target_logits)
 
-    selected_ships_logits = outputs.ships_logits[jnp.arange(N), target_index]
-
-    if deterministic:
-        ships_bucket = jnp.argmax(selected_ships_logits, axis=-1)
-    else:
-        key, k2 = jax.random.split(key)
-        ships_bucket = jax.random.categorical(k2, selected_ships_logits)
-
-    log_prob, entropy = action_log_prob_and_entropy(outputs, target_index, ships_bucket)
-    return target_index, ships_bucket, log_prob, entropy, key
+    log_prob, entropy = action_log_prob_and_entropy(outputs, target_index)
+    return target_index, log_prob, entropy, key
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +137,6 @@ def _ppo_update_jit(
     sv      = batch.src_valid            # [B, MAX_SRC] bool
     old_lp  = batch.log_prob             # [B, MAX_SRC]
     ti      = batch.target_index         # [B, MAX_SRC]
-    sb      = batch.ships_bucket         # [B, MAX_SRC]
     ret     = batch.returns              # [B]
     adv_raw = batch.advantages           # [B, MAX_SRC]
 
@@ -191,14 +171,11 @@ def _ppo_update_jit(
                 ref_params, sf_i, cf_i, gf_i, cm_i, sv_i
             )
         )(sf, cf, gf_exp_full, cm, sv)
-        # [B, MAX_SRC, K] — apply _safe_target_logits once over the flat B*MAX_SRC axis
-        ref_tgt_all   = _safe_target_logits(
+        ref_tgt_all = _safe_target_logits(
             ref_out_full.target_logits.reshape(B * MAX_SRC, K)
         ).reshape(B, MAX_SRC, K)
-        ref_ships_all = ref_out_full.ships_logits  # [B, MAX_SRC, K, B_ships]
     else:
-        ref_tgt_all   = None
-        ref_ships_all = None
+        ref_tgt_all = None
 
     # Pre-split one key per epoch so the scan carries only the TrainState.
     key, *epoch_keys = jax.random.split(key, epochs + 1)
@@ -219,15 +196,11 @@ def _ppo_update_jit(
 
         def loss_fn(params):
             outputs  = _fwd(params)
-            B_ships  = outputs.ships_logits.shape[-1]
             flat_out = PolicyOutput(
                 target_logits = outputs.target_logits.reshape(mb * MAX_SRC, K),
-                ships_logits  = outputs.ships_logits.reshape(mb * MAX_SRC, K, B_ships),
                 value         = outputs.value.reshape(-1),
             )
-            new_lp_f, ent_f = action_log_prob_and_entropy(
-                flat_out, ti[idx].reshape(-1), sb[idx].reshape(-1)
-            )
+            new_lp_f, ent_f = action_log_prob_and_entropy(flat_out, ti[idx].reshape(-1))
             new_lp  = new_lp_f.reshape(mb, MAX_SRC)
             ent     = ent_f.reshape(mb, MAX_SRC)
             valid_m = sv_mb.astype(jnp.float32)
@@ -242,15 +215,9 @@ def _ppo_update_jit(
             em = (ent * valid_m).sum() / n_v
 
             if use_kl:
-                ref_tgt   = ref_tgt_all[idx].reshape(mb * MAX_SRC, K)
-                new_tgt   = _safe_target_logits(flat_out.target_logits)
-                kl_tgt    = (_categorical_kl(ref_tgt, new_tgt).reshape(mb, MAX_SRC) * valid_m).sum() / n_v
-                ref_ships = ref_ships_all[idx].reshape(mb * MAX_SRC, K, B_ships)
-                kl_ships  = (
-                    _categorical_kl(ref_ships, flat_out.ships_logits)
-                    .reshape(mb, MAX_SRC, K).mean(axis=-1) * valid_m
-                ).sum() / n_v
-                kl = 0.5 * (kl_tgt + kl_ships)
+                ref_tgt = ref_tgt_all[idx].reshape(mb * MAX_SRC, K)
+                new_tgt = _safe_target_logits(flat_out.target_logits)
+                kl      = (_categorical_kl(ref_tgt, new_tgt).reshape(mb, MAX_SRC) * valid_m).sum() / n_v
             else:
                 kl = jnp.float32(0.0)
 

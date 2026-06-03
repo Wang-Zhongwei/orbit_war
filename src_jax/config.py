@@ -93,6 +93,7 @@ class BCConfig:
     out_dir: str = "artifacts/bc"
     run_name: str = "bc_pretrain"
     augment: bool = True
+    encode_workers: int = 0  # CPU encoder processes; 0 = auto (cpu_count - 1)
 
     def __setstate__(self, state) -> None: _setstate(self, state)
 

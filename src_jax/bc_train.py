@@ -16,8 +16,8 @@ Runtime flags (accepted in both modes):
     --no_wandb               Disable W&B logging
 
 Loss:
-    CE(target_logits, expert_target) + CE(ships_logits[expert_target], expert_bucket)
-    No value loss, no entropy bonus — pure supervised imitation.
+    CE(target_logits, expert_target)
+    No ships head, no value loss, no entropy bonus — pure supervised imitation.
 
 The saved checkpoint is compatible with train.py --resume so you can warm-start PPO.
 """
@@ -25,8 +25,11 @@ The saved checkpoint is compatible with train.py --resume so you can warm-start 
 from __future__ import annotations
 
 import argparse
+import multiprocessing
 import pickle
 import time
+from collections import deque
+from concurrent.futures import Future, ProcessPoolExecutor
 from pathlib import Path
 
 import jax
@@ -36,9 +39,8 @@ import optax
 
 from .augment import DEFAULT_AUG_IDS, expand_with_augmentations
 from .bc_data import (
-    _filter_winner,
     _iter_episode_jsons,
-    episode_to_samples_jax,
+    episode_to_samples,
     find_shards,
     shard_episode_counts,
 )
@@ -46,6 +48,50 @@ from .config import TrainConfig, load_train_config
 from .features import _make_env_encoder
 from .policy import build_policy, init_params
 from .ppo import TrainState
+
+
+# ---------------------------------------------------------------------------
+# Multiprocessing worker: CPU-JAX encoding, returns picklable numpy dict
+# ---------------------------------------------------------------------------
+
+# Per-worker globals set once by _worker_init
+_g_encode_fn = None
+
+
+def _worker_init(env_cfg) -> None:
+    """Initialize CPU-only JAX and the feature encoder in each worker process."""
+    import os
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    global _g_encode_fn
+    from src_jax.features import _make_env_encoder as _mee  # absolute import for spawn
+    _g_encode_fn = _mee(env_cfg.candidate_count, env_cfg)
+
+
+def _encode_episode(args: tuple) -> "dict | None":
+    """Worker task: winner-filter + encode one episode → numpy dict."""
+    episode, winner_only = args
+    from src_jax.bc_data import episode_to_samples as _eps, _filter_winner  # absolute
+
+    if not isinstance(episode, dict) or "steps" not in episode:
+        return None
+
+    if winner_only:
+        rewards       = episode.get("rewards", [])
+        statuses      = episode.get("statuses", [])
+        valid_rewards = [r for r in rewards if r is not None]
+        if not valid_rewards:
+            return None
+        best = max(valid_rewards)
+        winning_player = next(
+            (i for i, (r, s) in enumerate(zip(rewards, statuses))
+             if r == best and s == "DONE"),
+            None,
+        )
+        if winning_player is None:
+            return None
+        episode = _filter_winner(episode, winning_player)
+
+    return _eps(episode, _g_encode_fn, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -60,32 +106,21 @@ def _bc_step(
     gf: jax.Array,   # [N, global_dim]
     cm: jax.Array,   # [N, K]
     ti: jax.Array,   # [N]  int32  target index
-    sb: jax.Array,   # [N]  int32  ship bucket
-) -> tuple[TrainState, jax.Array, jax.Array, jax.Array]:
+) -> tuple[TrainState, jax.Array, jax.Array]:
     def loss_fn(params):
-        sv = jnp.ones(sf.shape[0], dtype=jnp.bool_)
+        sv  = jnp.ones(sf.shape[0], dtype=jnp.bool_)
         out = state.apply_fn(params, sf, cf, gf, cm, sv)
         N   = ti.shape[0]
 
-        # Target cross-entropy
         tgt_lp   = jax.nn.log_softmax(out.target_logits, axis=-1)
         tgt_loss = -tgt_lp[jnp.arange(N), ti].mean()
+        tgt_acc  = (jnp.argmax(out.target_logits, axis=-1) == ti).astype(jnp.float32).mean()
 
-        # Ships cross-entropy — only over the chosen target's ship logits
-        shp_logits = out.ships_logits[jnp.arange(N), ti]   # [N, B]
-        shp_lp     = jax.nn.log_softmax(shp_logits, axis=-1)
-        shp_loss   = -shp_lp[jnp.arange(N), sb].mean()
+        return tgt_loss, tgt_acc
 
-        # Top-1 accuracy helpers (returned as aux, not differentiated)
-        tgt_acc = (jnp.argmax(out.target_logits, axis=-1) == ti).astype(jnp.float32).mean()
-        shp_acc = (jnp.argmax(shp_logits,        axis=-1) == sb).astype(jnp.float32).mean()
-
-        total = tgt_loss + shp_loss
-        return total, (tgt_loss, shp_loss, tgt_acc, shp_acc)
-
-    (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    (loss, tgt_acc), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     state = state.apply_gradients(grads=grads)
-    return state, loss, aux[0], aux[1], aux[2], aux[3]  # state, total, tgt_loss, shp_loss, tgt_acc, shp_acc
+    return state, loss, tgt_acc
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +202,6 @@ def train(
                 "augment": bc.augment,
                 "aug_ids": aug_ids if bc.augment else [],
                 "candidate_count": cfg.env.candidate_count,
-                "ship_bucket_count": cfg.env.ship_bucket_count,
                 "top_k_episodes": bc.top_k_episodes,
                 "hidden_size": cfg.model.hidden_size,
             },
@@ -181,8 +215,7 @@ def train(
 
     for epoch in range(1, bc.epochs + 1):
         shard_order = rng.permutation(len(shard_paths)).tolist()
-        losses, tgt_losses, shp_losses = [], [], []
-        tgt_accs, shp_accs = [], []
+        losses, tgt_accs = [], []
         t0 = time.time()
         n_steps_epoch = 0
 
@@ -198,44 +231,34 @@ def train(
             gf = jnp.asarray(data["global_feats"][perm])
             cm = jnp.asarray(data["cand_mask"][perm])
             ti = jnp.asarray(data["target_idx"][perm])
-            sb = jnp.asarray(data["ships_bucket"][perm])
 
             # D4 augmentation: expand shard N→N*len(aug_ids) then re-shuffle.
             if bc.augment:
-                sf, cf, gf, cm, ti, sb = expand_with_augmentations(
-                    sf, cf, gf, cm, ti, sb, aug_ids
+                sf, cf, gf, cm, ti = expand_with_augmentations(
+                    sf, cf, gf, cm, ti, aug_ids
                 )
                 N = sf.shape[0]
                 perm2 = jnp.asarray(rng.permutation(N))
                 sf, cf, gf = sf[perm2], cf[perm2], gf[perm2]
-                cm, ti, sb = cm[perm2], ti[perm2], sb[perm2]
+                cm, ti = cm[perm2], ti[perm2]
 
             shard_losses: list[jax.Array] = []
-            shard_tgt_l: list[jax.Array] = []
-            shard_shp_l: list[jax.Array] = []
             shard_tgt_a: list[jax.Array] = []
-            shard_shp_a: list[jax.Array] = []
             for start in range(0, N - bc.batch_size + 1, bc.batch_size):
                 end = start + bc.batch_size
-                state, loss, tgt_l, shp_l, tgt_a, shp_a = _bc_step(
+                state, loss, tgt_a = _bc_step(
                     state,
                     sf[start:end], cf[start:end], gf[start:end], cm[start:end],
-                    ti[start:end], sb[start:end],
+                    ti[start:end],
                 )
                 shard_losses.append(loss)
-                shard_tgt_l.append(tgt_l)
-                shard_shp_l.append(shp_l)
                 shard_tgt_a.append(tgt_a)
-                shard_shp_a.append(shp_a)
                 global_step += 1
                 n_steps_epoch += 1
 
             # Single GPU→CPU sync per shard instead of per step
             losses.append(float(jnp.mean(jnp.stack(shard_losses))))
-            tgt_losses.append(float(jnp.mean(jnp.stack(shard_tgt_l))))
-            shp_losses.append(float(jnp.mean(jnp.stack(shard_shp_l))))
             tgt_accs.append(float(jnp.mean(jnp.stack(shard_tgt_a))))
-            shp_accs.append(float(jnp.mean(jnp.stack(shard_shp_a))))
 
             elapsed = time.time() - t0
             steps_per_s = n_steps_epoch / elapsed if elapsed > 0 else 0
@@ -243,7 +266,6 @@ def train(
                 f"  shard {si+1:3d}/{len(shard_paths)}"
                 f"  loss={losses[-1]:.4f}"
                 f"  tgt_acc={tgt_accs[-1]:.3f}"
-                f"  shp_acc={shp_accs[-1]:.3f}"
                 f"  steps={n_steps_epoch}"
                 f"  {elapsed:.0f}s ({steps_per_s:.1f} steps/s)",
                 flush=True,
@@ -255,27 +277,20 @@ def train(
                     tag=f"{epoch:06d}_shard{si+1:04d}",
                 )
 
-        mean_loss = float(np.mean(losses))
-        mean_tgt  = float(np.mean(tgt_losses))
-        mean_shp  = float(np.mean(shp_losses))
+        mean_loss    = float(np.mean(losses))
         mean_tgt_acc = float(np.mean(tgt_accs))
-        mean_shp_acc = float(np.mean(shp_accs))
-        elapsed   = time.time() - t0
-        steps_per_s = n_steps_epoch / elapsed if elapsed > 0 else 0
+        elapsed      = time.time() - t0
+        steps_per_s  = n_steps_epoch / elapsed if elapsed > 0 else 0
         print(
             f"epoch={epoch:3d}  loss={mean_loss:.4f}"
-            f"  tgt={mean_tgt:.4f}  shp={mean_shp:.4f}"
-            f"  tgt_acc={mean_tgt_acc:.3f}  shp_acc={mean_shp_acc:.3f}"
+            f"  tgt_acc={mean_tgt_acc:.3f}"
             f"  steps={n_steps_epoch}  {elapsed:.1f}s ({steps_per_s:.1f} steps/s)"
         )
 
         if use_wandb:
             import wandb
             wandb.log(
-                {
-                    "bc/loss": mean_loss, "bc/tgt_loss": mean_tgt, "bc/ships_loss": mean_shp,
-                    "bc/tgt_acc": mean_tgt_acc, "bc/shp_acc": mean_shp_acc,
-                },
+                {"bc/loss": mean_loss, "bc/tgt_acc": mean_tgt_acc},
                 step=global_step,
             )
 
@@ -323,12 +338,15 @@ def train_stream(
     *,
     use_wandb: bool = True,
 ) -> TrainState:
-    """Streaming BC training loop (on-the-fly encoding from zip). All hyperparameters are read from cfg.bc."""
+    """Streaming BC training loop with parallel CPU encoding.
+
+    Worker processes run CPU-JAX to encode episodes → numpy dicts while the
+    main process trains on the GPU, overlapping the two via a sliding window.
+    """
     bc = cfg.bc
     aug_ids = DEFAULT_AUG_IDS
 
     episodes_dirs = _resolve_episode_dirs(episodes_dirs)
-    encode_fn = _make_env_encoder(cfg.env.candidate_count, cfg.env)
 
     policy = build_policy(cfg)
     params = init_params(policy, cfg.seed)
@@ -337,6 +355,10 @@ def train_stream(
         optax.adam(bc.lr),
     )
     state = TrainState.create(apply_fn=policy.apply, params=params, tx=tx)
+
+    num_workers = bc.encode_workers if bc.encode_workers > 0 else max(1, multiprocessing.cpu_count() - 1)
+    # inflight cap: enough futures to keep workers busy during one GPU drain
+    _INFLIGHT = num_workers * 4
 
     if use_wandb:
         import wandb
@@ -354,8 +376,8 @@ def train_stream(
                 "augment": bc.augment,
                 "aug_ids": aug_ids if bc.augment else [],
                 "candidate_count": cfg.env.candidate_count,
-                "ship_bucket_count": cfg.env.ship_bucket_count,
                 "hidden_size": cfg.model.hidden_size,
+                "encode_workers": num_workers,
             },
         )
 
@@ -363,6 +385,7 @@ def train_stream(
 
     def _drain_buffer(buf: list[dict]) -> None:
         nonlocal state, global_step, n_samples
+        # buf items are numpy dicts from workers; jnp.concatenate accepts numpy
         keys = buf[0].keys()
         data = {k: jnp.concatenate([s[k] for s in buf], axis=0) for k in keys}
         N    = int(data["target_idx"].shape[0])
@@ -372,80 +395,81 @@ def train_stream(
         gf = data["global_feats"][perm]
         cm = data["cand_mask"][perm]
         ti = data["target_idx"][perm]
-        sb = data["ships_bucket"][perm]
 
-        # D4 augmentation: expand buffer N→N*len(aug_ids) then re-shuffle.
         if bc.augment:
-            sf, cf, gf, cm, ti, sb = expand_with_augmentations(
-                sf, cf, gf, cm, ti, sb, aug_ids
+            sf, cf, gf, cm, ti = expand_with_augmentations(
+                sf, cf, gf, cm, ti, aug_ids
             )
             N = int(sf.shape[0])
             perm2 = jnp.array(rng.permutation(N))
             sf, cf, gf = sf[perm2], cf[perm2], gf[perm2]
-            cm, ti, sb = cm[perm2], ti[perm2], sb[perm2]
+            cm, ti = cm[perm2], ti[perm2]
 
         buf_losses: list[jax.Array] = []
-        buf_tgt_l: list[jax.Array] = []
-        buf_shp_l: list[jax.Array] = []
         buf_tgt_a: list[jax.Array] = []
-        buf_shp_a: list[jax.Array] = []
         for start in range(0, N - bc.batch_size + 1, bc.batch_size):
             end = start + bc.batch_size
-            state, loss, tgt_l, shp_l, tgt_a, shp_a = _bc_step(
+            state, loss, tgt_a = _bc_step(
                 state,
                 sf[start:end], cf[start:end], gf[start:end], cm[start:end],
-                ti[start:end], sb[start:end],
+                ti[start:end],
             )
             buf_losses.append(loss)
-            buf_tgt_l.append(tgt_l)
-            buf_shp_l.append(shp_l)
             buf_tgt_a.append(tgt_a)
-            buf_shp_a.append(shp_a)
             global_step += 1
 
-        # Single GPU→CPU sync per buffer drain instead of per step
         losses.append(float(jnp.mean(jnp.stack(buf_losses))))
-        tgt_losses.append(float(jnp.mean(jnp.stack(buf_tgt_l))))
-        shp_losses.append(float(jnp.mean(jnp.stack(buf_shp_l))))
         tgt_accs.append(float(jnp.mean(jnp.stack(buf_tgt_a))))
-        shp_accs.append(float(jnp.mean(jnp.stack(buf_shp_a))))
         n_samples += N
 
-    for epoch in range(1, bc.epochs + 1):
-        losses, tgt_losses, shp_losses = [], [], []
-        tgt_accs, shp_accs = [], []
-        t0 = time.time()
-        n_episodes = n_samples = global_step = 0
-        buffer: list[dict] = []
-        limit_msg = "" if bc.top_k_episodes is None else f" (top_k_episodes={bc.top_k_episodes})"
-        print(
-            f"\nepoch {epoch}/{bc.epochs}: reading from {[str(d) for d in episodes_dirs]}"
-            f"{limit_msg} ...",
-            flush=True,
-        )
+    print(f"Starting BC training: {bc.epochs} epochs, batch={bc.batch_size}, "
+          f"encode_workers={num_workers}", flush=True)
+    print(f"Checkpoints → {Path(bc.out_dir) / bc.run_name}", flush=True)
 
-        for episodes_dir in episodes_dirs:
-            reached_episode_limit = False
-            for _name, episode in _iter_episode_jsons(episodes_dir):
-                if not isinstance(episode, dict) or "steps" not in episode:
-                    continue
-                if bc.winner_only:
-                    rewards  = episode.get("rewards", [])
-                    statuses = episode.get("statuses", [])
-                    valid_rewards = [r for r in rewards if r is not None]
-                    if not valid_rewards:
-                        continue
-                    best = max(valid_rewards)
-                    winning_player = next(
-                        (i for i, (r, s) in enumerate(zip(rewards, statuses))
-                         if r == best and s == "DONE"),
-                        None,
-                    )
-                    if winning_player is None:
-                        continue
-                    episode = _filter_winner(episode, winning_player)
+    mp_ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(
+        max_workers=num_workers,
+        initializer=_worker_init,
+        initargs=(cfg.env,),
+        mp_context=mp_ctx,
+    ) as pool:
 
-                samples = episode_to_samples_jax(episode, encode_fn, cfg.env.ship_bucket_count)
+        def _iter_all():
+            for d in episodes_dirs:
+                for _name, ep in _iter_episode_jsons(d):
+                    yield ep
+
+        for epoch in range(1, bc.epochs + 1):
+            losses, tgt_accs = [], []
+            t0 = time.time()
+            n_episodes = n_samples = global_step = 0
+            buffer: list[dict] = []
+            limit_msg = "" if bc.top_k_episodes is None else f" (top_k_episodes={bc.top_k_episodes})"
+            print(
+                f"\nepoch {epoch}/{bc.epochs}: reading from {[str(d) for d in episodes_dirs]}"
+                f"{limit_msg} ...",
+                flush=True,
+            )
+
+            pending: deque[Future] = deque()
+            ep_iter = _iter_all()
+
+            # Pre-fill sliding window
+            for _ in range(_INFLIGHT):
+                ep = next(ep_iter, None)
+                if ep is None:
+                    break
+                pending.append(pool.submit(_encode_episode, (ep, bc.winner_only)))
+
+            while pending:
+                f = pending.popleft()
+
+                # Refill window before blocking on result (keeps workers busy)
+                ep = next(ep_iter, None)
+                if ep is not None and (bc.top_k_episodes is None or n_episodes < bc.top_k_episodes):
+                    pending.append(pool.submit(_encode_episode, (ep, bc.winner_only)))
+
+                samples = f.result()
                 if samples is None:
                     continue
 
@@ -466,55 +490,46 @@ def train_stream(
                         f"  ep={n_episodes}  samples={n_samples}  steps={global_step}"
                         f"  loss={float(np.mean(losses)):.4f}"
                         f"  tgt_acc={float(np.mean(tgt_accs)):.3f}"
-                        f"  shp_acc={float(np.mean(shp_accs)):.3f}"
                         f"  {elapsed:.0f}s ({steps_per_s:.1f} steps/s)",
                         flush=True,
                     )
 
                 if bc.top_k_episodes is not None and n_episodes >= bc.top_k_episodes:
-                    reached_episode_limit = True
+                    for pf in pending:
+                        pf.cancel()
+                    pending.clear()
                     break
 
-            if reached_episode_limit:
-                break
+            if buffer:
+                _drain_buffer(buffer)
 
-        if buffer:
-            _drain_buffer(buffer)
+            if n_episodes == 0:
+                dirs_str = ", ".join(d.name for d in episodes_dirs)
+                raise RuntimeError(
+                    f"Stream mode processed 0 episodes from: {dirs_str}\n"
+                    "Check that the directories contain .zip or .json episode replay files.\n"
+                    "Example: --episode_dirs episodes/2026-05-24"
+                )
 
-        if n_episodes == 0:
-            dirs_str = ", ".join(d.name for d in episodes_dirs)
-            raise RuntimeError(
-                f"Stream mode processed 0 episodes from: {dirs_str}\n"
-                "Check that the directories contain .zip or .json episode replay files.\n"
-                "Example: --episode_dirs episodes/2026-05-24"
+            mean_loss    = float(np.mean(losses)) if losses else float("nan")
+            mean_tgt_acc = float(np.mean(tgt_accs)) if tgt_accs else float("nan")
+            elapsed      = time.time() - t0
+            steps_per_s  = global_step / elapsed if elapsed > 0 else 0
+            print(
+                f"epoch={epoch:3d}  loss={mean_loss:.4f}"
+                f"  tgt_acc={mean_tgt_acc:.3f}"
+                f"  ep={n_episodes}  samples={n_samples}"
+                f"  steps={global_step}  {elapsed:.1f}s ({steps_per_s:.1f} steps/s)"
             )
 
-        mean_loss = float(np.mean(losses)) if losses else float("nan")
-        mean_tgt  = float(np.mean(tgt_losses)) if tgt_losses else float("nan")
-        mean_shp  = float(np.mean(shp_losses)) if shp_losses else float("nan")
-        mean_tgt_acc = float(np.mean(tgt_accs)) if tgt_accs else float("nan")
-        mean_shp_acc = float(np.mean(shp_accs)) if shp_accs else float("nan")
-        elapsed = time.time() - t0
-        steps_per_s = global_step / elapsed if elapsed > 0 else 0
-        print(
-            f"epoch={epoch:3d}  loss={mean_loss:.4f}"
-            f"  tgt={mean_tgt:.4f}  shp={mean_shp:.4f}"
-            f"  tgt_acc={mean_tgt_acc:.3f}  shp_acc={mean_shp_acc:.3f}"
-            f"  ep={n_episodes}  samples={n_samples}"
-            f"  steps={global_step}  {elapsed:.1f}s ({steps_per_s:.1f} steps/s)"
-        )
+            if use_wandb:
+                import wandb
+                wandb.log(
+                    {"bc/loss": mean_loss, "bc/tgt_acc": mean_tgt_acc},
+                    step=global_step,
+                )
 
-        if use_wandb:
-            import wandb
-            wandb.log(
-                {
-                    "bc/loss": mean_loss, "bc/tgt_loss": mean_tgt, "bc/ships_loss": mean_shp,
-                    "bc/tgt_acc": mean_tgt_acc, "bc/shp_acc": mean_shp_acc,
-                },
-                step=global_step,
-            )
-
-        save_bc_checkpoint(Path(bc.out_dir), bc.run_name, epoch, state, cfg)
+            save_bc_checkpoint(Path(bc.out_dir), bc.run_name, epoch, state, cfg)
 
     if use_wandb:
         import wandb
@@ -553,6 +568,8 @@ def parse_args() -> argparse.Namespace:
                         help="Use pre-built shards instead of streaming from zip")
     parser.add_argument("--no_use_shard", dest="use_shard", action="store_false",
                         help="Stream on the fly from zip (default)")
+    parser.add_argument("--encode_workers", type=int, default=None,
+                        help="Parallel CPU encoder processes (0 = auto = cpu_count-1)")
     parser.add_argument("--no_wandb", action="store_true")
     return parser.parse_args()
 
@@ -577,6 +594,7 @@ def main() -> None:
     if args.run_name       is not None: bc.run_name       = args.run_name
     if args.augment        is not None: bc.augment        = args.augment
     if args.use_shard      is not None: bc.use_shard      = args.use_shard
+    if args.encode_workers is not None: bc.encode_workers = args.encode_workers
     use_wandb = not args.no_wandb
 
     if cfg.bc.top_k_episodes is not None and cfg.bc.top_k_episodes <= 0:
