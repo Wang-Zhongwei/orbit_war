@@ -20,7 +20,7 @@ import jax.numpy as jnp
 from .bc_data import obs_to_env_state
 from .features import MIN_SOURCE_SHIPS, _make_env_encoder
 from .physics import MAX_BASE_PLANETS
-from .policy import build_policy
+from .policies import build_policy
 from .rollout import GLOB_DIM
 
 

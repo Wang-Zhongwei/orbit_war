@@ -264,6 +264,14 @@ def _make_env_encoder(K: int, env_cfg):
     K_friendly = K // 3
     K_neutral  = K - 1 - K_enemy - K_friendly
 
+    # Candidate selection strategy (resolved once, at encoder-build time, so the
+    # branch is a Python-level choice and adds no per-trace cost).
+    cand_select = getattr(env_cfg, "cand_select", "category")
+    if cand_select not in ("category", "knn"):
+        raise ValueError(
+            f"Unknown env.cand_select={cand_select!r}; expected 'category' or 'knn'"
+        )
+
     board_size           = jnp.float32(BOARD_SIZE)
     max_ships            = jnp.float32(env_cfg.max_ships)
     max_production       = jnp.float32(MAX_PRODUCTION)
@@ -336,7 +344,28 @@ def _make_env_encoder(K: int, env_cfg):
             cand_valid = jnp.concatenate([jnp.array([True], bool),     final_valid])
             return cand_slots, cand_valid
 
-        all_cand_slots, all_cand_valid = jax.vmap(_select_cands)(src_slots)
+        def _select_cands_knn(src_slot):
+            """Plain K-nearest-neighbours: the K-1 closest planets of any owner.
+
+            No per-owner quotas — just distance. Slot 0 is the no-op; comets and
+            the source planet are still excluded (same reasons as the category
+            selector). Empty trailing slots (fewer than K-1 planets) are invalid.
+            """
+            src_x       = state.p_x[src_slot]
+            src_y       = state.p_y[src_slot]
+            dist_to_src = jnp.hypot(state.p_x - src_x, state.p_y - src_y)
+            excl_mask   = state.p_alive & (planet_idx != src_slot) & ~state.p_is_comet
+
+            sorted_dist = jnp.where(excl_mask, dist_to_src, INF)
+            nn_slots    = jnp.argsort(sorted_dist)[:K - 1]          # [K-1]
+            nn_valid    = sorted_dist[nn_slots] < INF
+
+            cand_slots = jnp.concatenate([jnp.array([-1], jnp.int32), nn_slots])
+            cand_valid = jnp.concatenate([jnp.array([True], bool),    nn_valid])
+            return cand_slots, cand_valid
+
+        _select = _select_cands_knn if cand_select == "knn" else _select_cands
+        all_cand_slots, all_cand_valid = jax.vmap(_select)(src_slots)
         # [MAX_SRC, K], [MAX_SRC, K]
         safe_slots = jnp.clip(all_cand_slots, 0, MAX_PLANETS - 1)  # [MAX_SRC, K]
 

@@ -9,7 +9,7 @@ import numpy as np
 import optax
 from flax.training import train_state
 
-from .policy import PolicyOutput, build_policy, init_params
+from .policies import PolicyOutput, build_policy, init_params
 
 
 # ---------------------------------------------------------------------------

@@ -46,6 +46,12 @@ class EnvConfig:
     ship_bucket_count: int = 8
     max_planets: int = 48
     max_ships: float = 400.0
+    # K-candidate selection strategy used by the feature encoder:
+    #   "category" (default) — per-owner quotas (enemy/neutral/friendly) filled by
+    #                          nearest-of-type, with nearest-of-any overflow backfill.
+    #   "knn"                — simply the K-1 nearest planets of any owner.
+    # Slot 0 is always the no-op in both; comets and the source are excluded.
+    cand_select: str = "category"
 
     def __setstate__(self, state) -> None: _setstate(self, state)
 
@@ -53,6 +59,18 @@ class EnvConfig:
 @dataclass
 class ModelConfig:
     hidden_size: int = 128
+    # Policy architecture (see src_jax/policies/__init__.py):
+    #   "cross_source"    — per-source candidate-scoring net (default).
+    #   "entity_mlp"      — entity-transformer backbone + joint MLP head.
+    #   "entity_deep_mlp" — entity-transformer backbone + deep residual MLP head.
+    # Legacy aliases: "planet" → cross_source, "entity" → entity_mlp.
+    arch: str = "cross_source"
+    # Entity-transformer hyperparameters (only used by the "entity_*" arches).
+    n_heads: int = 4
+    n_layers: int = 2
+    ff_dim: int = 0          # 0 → default to 2 * hidden_size at build time
+    value_queries: int = 4
+    score_blocks: int = 2    # residual head depth (entity_deep_mlp only)
 
     def __setstate__(self, state) -> None: _setstate(self, state)
 

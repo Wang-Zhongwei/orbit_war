@@ -12,7 +12,7 @@ import jax.numpy as jnp
 from .features import _make_env_encoder
 from .config import TrainConfig, default_train_config_path, load_train_config
 from .env import make_board_pool, make_initial_carry_state
-from .policy import build_policy
+from .policies import build_policy
 from .ppo import TrainState, build_train_state, ppo_update
 from .rollout import (
     RolloutCarry,

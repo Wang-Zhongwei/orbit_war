@@ -46,7 +46,7 @@ from .bc_data import (
 )
 from .config import TrainConfig, load_train_config
 from .features import _make_env_encoder
-from .policy import build_policy, init_params
+from .policies import build_policy, init_params
 from .ppo import TrainState
 
 
@@ -271,6 +271,19 @@ def train(
                 flush=True,
             )
 
+            if use_wandb:
+                import wandb
+                wandb.log(
+                    {
+                        "bc/loss": losses[-1],
+                        "bc/tgt_acc": tgt_accs[-1],
+                        "bc/epoch": epoch,
+                        "bc/shard": si + 1,
+                        "bc/steps_per_s": steps_per_s,
+                    },
+                    step=global_step,
+                )
+
             if (si + 1) % 5 == 0:
                 save_bc_checkpoint(
                     Path(bc.out_dir), bc.run_name, epoch, state, cfg,
@@ -290,7 +303,11 @@ def train(
         if use_wandb:
             import wandb
             wandb.log(
-                {"bc/loss": mean_loss, "bc/tgt_acc": mean_tgt_acc},
+                {
+                    "bc/epoch_loss": mean_loss,
+                    "bc/epoch_tgt_acc": mean_tgt_acc,
+                    "bc/epoch": epoch,
+                },
                 step=global_step,
             )
 

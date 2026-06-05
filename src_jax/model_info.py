@@ -9,7 +9,7 @@ import argparse
 import jax
 
 from .config import load_train_config
-from .policy import build_policy, init_params
+from .policies import build_policy, init_params
 from .features import self_feature_dim, candidate_feature_dim, global_feature_dim
 from .physics import MAX_BASE_PLANETS
 

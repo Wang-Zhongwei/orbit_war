@@ -1,22 +1,18 @@
-from __future__ import annotations
+"""Cross-source candidate-scoring policy (formerly ``PlanetPolicy``).
 
-from typing import NamedTuple
+Per source planet, encodes the K candidate targets with a cross-source
+coordination attention block (so sources can form coalitions / avoid
+double-committing) plus a candidate transformer block, then scores each
+candidate. Separate value net with no shared weights.
+"""
+from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
 
-from .features import self_feature_dim, candidate_feature_dim, global_feature_dim
-
-
-# Finite floor used to mask invalid candidates in the target logits. Must be
-# very negative (prob≈0) but finite so entropy/log_softmax stay NaN-free.
-MASK_LOGIT = -1e9
-
-
-class PolicyOutput(NamedTuple):
-    target_logits: jax.Array   # [N, K]
-    value: jax.Array           # [N]
+from ..features import self_feature_dim, candidate_feature_dim, global_feature_dim
+from .base import PolicyOutput, MASK_LOGIT
 
 
 class _PolicyHead(nn.Module):
@@ -37,7 +33,7 @@ class _PolicyHead(nn.Module):
         H, K = self.hidden_size, self.candidate_count
         N = self_features.shape[0]
 
-        # 2-layer GELU MLP encoders (GELU per RLIAYN)
+        # 2-layer GELU MLP encoders (GELU per RLIAYN) 
         self_h   = nn.gelu(nn.Dense(H)(nn.gelu(nn.Dense(H)(self_features))))
         global_h = nn.gelu(nn.Dense(H)(nn.gelu(nn.Dense(H)(global_features))))
         cand_flat = candidate_features.reshape(N * K, candidate_features.shape[-1])
@@ -146,7 +142,7 @@ class _ValueNet(nn.Module):
         return nn.Dense(1)(nn.gelu(nn.Dense(H)(value_in))).squeeze(-1)          # [N]
 
 
-class PlanetPolicy(nn.Module):
+class CrossSourcePolicy(nn.Module):
     self_dim: int
     candidate_dim: int
     global_dim: int
@@ -181,8 +177,17 @@ class PlanetPolicy(nn.Module):
         )
 
 
-def build_policy(cfg) -> PlanetPolicy:
-    return PlanetPolicy(
+# Back-compat alias: older code / pickles referenced ``PlanetPolicy``.
+PlanetPolicy = CrossSourcePolicy
+
+
+def build(cfg) -> CrossSourcePolicy:
+    """Construct a ``CrossSourcePolicy`` from a TrainConfig.
+
+    Architecture dispatch (``cfg.model.arch``) lives in ``policies/__init__.py``;
+    this just builds the net. ``init_params`` is the package-level generic.
+    """
+    return CrossSourcePolicy(
         self_dim        = self_feature_dim(),
         candidate_dim   = candidate_feature_dim(),
         global_dim      = global_feature_dim(),
@@ -190,15 +195,3 @@ def build_policy(cfg) -> PlanetPolicy:
         hidden_size     = cfg.model.hidden_size,
         n_heads         = getattr(cfg.model, 'n_heads', 4),
     )
-
-
-def init_params(module: PlanetPolicy, seed: int = 0) -> dict:
-    K = module.candidate_count
-    dummy = (
-        jnp.zeros((1, module.self_dim)),
-        jnp.zeros((1, K, module.candidate_dim)),
-        jnp.zeros((1, module.global_dim)),
-        jnp.ones((1, K), dtype=bool),
-        jnp.ones((1,), dtype=bool),
-    )
-    return module.init(jax.random.PRNGKey(seed), *dummy)

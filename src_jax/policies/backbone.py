@@ -1,0 +1,175 @@
+"""Shared entity-transformer backbone.
+
+Reusable building blocks for the ``entity_*`` policy family, ported from
+lvchao0428/OrbitWarRL ``net/`` (transformer.py + heads.py) and adapted to this
+repo's per-source feature layout:
+
+  * :class:`EntityEncoder`     — type-tagged pre-LN self-attention encoder.
+  * :class:`CrossSourceMixer`  — cross-source coordination attention.
+  * :class:`MultiQueryValueHead` — N learned queries cross-attend to entities.
+
+Policy variants in ``entity_transformer.py`` share this backbone and differ only
+in their candidate-scoring head.
+"""
+from __future__ import annotations
+
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+
+
+class _MLPBlock(nn.Module):
+    d_model: int
+    ff_dim: int
+
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        x = nn.Dense(self.ff_dim, name="fc1")(x)
+        x = nn.gelu(x)
+        x = nn.Dense(self.d_model, name="fc2")(x)
+        return x
+
+
+class _EncoderBlock(nn.Module):
+    d_model: int
+    n_heads: int
+    ff_dim: int
+
+    @nn.compact
+    def __call__(self, x: jax.Array, mask: jax.Array) -> jax.Array:
+        # Pre-LN attention residual.
+        h = nn.LayerNorm(name="ln1")(x)
+        attn = nn.SelfAttention(
+            num_heads=self.n_heads,
+            qkv_features=self.d_model,
+            out_features=self.d_model,
+            name="attn",
+        )(h, mask=mask)
+        x = x + attn
+        # Pre-LN FFN residual.
+        h = nn.LayerNorm(name="ln2")(x)
+        x = x + _MLPBlock(self.d_model, self.ff_dim, name="mlp")(h)
+        return x
+
+
+class EntityEncoder(nn.Module):
+    """Encode one source row into per-token embeddings.
+
+    Per source the token sequence is ``[self, global, cand_0 .. cand_{K-1}]``,
+    each projected to ``d_model`` and tagged with a learned type embedding
+    (0=self, 1=global, 2=candidate). A key padding mask hides invalid
+    candidates; the self + global tokens are always valid keys.
+
+    Returns ``(self_emb [N,H], global_emb [N,H], cand_emb [N,K,H])``.
+    """
+
+    d_model: int
+    n_layers: int
+    n_heads: int
+    ff_dim: int
+
+    @nn.compact
+    def __call__(
+        self,
+        self_features: jax.Array,       # [N, self_dim]
+        global_features: jax.Array,     # [N, global_dim]
+        candidate_features: jax.Array,  # [N, K, cand_dim]
+        candidate_mask: jax.Array,      # [N, K] bool
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        N, K = candidate_features.shape[0], candidate_features.shape[1]
+        H = self.d_model
+
+        type_embed = self.param(
+            "type_embed", nn.initializers.normal(stddev=0.02), (3, H), jnp.float32
+        )
+
+        self_tok   = nn.Dense(H, name="self_proj")(self_features) + type_embed[0][None, :]
+        global_tok = nn.Dense(H, name="global_proj")(global_features) + type_embed[1][None, :]
+        cand_tok   = nn.Dense(H, name="cand_proj")(candidate_features) + type_embed[2][None, None, :]
+
+        tokens = jnp.concatenate(
+            [self_tok[:, None, :], global_tok[:, None, :], cand_tok], axis=1
+        )  # [N, 2+K, H]
+
+        always_valid = jnp.ones((N, 2), dtype=jnp.bool_)
+        key_mask = jnp.concatenate([always_valid, candidate_mask], axis=1)   # [N, 2+K]
+        attn_mask = jnp.broadcast_to(
+            key_mask[:, None, None, :], (N, 1, 2 + K, 2 + K)
+        )
+
+        x = tokens
+        for i in range(self.n_layers):
+            x = _EncoderBlock(H, self.n_heads, self.ff_dim, name=f"block{i}")(x, attn_mask)
+        x = nn.LayerNorm(name="ln_out")(x)
+
+        self_emb   = x[:, 0, :]            # [N, H]
+        global_emb = x[:, 1, :]            # [N, H]
+        cand_emb   = x[:, 2:, :]           # [N, K, H]
+        return self_emb, global_emb, cand_emb
+
+
+class CrossSourceMixer(nn.Module):
+    """Let each source attend to every valid sibling source (coalition signal)."""
+
+    d_model: int
+    n_heads: int
+
+    @nn.compact
+    def __call__(self, self_emb: jax.Array, src_valid: jax.Array) -> jax.Array:
+        H = self.d_model
+        # [1,1,1,N] broadcasts to [N, n_heads, N_q, N_k]; invalid sources masked
+        # as keys so padding doesn't pollute the coalition signal.
+        N = self_emb.shape[0]
+        cs_mask = src_valid[None, None, None, :]
+        normed  = nn.LayerNorm(name="cs_ln1")(self_emb)
+        # Attention can return broadcast leading dims from the 4-D mask; collapse
+        # back to [N, H] (parity with CrossSourcePolicy's cross-source block).
+        self_emb = (self_emb + nn.MultiHeadDotProductAttention(
+            num_heads=self.n_heads, qkv_features=H, out_features=H, name="cs_attn",
+        )(normed, mask=cs_mask)).reshape(N, H)
+        normed2 = nn.LayerNorm(name="cs_ln2")(self_emb)
+        self_emb = self_emb + nn.Dense(H, name="cs_fc2")(
+            nn.gelu(nn.Dense(4 * H, name="cs_fc1")(normed2))
+        )
+        return self_emb
+
+
+class MultiQueryValueHead(nn.Module):
+    """Multi-query cross-attention value head (upstream heads.ValueHead)."""
+
+    d_model: int
+    n_queries: int
+    n_heads: int
+    hidden: int
+
+    @nn.compact
+    def __call__(
+        self,
+        self_emb: jax.Array,     # [N, H]
+        global_emb: jax.Array,   # [N, H]
+        cand_emb: jax.Array,     # [N, K, H]
+        candidate_mask: jax.Array,  # [N, K] bool
+    ) -> jax.Array:
+        N, H = self_emb.shape
+        queries = self.param(
+            "queries", nn.initializers.normal(stddev=0.02),
+            (self.n_queries, self.d_model), jnp.float32,
+        )
+        q = jnp.broadcast_to(queries[None, :, :], (N, self.n_queries, self.d_model))
+        # Condition queries on global state so they aren't static slots.
+        q = q + nn.Dense(self.d_model, name="q_cond")(global_emb)[:, None, :]
+
+        kv = jnp.concatenate([self_emb[:, None, :], cand_emb], axis=1)        # [N, 1+K, H]
+        kv_mask = jnp.concatenate(
+            [jnp.ones((N, 1), dtype=jnp.bool_), candidate_mask], axis=1
+        )
+        attn_mask = kv_mask[:, None, None, :]
+        attended = nn.MultiHeadDotProductAttention(
+            num_heads=self.n_heads, qkv_features=self.d_model,
+            out_features=self.d_model, name="value_attn",
+        )(q, kv, mask=attn_mask)
+
+        pooled = attended.reshape(N, self.n_queries * self.d_model)
+        joined = jnp.concatenate([pooled, global_emb], axis=-1)
+        x = nn.gelu(nn.Dense(self.hidden, name="fc1")(joined))
+        return nn.Dense(1, name="value")(x).squeeze(-1)                       # [N]
