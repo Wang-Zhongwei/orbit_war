@@ -1,0 +1,15 @@
+# Pinned to 1.12.0 — newer versions require Rust (tiktoken) or modern GCC (numpy 2.x)
+kaggle-environments==1.12.0
+kaggle
+jax[cuda12]
+flax
+optax
+optuna
+numpy
+scipy
+torch
+wandb
+python-dotenv
+pyyaml
+tqdm
+jupytext

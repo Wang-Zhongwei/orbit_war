@@ -8,3 +8,6 @@ artifacts/*
 wandb/*
 *.ipynb
 *.env
+jobs/*
+!jobs/templates/
+!jobs/templates/**
