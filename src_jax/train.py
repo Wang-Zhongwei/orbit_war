@@ -6,6 +6,9 @@ import pickle
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import jax
 import jax.numpy as jnp
 

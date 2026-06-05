@@ -32,6 +32,9 @@ from collections import deque
 from concurrent.futures import Future, ProcessPoolExecutor
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import jax
 import jax.numpy as jnp
 import numpy as np
