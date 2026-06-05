@@ -10,9 +10,6 @@ Architectures are selected by ``cfg.model.arch``:
   * ``"entity_deep_mlp"`` — :class:`~.entity_transformer.EntityDeepMLPPolicy`,
     same backbone + deeper residual joint MLP head.
 
-Legacy aliases kept for older configs / checkpoints: ``"planet"`` → cross_source,
-``"entity"`` → entity_mlp.
-
 Every variant exposes the same call signature and returns ``PolicyOutput``, so
 the rest of the codebase imports ``build_policy`` / ``init_params`` /
 ``PolicyOutput`` from this package and never special-cases the architecture.

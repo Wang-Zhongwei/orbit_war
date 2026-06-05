@@ -1,6 +1,6 @@
 ---
 name: orbit-wars-training-pipeline
-description: Run the Orbit Wars JAX training workflow: download Kaggle episode replays with download_episodes.py, then either pre-encode into shards with src_jax.bc_encode + behavior-clone with src_jax.bc_train, OR stream directly from zip with src_jax.bc_train --stream (no shards, best for large 1-epoch runs), then start PPO self-play from the BC checkpoint. Use when the user asks to run, resume, monitor, or document the Orbit Wars data/pretraining/self-play pipeline.
+description: Run the Orbit Wars JAX training workflow: download Kaggle episode replays with fetch_daily_episodes.py, then either pre-encode into shards with src_jax.bc_encode + behavior-clone with src_jax.bc_train, OR stream directly from zip with src_jax.bc_train --stream (no shards, best for large 1-epoch runs), then start PPO self-play from the BC checkpoint. Use when the user asks to run, resume, monitor, or document the Orbit Wars data/pretraining/self-play pipeline.
 ---
 
 # Orbit Wars Training Pipeline
@@ -21,15 +21,22 @@ conda run -n torch-gpu python -c "import jax, wandb; print('jax', jax.__version_
 
 ## Step 1 — Download
 
-Downloads the full dataset as a single zip into `episodes/<date>/`.
+Downloads each day's dataset as a single zip into `episodes/<date>/archive.zip`.
+Already-downloaded days are skipped, so it is safe to re-run for daily backfill.
 
 ```bash
-conda run --no-capture-output -n torch-gpu python -u download_episodes.py \
-  --dataset kaggle/orbit-wars-episodes-2026-05-24
-# → episodes/2026-05-24/orbit-wars-episodes-2026-05-24.zip
+# One specific day:
+conda run --no-capture-output -n torch-gpu python -u fetch_daily_episodes.py \
+  --start 2026-05-24 --end 2026-05-24
+# → episodes/2026-05-24/archive.zip  (+ extracted manifest.csv)
+
+# Or backfill a range (omit --end for "through today"):
+conda run --no-capture-output -n torch-gpu python -u fetch_daily_episodes.py \
+  --start 2026-05-01
 ```
 
-The date subdirectory is parsed automatically from the dataset slug. Pass `--out_dir` to override.
+Each day's dataset is `kaggle/orbit-wars-episodes-<date>`; the date subdirectory
+is derived from the date. Pass `--out_dir` to override, `--force` to re-download.
 
 Verification gate — confirm zip landed:
 ```bash

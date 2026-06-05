@@ -9,7 +9,6 @@ Each training sample = one source-planet decision at one timestep:
   fleet_feats  : [MAX_FLEETS, FLEET_DIM]
   fleet_mask   : [MAX_FLEETS]
   target_idx   : int in [0, K)   — which candidate the expert chose
-  ships_bucket : int in [0, B)   — how many ships (as a fraction bucket)
 
 Label extraction:
   - source planet: matched by planet_id in encoder's src_ids
@@ -18,8 +17,6 @@ Label extraction:
     whose recomputed angle is closest to the action's launch angle.
     Using actual ships (vs the encoder's estimated src_ships//2) matters for
     rotating targets whose lead angle depends on fleet speed.
-  - ship bucket: bucket b sends floor((b+1)/B * src_ships) ships;
-    pick the bucket whose ships_count is closest to the expert's choice
 """
 
 from __future__ import annotations
@@ -237,12 +234,6 @@ def obs_to_env_state(obs: dict, num_agents: int = 2) -> EnvState:
 # ---------------------------------------------------------------------------
 
 
-def _ships_to_bucket(act_ships: int, src_ships: int, B: int) -> int:
-    """Return the bucket index whose decoded ship count is closest to act_ships."""
-    bucket_ships = [max(1, int((b + 1) * src_ships // B)) for b in range(B)]
-    return int(min(range(B), key=lambda b: abs(bucket_ships[b] - act_ships)))
-
-
 def extract_labels(
     action: list,
     *,
@@ -250,7 +241,6 @@ def extract_labels(
     src_valid: np.ndarray,      # [MAX_BASE_PLANETS] bool
     src_ships: np.ndarray,      # [MAX_BASE_PLANETS] int32
     cand_mask: np.ndarray,      # [MAX_BASE_PLANETS, K] bool
-    B: int,
     # State geometry — needed to recompute angles with the expert's actual ship count
     p_x: np.ndarray,            # [MAX_PLANETS] float32
     p_y: np.ndarray,            # [MAX_PLANETS] float32
@@ -258,20 +248,15 @@ def extract_labels(
     angular_velocity: float,
     src_slots: np.ndarray,      # [MAX_BASE_PLANETS] int32 — planet slot per source
     cand_slots: np.ndarray,     # [MAX_BASE_PLANETS, K] int32 — planet slot per candidate
-) -> list[tuple[int, int, int, int, int]]:
-    """Return (src_idx, cand_idx, ship_bucket, act_ships, src_ships_count) per action.
-
-    act_ships and src_ships_count are stored in shards so that ship_bucket can be
-    recomputed for a different ship_bucket_count B without re-encoding.
-    act_ships=0 marks no-ops (either explicit out-of-pool or the implicit hold label
-    added by the caller); in that case ship_bucket is always 0 regardless of B.
+) -> list[tuple[int, int]]:
+    """Return (src_idx, cand_idx) per action.
 
     If the expert's launch angle is beyond _ANGLE_MATCH_THRESHOLD from every candidate
     (i.e. the target was outside the candidate pool), the action is labelled as no-op
     rather than dropped — preserving the training signal that this state called for
     inaction within the modelled action space.
     """
-    labels: list[tuple[int, int, int, int, int]] = []
+    labels: list[tuple[int, int]] = []
 
     for act in action:
         from_pid  = int(act[0])
@@ -317,12 +302,10 @@ def extract_labels(
 
         if best_dist > _ANGLE_MATCH_THRESHOLD:
             # Expert targeted a planet outside the candidate pool → label as no-op.
-            # act_ships=0 signals "no-op" so relabeling keeps ship_bucket=0.
-            labels.append((src_idx, 0, 0, 0, S))
+            labels.append((src_idx, 0))
             continue
 
-        bucket = _ships_to_bucket(act_ships, S, B)
-        labels.append((src_idx, best_k, bucket, act_ships, S))
+        labels.append((src_idx, best_k))
 
     return labels
 
@@ -334,7 +317,6 @@ def extract_labels(
 def episode_to_samples(
     episode: dict,
     encode_fn,
-    ship_bucket_count: int,
 ) -> dict[str, np.ndarray] | None:
     """Convert one episode JSON to flat numpy arrays of BC training samples.
 
@@ -368,8 +350,7 @@ def episode_to_samples(
     batched_np = jax.tree_util.tree_map(np.asarray, batched)
 
     rows_sf, rows_cf, rows_gf, rows_cm = [], [], [], []
-    rows_ff, rows_fm, rows_ti, rows_sb = [], [], [], []
-    rows_as, rows_ss = [], []   # act_ships, src_ships — for B-change relabeling
+    rows_ff, rows_fm, rows_ti = [], [], []
 
     for i in range(N):  # only real states, not padding
         src_ships_i = enc_np.src_ships[i]
@@ -379,7 +360,6 @@ def episode_to_samples(
             src_valid        = enc_np.src_valid[i],
             src_ships        = src_ships_i,
             cand_mask        = enc_np.cand_mask[i],
-            B                = ship_bucket_count,
             p_x              = batched_np.p_x[i],
             p_y              = batched_np.p_y[i],
             p_radius         = batched_np.p_radius[i],
@@ -390,13 +370,12 @@ def episode_to_samples(
         # Emit explicit no-op labels for valid sources the expert chose to hold.
         # Without these, the policy only sees "given expert decided to launch,
         # where to?" and collapses toward always-launch at inference.
-        acted_src = {src_idx for src_idx, _, _, _, _ in labels}
+        acted_src = {src_idx for src_idx, _ in labels}
         src_valid_i = enc_np.src_valid[i]
         for j in range(len(src_valid_i)):
             if bool(src_valid_i[j]) and j not in acted_src:
-                # act_ships=0 marks implicit hold; ship_bucket stays 0 for any B
-                labels.append((j, 0, 0, 0, int(src_ships_i[j])))
-        for src_idx, cand_idx, ship_bucket, act_ships, ss in labels:
+                labels.append((j, 0))
+        for src_idx, cand_idx in labels:
             rows_sf.append(enc_np.self_feats[i,   src_idx])
             rows_cf.append(enc_np.cand_feats[i,   src_idx])
             rows_gf.append(enc_np.global_feat[i])
@@ -404,9 +383,6 @@ def episode_to_samples(
             # rows_ff.append(enc_np.fleet_feats[i])
             # rows_fm.append(enc_np.fleet_mask[i])
             rows_ti.append(cand_idx)
-            rows_sb.append(ship_bucket)
-            rows_as.append(act_ships)
-            rows_ss.append(ss)
 
     if not rows_sf:
         return None
@@ -419,11 +395,6 @@ def episode_to_samples(
         # "fleet_feats":  np.stack(rows_ff).astype(np.float32),
         # "fleet_mask":   np.stack(rows_fm),
         "target_idx":   np.array(rows_ti, dtype=np.int32),
-        "ships_bucket": np.array(rows_sb, dtype=np.int32),
-        # Stored so ships_bucket can be recomputed for a new B without re-encoding.
-        # act_ships=0 means no-op (hold or out-of-pool); ship_bucket is always 0.
-        "act_ships":    np.array(rows_as, dtype=np.int32),
-        "src_ships":    np.array(rows_ss, dtype=np.int32),
     }
 
 
@@ -461,7 +432,6 @@ def _collect_states_actions(episode: dict):
 def episode_to_samples_jax(
     episode: dict,
     encode_fn,
-    ship_bucket_count: int,
 ) -> dict | None:
     """Streaming variant of episode_to_samples: feature arrays stay on device.
 
@@ -501,7 +471,6 @@ def episode_to_samples_jax(
     ts_list: list[int] = []
     si_list: list[int] = []
     ci_list: list[int] = []
-    bi_list: list[int] = []
 
     for i in range(N):  # only real states, not padding
         labels = extract_labels(
@@ -510,7 +479,6 @@ def episode_to_samples_jax(
             src_valid        = src_valid_np[i],
             src_ships        = src_ships_np[i],
             cand_mask        = cand_mask_np[i],
-            B                = ship_bucket_count,
             p_x              = p_x_np[i],
             p_y              = p_y_np[i],
             p_radius         = p_radius_np[i],
@@ -521,16 +489,15 @@ def episode_to_samples_jax(
         # Emit explicit no-op labels for valid sources the expert chose to hold.
         # Without these, the policy only sees "given expert decided to launch,
         # where to?" and collapses toward always-launch at inference.
-        acted_src = {src_idx for src_idx, _, _, _, _ in labels}
+        acted_src = {src_idx for src_idx, _ in labels}
         src_valid_i = src_valid_np[i]
         for j in range(len(src_valid_i)):
             if bool(src_valid_i[j]) and j not in acted_src:
-                labels.append((j, 0, 0, 0, int(src_ships_np[i][j])))
-        for src_idx, cand_idx, bucket, _as, _ss in labels:
+                labels.append((j, 0))
+        for src_idx, cand_idx in labels:
             ts_list.append(i)
             si_list.append(src_idx)
             ci_list.append(cand_idx)
-            bi_list.append(bucket)
 
     if not ts_list:
         return None
@@ -547,7 +514,6 @@ def episode_to_samples_jax(
         # "fleet_feats":  enc.fleet_feats[ts],
         # "fleet_mask":   enc.fleet_mask[ts],
         "target_idx":   jnp.array(ci_list, dtype=jnp.int32),
-        "ships_bucket": jnp.array(bi_list, dtype=jnp.int32),
     }
 
 
@@ -617,16 +583,14 @@ SHARD_DIR_NAME = "shards"
 
 # Module-level state populated by each worker process via Pool initializer.
 _worker_encode_fn = None
-_worker_ship_bucket_count: int = 0
 
 
-def _worker_init(encode_fn_factory, factory_args, ship_bucket_count: int) -> None:
+def _worker_init(encode_fn_factory, factory_args) -> None:
     """Called once per worker process. Builds encode_fn locally (avoids pickling JAX fn)."""
     import os
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
-    global _worker_encode_fn, _worker_ship_bucket_count
+    global _worker_encode_fn
     _worker_encode_fn = encode_fn_factory(*factory_args)
-    _worker_ship_bucket_count = ship_bucket_count
 
 
 def _worker_encode_episode(args: tuple) -> dict | None:
@@ -647,13 +611,12 @@ def _worker_encode_episode(args: tuple) -> dict | None:
         if winning_player is None:
             return None
         episode = _filter_winner(episode, winning_player)
-    return episode_to_samples(episode, _worker_encode_fn, _worker_ship_bucket_count)
+    return episode_to_samples(episode, _worker_encode_fn)
 
 
 def encode_to_shards(
     episodes_dir: Path,
     encode_fn,
-    ship_bucket_count: int,
     *,
     episodes_per_shard: int = 100,
     num_shards: int | None = None,
@@ -735,7 +698,7 @@ def encode_to_shards(
         pool = ctx.Pool(
             processes=n_workers,
             initializer=_worker_init,
-            initargs=(encode_fn_factory, encode_fn_factory_args, ship_bucket_count),
+            initargs=(encode_fn_factory, encode_fn_factory_args),
         )
         episodes_iter = (
             (ep, winner_only)
@@ -759,7 +722,7 @@ def encode_to_shards(
             if not isinstance(episode, dict) or "steps" not in episode:
                 n_skipped += 1
                 continue
-            samples = episode_to_samples(episode, encode_fn, ship_bucket_count)
+            samples = episode_to_samples(episode, encode_fn)
             if _process_result(samples):
                 break
         else:
@@ -813,40 +776,3 @@ def shard_episode_counts(shard_paths: list[Path], episodes_per_shard_fallback: i
             counts.append(episodes_per_shard_fallback)
         d.close()
     return counts
-
-
-# ---------------------------------------------------------------------------
-# Fast B-only relabeling — no re-encoding needed when ship_bucket_count changes
-# ---------------------------------------------------------------------------
-
-def relabel_ships_bucket(shard_paths: list[Path], B_new: int, *, inplace: bool = True) -> None:
-    """Rewrite the ships_bucket field in shards for a new ship_bucket_count B.
-
-    self_feats, cand_feats, target_idx, etc. are unchanged — only ships_bucket
-    is recomputed from stored act_ships / src_ships.  Runs in seconds since no
-    encode_fn call is needed.
-
-    Requires shards to have been written with act_ships and src_ships fields
-    (bc_encode version that stores these).  Older shards without those fields
-    will raise KeyError.
-
-    inplace=True  overwrites each shard file.
-    inplace=False writes a new file alongside: shard_NNNN_B{B_new}.npz.
-    """
-    for p in shard_paths:
-        d = dict(np.load(p))
-        act_ships = d["act_ships"]   # [N] int32, 0 = no-op / hold
-        src_ships = d["src_ships"]   # [N] int32
-
-        # Vectorised bucket computation — only relabel non-no-op samples
-        new_buckets = np.zeros(len(act_ships), dtype=np.int32)
-        active = act_ships > 0
-        for idx in np.where(active)[0]:
-            new_buckets[idx] = _ships_to_bucket(int(act_ships[idx]), int(src_ships[idx]), B_new)
-
-        d["ships_bucket"] = new_buckets
-        out_path = p if inplace else p.with_name(p.stem + f"_B{B_new}.npz")
-        np.savez(out_path, **d)
-        print(f"  relabeled {p.name} → B={B_new}")
-
-    print(f"Done: {len(shard_paths)} shards relabeled for ship_bucket_count={B_new}")

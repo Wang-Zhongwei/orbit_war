@@ -39,6 +39,7 @@ import optax
 
 from .augment import DEFAULT_AUG_IDS, expand_with_augmentations
 from .bc_data import (
+    SHARD_DIR_NAME,
     _iter_episode_jsons,
     episode_to_samples,
     find_shards,
@@ -165,6 +166,7 @@ def train(
     """Shard-based BC training loop. All hyperparameters are read from cfg.bc."""
     bc = cfg.bc
     aug_ids = DEFAULT_AUG_IDS
+    episodes_dirs = _resolve_episode_dirs(episodes_dirs, include_shard_dirs=True)
     shard_paths = find_shards(episodes_dirs)
     if bc.top_k_episodes is not None:
         counts = shard_episode_counts(shard_paths)
@@ -320,22 +322,33 @@ def train(
     return state
 
 
-def _resolve_episode_dirs(episodes_dirs: list[Path]) -> list[Path]:
-    """Auto-expand dirs that contain no episode files directly but have dated subdirs."""
+def _resolve_episode_dirs(
+    episodes_dirs: list[Path], *, include_shard_dirs: bool = False
+) -> list[Path]:
+    """Auto-expand dirs that contain no episode files directly but have dated subdirs.
+
+    A subdir qualifies if it directly holds a ``*.zip``/``*.json`` episode file.
+    With ``include_shard_dirs=True`` (shard-based training), a subdir also qualifies
+    if it has an encoded ``shards/`` directory — so already-encoded dates whose raw
+    zip has since been deleted are still picked up.
+    """
+    def _qualifies(p: Path) -> bool:
+        if any(p.glob("*.zip")) or any(p.glob("*.json")):
+            return True
+        return include_shard_dirs and (p / SHARD_DIR_NAME).is_dir()
+
     resolved: list[Path] = []
     for d in episodes_dirs:
         d = Path(d)
         if not d.is_dir():
             resolved.append(d)
             continue
-        has_direct = any(d.glob("*.zip")) or any(d.glob("*.json"))
-        if has_direct:
+        if _qualifies(d):
             resolved.append(d)
         else:
             subdirs = sorted(
                 child for child in d.iterdir()
-                if child.is_dir()
-                and (any(child.glob("*.zip")) or any(child.glob("*.json")))
+                if child.is_dir() and _qualifies(child)
             )
             if subdirs:
                 print(f"  auto-discovered: {[s.name for s in subdirs]}", flush=True)

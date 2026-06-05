@@ -43,7 +43,6 @@ def _setstate(instance: Any, state: Any) -> None:
 class EnvConfig:
     episode_steps: int = 500
     candidate_count: int = 8
-    ship_bucket_count: int = 8
     max_planets: int = 48
     max_ships: float = 400.0
     # K-candidate selection strategy used by the feature encoder:
@@ -63,8 +62,7 @@ class ModelConfig:
     #   "cross_source"    — per-source candidate-scoring net (default).
     #   "entity_mlp"      — entity-transformer backbone + joint MLP head.
     #   "entity_deep_mlp" — entity-transformer backbone + deep residual MLP head.
-    # Legacy aliases: "planet" → cross_source, "entity" → entity_mlp.
-    arch: str = "cross_source"
+    arch: str = "entity_mlp"
     # Entity-transformer hyperparameters (only used by the "entity_*" arches).
     n_heads: int = 4
     n_layers: int = 2

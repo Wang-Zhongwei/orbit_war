@@ -9,6 +9,10 @@ Usage:
     # Smoke-test mode — uses dataclass defaults, no config file needed:
     python -m src_jax.bc_encode --episodes_dir episodes/2026-05-24
 
+    # Recursive mode — encode every date subdirectory under a parent.
+    # Dirs that already have shards are skipped (use --force to re-encode):
+    python -m src_jax.bc_encode --episodes_dir episodes --recursive
+
 Output: episodes/2026-05-24/shards/shard_NNNN.npz
 """
 
@@ -17,19 +21,42 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .bc_data import encode_to_shards
+from .bc_data import SHARD_DIR_NAME, encode_to_shards
 from .config import TrainConfig, load_train_config
 from .features import _make_env_encoder
+
+
+def _find_episode_dirs(root: Path) -> list[Path]:
+    """Return every subdirectory under ``root`` that holds raw episode files.
+
+    A directory qualifies if it directly contains a ``*.zip`` or ``*.json``
+    episode file. The generated ``shards/`` subdirectory is ignored so re-runs
+    don't treat already-encoded output as a new episode dir.
+    """
+    dirs: list[Path] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_dir() or path.name == SHARD_DIR_NAME:
+            continue
+        if any(path.glob("*.zip")) or any(path.glob("*.json")):
+            dirs.append(path)
+    return dirs
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--episodes_dir", required=True,
-                        help="Date directory containing the episode zip (e.g. episodes/2026-05-24)")
+                        help="Date directory containing the episode zip (e.g. episodes/2026-05-24). "
+                             "With --recursive, a parent dir whose date subdirs are each encoded.")
+    parser.add_argument("--recursive", action="store_true",
+                        help="Treat --episodes_dir as a parent and encode every subdirectory that "
+                             "contains episode files. Dirs that already have shards are skipped "
+                             "unless --force is given.")
     parser.add_argument("--config", default=None,
                         help="TrainConfig YAML (formal mode). Omit to use dataclass defaults "
                              "(smoke-test mode).")
+    parser.add_argument("--candidate_count", type=int, default=None,
+                        help="Candidate count for the environment")
     parser.add_argument("--episodes_per_shard", type=int, default=100,
                         help="Episodes per shard file (default: 100)")
     parser.add_argument("--winner_only", action="store_true",
@@ -42,20 +69,29 @@ def main() -> None:
 
     cfg = load_train_config(args.config) if args.config is not None else TrainConfig()
 
-    episodes_dir = Path(args.episodes_dir)
-    print(f"Encoding {episodes_dir} …")
-    shard_dir = encode_to_shards(
-        episodes_dir,
-        encode_fn=None,
-        ship_bucket_count=cfg.env.ship_bucket_count,
-        episodes_per_shard=args.episodes_per_shard,
-        winner_only=args.winner_only,
-        force=args.force,
-        workers=args.workers,
-        encode_fn_factory=_make_env_encoder,
-        encode_fn_factory_args=(cfg.env.candidate_count, cfg.env),
-    )
-    print(f"Done → {shard_dir}")
+    root = Path(args.episodes_dir)
+    if args.recursive:
+        targets = _find_episode_dirs(root)
+        if not targets:
+            print(f"No episode directories found under {root}")
+            return
+        print(f"Recursive: found {len(targets)} episode dir(s) under {root}")
+    else:
+        targets = [root]
+
+    for episodes_dir in targets:
+        print(f"Encoding {episodes_dir} …")
+        shard_dir = encode_to_shards(
+            episodes_dir,
+            encode_fn=None,
+            episodes_per_shard=args.episodes_per_shard,
+            winner_only=args.winner_only,
+            force=args.force,
+            workers=args.workers,
+            encode_fn_factory=_make_env_encoder,
+            encode_fn_factory_args=(args.candidate_count or cfg.env.candidate_count, cfg.env),
+        )
+        print(f"Done → {shard_dir}")
 
 
 if __name__ == "__main__":
