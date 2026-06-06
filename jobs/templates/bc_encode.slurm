@@ -23,9 +23,6 @@ fi
 if [[ -n "${CONFIG:-}" ]]; then
   args+=(--config "${CONFIG}")
 fi
-if [[ -n "${CANDIDATE_COUNT:-}" ]]; then
-  args+=(--candidate_count "${CANDIDATE_COUNT}")
-fi
 if [[ -n "${EPISODES_PER_SHARD:-}" ]]; then
   args+=(--episodes_per_shard "${EPISODES_PER_SHARD}")
 fi

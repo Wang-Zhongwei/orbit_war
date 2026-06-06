@@ -19,11 +19,33 @@ from .physics import (
     EnvState, MAX_PLANETS, MAX_BASE_PLANETS, MAX_FLEETS,
     _fleet_speed,
 )
-from .constants import CENTER, LAUNCH_SURFACE_EPS, ROTATION_RADIUS_LIMIT, SUN_RADIUS
+from .constants import (
+    CENTER, LAUNCH_SURFACE_EPS, ROTATION_RADIUS_LIMIT, SUN_RADIUS,
+)
 
 MIN_SOURCE_SHIPS: int = 10
 MAX_TICKS_OUT: int = 30
 MAX_TICKS_IN: int = 30
+
+# ---------------------------------------------------------------------------
+# Time-varying per-owner candidate quota (fractions of the K-1 real candidate
+# slots). Linearly interpolated across a short transition window of game ticks
+# [T0, T1]: step <= T0 uses the *_T0 mix, step >= T1 uses the *_T1 mix (held for
+# the rest of the game). Heuristic rationale, confirmed on real games by
+# test/target_owner_by_tick.py:
+#   * NEUTRAL  dominates very early (the expert sends ~90% of fleets at neutral
+#              planets in the first 10 ticks — pure land-grab) then collapses to
+#              ~3-5% by tick ~50 as the reachable neutrals get claimed.
+#   * ENEMY    grows once expansion is done (mid/late game is mostly combat).
+#   * FRIENDLY grows (reinforcement/consolidation) and takes the remainder so the
+#              three always sum to K-1.
+# The transition window is intentionally short (T1=50) because the measured shift
+# is fast: neutral targeting is essentially over by tick 50, the first comet step.
+# ---------------------------------------------------------------------------
+_Q_NEUTRAL_T0, _Q_NEUTRAL_T1 = 0.8, 0.2
+_Q_ENEMY_T0,   _Q_ENEMY_T1   = 0.1, 0.3
+T0, T1 = 0, 50    # quota transition window, in game ticks (then held at *_T1)
+#  friendly = remainder  (T0: 0.1 -> T1: 0.5)
 
 
 def self_feature_dim() -> int:
@@ -270,11 +292,22 @@ def _select_sources_and_candidates(state: EnvState, player, K: int, cand_select:
     analysis tools call it directly to measure pure pool coverage. Sharing it keeps
     the two from drifting.
     """
-    K_enemy    = K // 3
-    K_friendly = K // 3
-    K_neutral  = K - 1 - K_enemy - K_friendly
+    # Per-owner quota over the K-1 real candidate slots (slot 0 is the no-op),
+    # linearly scheduled by episode progress (see _Q_* constants at module top):
+    # neutral high early then decaying, enemy/friendly growing. Fractions are
+    # rounded to integer slot counts; friendly takes the remainder so they always
+    # sum to K-1. Quotas are soft — a category short of planets has its deficit
+    # backfilled by the nearest planets of any owner (the overflow pool below).
+    n_real = K - 1
+    t_frac = jnp.clip((state.step.astype(jnp.float32) - T0) / jnp.float32(T1 - T0), 0.0, 1.0)
+    f_neutral  = _Q_NEUTRAL_T0 + (_Q_NEUTRAL_T1 - _Q_NEUTRAL_T0) * t_frac
+    f_enemy    = _Q_ENEMY_T0   + (_Q_ENEMY_T1   - _Q_ENEMY_T0)   * t_frac
+    k_neutral  = jnp.maximum(jnp.round(f_neutral * n_real), 1)
+    k_enemy    = jnp.maximum(jnp.round(f_enemy   * n_real), 1)
+    k_friendly = jnp.maximum(n_real - k_neutral - k_enemy, 1)   # remainder
     planet_idx = jnp.arange(MAX_PLANETS, dtype=jnp.int32)
     INF = jnp.float32(1e30)
+    OVERFLOW_BIAS = jnp.float32(1e6)   # >> board diagonal: in-quota sort before overflow
 
     # ── Source selection ──────────────────────────────────────────────
     src_mask = (
@@ -289,6 +322,12 @@ def _select_sources_and_candidates(state: EnvState, player, K: int, cand_select:
     src_valid = src_mask[src_slots]                         # [MAX_SRC]
 
     # ── Candidate selection (vmapped over sources) ────────────────────
+    # Rank-based so the quota can vary per tick: dynamic slice sizes ([:k] with a
+    # traced k) aren't allowed in JAX, so instead of "take the k nearest of each
+    # category" we mark a planet in-quota when its within-category distance rank
+    # is below that category's (tick-dependent) quota. In-quota planets sort ahead
+    # of everything else; the nearest leftovers backfill any deficit — identical
+    # semantics to the old quota+overflow, but with a tick-scheduled k.
     def _select_cands(src_slot):
         src_x       = state.p_x[src_slot]
         src_y       = state.p_y[src_slot]
@@ -298,40 +337,30 @@ def _select_sources_and_candidates(state: EnvState, player, K: int, cand_select:
         # fleets typically miss and may continue into the sun.
         excl_mask   = state.p_alive & (planet_idx != src_slot) & ~state.p_is_comet
 
-        def top_k(mask, k):
-            sorted_dist = jnp.where(mask & excl_mask, dist_to_src, INF)
-            slots       = jnp.argsort(sorted_dist)[:k]
-            valid       = sorted_dist[slots] < INF
-            return slots, valid
-
         is_enemy_planet    = excl_mask & (state.p_owner != -1) & (state.p_owner != player)
         is_neutral_planet  = excl_mask & (state.p_owner == -1)
         is_friendly_planet = excl_mask & (state.p_owner == player)
 
-        enemy_slots,    enemy_valid    = top_k(is_enemy_planet,    K_enemy)
-        neutral_slots,  neutral_valid  = top_k(is_neutral_planet,  K_neutral)
-        friendly_slots, friendly_valid = top_k(is_friendly_planet, K_friendly)
+        def cat_rank(cat_mask):
+            # rank[p] = number of same-category planets strictly nearer than p.
+            closer = cat_mask[None, :] & (dist_to_src[None, :] < dist_to_src[:, None])
+            return jnp.sum(closer, axis=1)            # [MAX_PLANETS] int
 
-        # Flatten per-category picks [K-1]
-        per_slots = jnp.concatenate([enemy_slots,  neutral_slots,  friendly_slots])
-        per_valid = jnp.concatenate([enemy_valid,  neutral_valid,  friendly_valid])
+        in_quota = (
+            (is_enemy_planet    & (cat_rank(is_enemy_planet)    < k_enemy))
+            | (is_neutral_planet  & (cat_rank(is_neutral_planet)  < k_neutral))
+            | (is_friendly_planet & (cat_rank(is_friendly_planet) < k_friendly))
+        )
 
-        # Overflow pool: nearest planets not already claimed by a quota slot.
-        # Handles the case where a category has fewer planets than its quota —
-        # instead of wasting those slots, fill them with the next-closest planets
-        # from any category.
-        selected   = jnp.zeros(MAX_PLANETS, dtype=jnp.bool_).at[per_slots].set(per_valid)
-        ovfl_dist  = jnp.where(excl_mask & ~selected, dist_to_src, INF)
-        ovfl_slots = jnp.argsort(ovfl_dist)[:K - 1]   # [K-1] — max deficit is K-1
-        ovfl_valid = ovfl_dist[ovfl_slots] < INF
-
-        # Exclusive prefix-sum of invalids → overflow index for each slot.
-        # per_valid[i]=False means: use ovfl_slots[# of invalids before i].
-        inv      = (~per_valid).astype(jnp.int32)
-        ovfl_idx = jnp.minimum(jnp.cumsum(inv) - inv, K - 2)  # clamp to [0, K-2]
-
-        final_slots = jnp.where(per_valid, per_slots, ovfl_slots[ovfl_idx])
-        final_valid = jnp.where(per_valid, True,      ovfl_valid[ovfl_idx])
+        # Sort key: in-quota planets first (by distance), then the nearest
+        # out-of-quota planets (overflow backfill), then ineligible (INF).
+        key = jnp.where(
+            excl_mask,
+            jnp.where(in_quota, dist_to_src, OVERFLOW_BIAS + dist_to_src),
+            INF,
+        )
+        final_slots = jnp.argsort(key)[:K - 1]        # [K-1]
+        final_valid = key[final_slots] < INF
 
         cand_slots = jnp.concatenate([jnp.array([-1], jnp.int32), final_slots])
         cand_valid = jnp.concatenate([jnp.array([True], bool),     final_valid])
@@ -368,10 +397,6 @@ def _make_env_encoder(K: int, env_cfg):
     Call once at JaxVecEnv init; reuse every tick.
     """
     from .constants import MAX_ANGULAR_VELOCITY, BOARD_SIZE, MAX_PRODUCTION
-
-    K_enemy    = K // 3
-    K_friendly = K // 3
-    K_neutral  = K - 1 - K_enemy - K_friendly
 
     # Candidate selection strategy (resolved once, at encoder-build time, so the
     # branch is a Python-level choice and adds no per-trace cost).

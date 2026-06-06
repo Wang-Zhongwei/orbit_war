@@ -11,6 +11,9 @@ Usage:
     python -m src_jax.bc_train --episode_dirs episodes/2026-05-24 \\
                                 --top_k_episodes 5 --epochs 1
 
+    # Recursive mode — train from every episode subdirectory under a parent:
+    python -m src_jax.bc_train --episode_dirs episodes --recursive
+
 Runtime flags (accepted in both modes):
     --use_shard / --no_use_shard   Use pre-built shards (default: stream from zip)
     --no_wandb               Disable W&B logging
@@ -167,11 +170,16 @@ def train(
     cfg: TrainConfig,
     *,
     use_wandb: bool = True,
+    recursive: bool = False,
 ) -> TrainState:
     """Shard-based BC training loop. All hyperparameters are read from cfg.bc."""
     bc = cfg.bc
     aug_ids = DEFAULT_AUG_IDS
-    episodes_dirs = _resolve_episode_dirs(episodes_dirs, include_shard_dirs=True)
+    episodes_dirs = _resolve_episode_dirs(
+        episodes_dirs,
+        include_shard_dirs=True,
+        recursive=recursive,
+    )
     shard_paths = find_shards(episodes_dirs)
     if bc.top_k_episodes is not None:
         counts = shard_episode_counts(shard_paths)
@@ -332,7 +340,10 @@ def train(
 
 
 def _resolve_episode_dirs(
-    episodes_dirs: list[Path], *, include_shard_dirs: bool = False
+    episodes_dirs: list[Path],
+    *,
+    include_shard_dirs: bool = False,
+    recursive: bool = False,
 ) -> list[Path]:
     """Auto-expand dirs that contain no episode files directly but have dated subdirs.
 
@@ -351,6 +362,17 @@ def _resolve_episode_dirs(
         d = Path(d)
         if not d.is_dir():
             resolved.append(d)
+            continue
+        if recursive:
+            subdirs = [
+                child for child in sorted(d.rglob("*"))
+                if child.is_dir() and child.name != SHARD_DIR_NAME and _qualifies(child)
+            ]
+            if subdirs:
+                print(f"  recursive-discovered under {d}: {[str(s) for s in subdirs]}", flush=True)
+                resolved.extend(subdirs)
+            else:
+                resolved.append(d)   # keep as-is; will raise a clear error later
             continue
         if _qualifies(d):
             resolved.append(d)
@@ -376,6 +398,7 @@ def train_stream(
     cfg: TrainConfig,
     *,
     use_wandb: bool = True,
+    recursive: bool = False,
 ) -> TrainState:
     """Streaming BC training loop with parallel CPU encoding.
 
@@ -385,7 +408,7 @@ def train_stream(
     bc = cfg.bc
     aug_ids = DEFAULT_AUG_IDS
 
-    episodes_dirs = _resolve_episode_dirs(episodes_dirs)
+    episodes_dirs = _resolve_episode_dirs(episodes_dirs, recursive=recursive)
 
     policy = build_policy(cfg)
     params = init_params(policy, cfg.seed)
@@ -586,7 +609,12 @@ def parse_args() -> argparse.Namespace:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--episode_dirs", "--episodes_dirs", "--episodes_dir",
                         dest="episodes_dirs", nargs="+", default=["episodes"],
-                        help="Date directories (e.g. episodes/2026-05-24)")
+                        help="Date directories (e.g. episodes/2026-05-24). "
+                             "With --recursive, parent dirs whose episode subdirs are trained.")
+    parser.add_argument("--recursive", action="store_true",
+                        help="Treat --episode_dirs as parent dirs and train from every subdirectory "
+                             "that contains episode files. In --use_shard mode, subdirectories with "
+                             "pre-built shards also qualify.")
     parser.add_argument("--config", default=None,
                         help="TrainConfig YAML (formal mode). Omit to use dataclass defaults "
                              "with CLI overrides (smoke-test mode).")
@@ -642,9 +670,9 @@ def main() -> None:
     episodes_dirs = [Path(d) for d in args.episodes_dirs]
 
     if cfg.bc.use_shard:
-        train(episodes_dirs, cfg, use_wandb=use_wandb)
+        train(episodes_dirs, cfg, use_wandb=use_wandb, recursive=args.recursive)
     else:
-        train_stream(episodes_dirs, cfg, use_wandb=use_wandb)
+        train_stream(episodes_dirs, cfg, use_wandb=use_wandb, recursive=args.recursive)
 
 
 if __name__ == "__main__":

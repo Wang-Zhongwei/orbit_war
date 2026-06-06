@@ -42,7 +42,7 @@ def _setstate(instance: Any, state: Any) -> None:
 @dataclass
 class EnvConfig:
     episode_steps: int = 500
-    candidate_count: int = 8
+    candidate_count: int = 12
     max_planets: int = 48
     max_ships: float = 400.0
     # K-candidate selection strategy used by the feature encoder:

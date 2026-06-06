@@ -11,3 +11,4 @@ wandb/*
 jobs/*
 !jobs/templates/
 !jobs/templates/**
+analysis/*
