@@ -21,7 +21,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .bc_data import SHARD_DIR_NAME, encode_to_shards
+from .bc_data import POOL_K, SHARD_DIR_NAME, encode_to_shards
 from .config import TrainConfig, load_train_config
 from .features import _make_env_encoder
 
@@ -55,8 +55,6 @@ def main() -> None:
     parser.add_argument("--config", default=None,
                         help="TrainConfig YAML (formal mode). Omit to use dataclass defaults "
                              "(smoke-test mode).")
-    parser.add_argument("--candidate_count", type=int, default=None,
-                        help="Candidate count for the environment")
     parser.add_argument("--episodes_per_shard", type=int, default=100,
                         help="Episodes per shard file (default: 100)")
     parser.add_argument("--winner_only", action="store_true",
@@ -68,6 +66,12 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_train_config(args.config) if args.config is not None else TrainConfig()
+
+    # Shards are encoded once at the fixed K-pool size (POOL_K) and re-sliced to the
+    # training K offline via assemble_for_k — so the encoded pool is decoupled from
+    # cfg.env.candidate_count. POOL_K is the single source of truth; bump it (and
+    # re-encode) if you ever need to train at K > POOL_K.
+    print(f"Encoding candidate pool at K={POOL_K} (train at any K <= {POOL_K})")
 
     root = Path(args.episodes_dir)
     if args.recursive:
@@ -89,7 +93,7 @@ def main() -> None:
             force=args.force,
             workers=args.workers,
             encode_fn_factory=_make_env_encoder,
-            encode_fn_factory_args=(args.candidate_count or cfg.env.candidate_count, cfg.env),
+            encode_fn_factory_args=(POOL_K, cfg.env),
         )
         print(f"Done → {shard_dir}")
 

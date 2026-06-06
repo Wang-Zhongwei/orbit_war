@@ -44,8 +44,10 @@ from .augment import DEFAULT_AUG_IDS, expand_with_augmentations
 from .bc_data import (
     SHARD_DIR_NAME,
     _iter_episode_jsons,
+    assemble_for_k,
     episode_to_samples,
     find_shards,
+    is_pool_shard,
     shard_episode_counts,
 )
 from .config import TrainConfig, load_train_config
@@ -228,6 +230,10 @@ def train(
 
         for si, shard_i in enumerate(shard_order):
             data = np.load(shard_paths[shard_i])
+            # K-pool shards store a K_max candidate pool; re-slice to this run's K.
+            # Legacy fixed-K shards already carry cand_feats/target_idx directly.
+            if is_pool_shard(data):
+                data = assemble_for_k(data, cfg.env.candidate_count)
             N    = data["target_idx"].shape[0]
             perm = rng.permutation(N)
 

@@ -19,11 +19,11 @@ from .physics import (
     EnvState, MAX_PLANETS, MAX_BASE_PLANETS, MAX_FLEETS,
     _fleet_speed,
 )
-from .constants import CENTER, ROTATION_RADIUS_LIMIT, SUN_RADIUS
+from .constants import CENTER, LAUNCH_SURFACE_EPS, ROTATION_RADIUS_LIMIT, SUN_RADIUS
 
 MIN_SOURCE_SHIPS: int = 10
-_MAX_TICKS: int = 25
-_T_INBOUND: int = 25  # tick horizon for inbound fleet simulation
+MAX_TICKS_OUT: int = 30
+MAX_TICKS_IN: int = 30
 
 
 def self_feature_dim() -> int:
@@ -94,7 +94,7 @@ def _find_angle_single(
         ty = CENTER + orb_r * s_t
         dx = tx - src_x
         dy = ty - src_y
-        gap = spd * t - (jnp.sqrt(dx * dx + dy * dy) - src_radius)
+        gap = spd * t - (jnp.sqrt(dx * dx + dy * dy) - (src_radius + LAUNCH_SURFACE_EPS))
         valid = (~found) & (jnp.abs(gap) < tgt_radius)
         angle_t = jnp.arctan2(dy, dx)
         next_c_t = c_step * c_t - s_step * s_t
@@ -120,7 +120,7 @@ def _find_angle_single(
             c_tick1,
             s_tick1,
         ),
-        jnp.arange(1, _MAX_TICKS + 1, dtype=jnp.int32),
+        jnp.arange(1, MAX_TICKS_OUT + 1, dtype=jnp.int32),
     )
 
     # --- Static candidate angles ---
@@ -246,11 +246,120 @@ class _EncodedTurn(NamedTuple):
     src_slots:       jnp.ndarray  # [MAX_SRC]       int32 — planet slot for each source
     cand_slots_safe: jnp.ndarray  # [MAX_SRC, K]    int32 (no-op clamped to 0)
     cand_ids:        jnp.ndarray  # [MAX_SRC, K]    int32 (-1 for no-op/invalid)
-    cand_mask:       jnp.ndarray  # [MAX_SRC, K]    bool
+    cand_mask:       jnp.ndarray  # [MAX_SRC, K]    bool  (valid & ~blocked; slot 0 True)
     angles:          jnp.ndarray  # [MAX_SRC, K]    float32
     cand_feats:      jnp.ndarray  # [MAX_SRC, K, 30]
+    # K-pool reconstruction metadata (lets a K_max shard be re-sliced to any K<=K_max).
+    cand_cat:        jnp.ndarray  # [MAX_SRC, K]    int8  (0=enemy,1=neutral,2=friendly; -1=no-op/empty)
+    cand_dist:       jnp.ndarray  # [MAX_SRC, K]    float32 (source→candidate distance, board units)
     global_feat:     jnp.ndarray  # [12]
     step:            jnp.ndarray  # []              int32
+
+
+def _select_sources_and_candidates(state: EnvState, player, K: int, cand_select: str):
+    """Source + K-candidate slot selection for a single game state (no features).
+
+    Returns:
+        src_slots      [MAX_SRC]      planet slots chosen as launch sources
+        src_valid      [MAX_SRC]      which of those are real (own, alive, >=MIN ships)
+        all_cand_slots [MAX_SRC, K]   candidate planet slots per source (slot 0 = -1 no-op)
+        all_cand_valid [MAX_SRC, K]   pre-blocking pool membership (slot 0 = True)
+
+    This is the only K-dependent part of the encoder. _make_env_encoder calls it and
+    then additionally AND-masks candidates whose flight path is blocked; lightweight
+    analysis tools call it directly to measure pure pool coverage. Sharing it keeps
+    the two from drifting.
+    """
+    K_enemy    = K // 3
+    K_friendly = K // 3
+    K_neutral  = K - 1 - K_enemy - K_friendly
+    planet_idx = jnp.arange(MAX_PLANETS, dtype=jnp.int32)
+    INF = jnp.float32(1e30)
+
+    # ── Source selection ──────────────────────────────────────────────
+    src_mask = (
+        state.p_alive
+        & (state.p_owner == player)
+        & (state.p_ships >= MIN_SOURCE_SHIPS)
+    )
+    sort_key  = jnp.where(src_mask,
+                          jnp.arange(MAX_PLANETS, dtype=jnp.int32),
+                          MAX_PLANETS + 1)
+    src_slots = jnp.argsort(sort_key)[:MAX_BASE_PLANETS]   # [MAX_SRC]
+    src_valid = src_mask[src_slots]                         # [MAX_SRC]
+
+    # ── Candidate selection (vmapped over sources) ────────────────────
+    def _select_cands(src_slot):
+        src_x       = state.p_x[src_slot]
+        src_y       = state.p_y[src_slot]
+        dist_to_src = jnp.hypot(state.p_x - src_x, state.p_y - src_y)
+        # Exclude comets: the static-angle fallback aims at the comet's
+        # current position, which it will have left by arrival time, so
+        # fleets typically miss and may continue into the sun.
+        excl_mask   = state.p_alive & (planet_idx != src_slot) & ~state.p_is_comet
+
+        def top_k(mask, k):
+            sorted_dist = jnp.where(mask & excl_mask, dist_to_src, INF)
+            slots       = jnp.argsort(sorted_dist)[:k]
+            valid       = sorted_dist[slots] < INF
+            return slots, valid
+
+        is_enemy_planet    = excl_mask & (state.p_owner != -1) & (state.p_owner != player)
+        is_neutral_planet  = excl_mask & (state.p_owner == -1)
+        is_friendly_planet = excl_mask & (state.p_owner == player)
+
+        enemy_slots,    enemy_valid    = top_k(is_enemy_planet,    K_enemy)
+        neutral_slots,  neutral_valid  = top_k(is_neutral_planet,  K_neutral)
+        friendly_slots, friendly_valid = top_k(is_friendly_planet, K_friendly)
+
+        # Flatten per-category picks [K-1]
+        per_slots = jnp.concatenate([enemy_slots,  neutral_slots,  friendly_slots])
+        per_valid = jnp.concatenate([enemy_valid,  neutral_valid,  friendly_valid])
+
+        # Overflow pool: nearest planets not already claimed by a quota slot.
+        # Handles the case where a category has fewer planets than its quota —
+        # instead of wasting those slots, fill them with the next-closest planets
+        # from any category.
+        selected   = jnp.zeros(MAX_PLANETS, dtype=jnp.bool_).at[per_slots].set(per_valid)
+        ovfl_dist  = jnp.where(excl_mask & ~selected, dist_to_src, INF)
+        ovfl_slots = jnp.argsort(ovfl_dist)[:K - 1]   # [K-1] — max deficit is K-1
+        ovfl_valid = ovfl_dist[ovfl_slots] < INF
+
+        # Exclusive prefix-sum of invalids → overflow index for each slot.
+        # per_valid[i]=False means: use ovfl_slots[# of invalids before i].
+        inv      = (~per_valid).astype(jnp.int32)
+        ovfl_idx = jnp.minimum(jnp.cumsum(inv) - inv, K - 2)  # clamp to [0, K-2]
+
+        final_slots = jnp.where(per_valid, per_slots, ovfl_slots[ovfl_idx])
+        final_valid = jnp.where(per_valid, True,      ovfl_valid[ovfl_idx])
+
+        cand_slots = jnp.concatenate([jnp.array([-1], jnp.int32), final_slots])
+        cand_valid = jnp.concatenate([jnp.array([True], bool),     final_valid])
+        return cand_slots, cand_valid
+
+    def _select_cands_knn(src_slot):
+        """Plain K-nearest-neighbours: the K-1 closest planets of any owner.
+
+        No per-owner quotas — just distance. Slot 0 is the no-op; comets and
+        the source planet are still excluded (same reasons as the category
+        selector). Empty trailing slots (fewer than K-1 planets) are invalid.
+        """
+        src_x       = state.p_x[src_slot]
+        src_y       = state.p_y[src_slot]
+        dist_to_src = jnp.hypot(state.p_x - src_x, state.p_y - src_y)
+        excl_mask   = state.p_alive & (planet_idx != src_slot) & ~state.p_is_comet
+
+        sorted_dist = jnp.where(excl_mask, dist_to_src, INF)
+        nn_slots    = jnp.argsort(sorted_dist)[:K - 1]          # [K-1]
+        nn_valid    = sorted_dist[nn_slots] < INF
+
+        cand_slots = jnp.concatenate([jnp.array([-1], jnp.int32), nn_slots])
+        cand_valid = jnp.concatenate([jnp.array([True], bool),    nn_valid])
+        return cand_slots, cand_valid
+
+    _select = _select_cands_knn if cand_select == "knn" else _select_cands
+    all_cand_slots, all_cand_valid = jax.vmap(_select)(src_slots)  # [MAX_SRC, K]
+    return src_slots, src_valid, all_cand_slots, all_cand_valid
 
 
 def _make_env_encoder(K: int, env_cfg):
@@ -280,93 +389,10 @@ def _make_env_encoder(K: int, env_cfg):
     max_angular_velocity = jnp.float32(MAX_ANGULAR_VELOCITY)
 
     def _encode_single(state: EnvState, player: jnp.ndarray) -> _EncodedTurn:
-        planet_idx = jnp.arange(MAX_PLANETS, dtype=jnp.int32)
-        INF = jnp.float32(1e30)
-
-        # ── Source selection ──────────────────────────────────────────────
-        src_mask = (
-            state.p_alive
-            & (state.p_owner == player)
-            & (state.p_ships >= MIN_SOURCE_SHIPS)
+        # ── Source + candidate selection (shared with analysis tools) ─────
+        src_slots, src_valid, all_cand_slots, all_cand_valid = (
+            _select_sources_and_candidates(state, player, K, cand_select)
         )
-        sort_key  = jnp.where(src_mask,
-                              jnp.arange(MAX_PLANETS, dtype=jnp.int32),
-                              MAX_PLANETS + 1)
-        src_slots = jnp.argsort(sort_key)[:MAX_BASE_PLANETS]   # [MAX_SRC]
-        src_valid = src_mask[src_slots]                         # [MAX_SRC]
-
-        # ── Candidate selection (vmapped over sources) ────────────────────
-        def _select_cands(src_slot):
-            src_x       = state.p_x[src_slot]
-            src_y       = state.p_y[src_slot]
-            dist_to_src = jnp.hypot(state.p_x - src_x, state.p_y - src_y)
-            # Exclude comets: the static-angle fallback aims at the comet's
-            # current position, which it will have left by arrival time, so
-            # fleets typically miss and may continue into the sun.
-            excl_mask   = state.p_alive & (planet_idx != src_slot) & ~state.p_is_comet
-
-            def top_k(mask, k):
-                sorted_dist = jnp.where(mask & excl_mask, dist_to_src, INF)
-                slots       = jnp.argsort(sorted_dist)[:k]
-                valid       = sorted_dist[slots] < INF
-                return slots, valid
-
-            is_enemy_planet    = excl_mask & (state.p_owner != -1) & (state.p_owner != player)
-            is_neutral_planet  = excl_mask & (state.p_owner == -1)
-            is_friendly_planet = excl_mask & (state.p_owner == player)
-
-            enemy_slots,    enemy_valid    = top_k(is_enemy_planet,    K_enemy)
-            neutral_slots,  neutral_valid  = top_k(is_neutral_planet,  K_neutral)
-            friendly_slots, friendly_valid = top_k(is_friendly_planet, K_friendly)
-
-            # Flatten per-category picks [K-1]
-            per_slots = jnp.concatenate([enemy_slots,  neutral_slots,  friendly_slots])
-            per_valid = jnp.concatenate([enemy_valid,  neutral_valid,  friendly_valid])
-
-            # Overflow pool: nearest planets not already claimed by a quota slot.
-            # Handles the case where a category has fewer planets than its quota —
-            # instead of wasting those slots, fill them with the next-closest planets
-            # from any category.
-            selected   = jnp.zeros(MAX_PLANETS, dtype=jnp.bool_).at[per_slots].set(per_valid)
-            ovfl_dist  = jnp.where(excl_mask & ~selected, dist_to_src, INF)
-            ovfl_slots = jnp.argsort(ovfl_dist)[:K - 1]   # [K-1] — max deficit is K-1
-            ovfl_valid = ovfl_dist[ovfl_slots] < INF
-
-            # Exclusive prefix-sum of invalids → overflow index for each slot.
-            # per_valid[i]=False means: use ovfl_slots[# of invalids before i].
-            inv      = (~per_valid).astype(jnp.int32)
-            ovfl_idx = jnp.minimum(jnp.cumsum(inv) - inv, K - 2)  # clamp to [0, K-2]
-
-            final_slots = jnp.where(per_valid, per_slots, ovfl_slots[ovfl_idx])
-            final_valid = jnp.where(per_valid, True,      ovfl_valid[ovfl_idx])
-
-            cand_slots = jnp.concatenate([jnp.array([-1], jnp.int32), final_slots])
-            cand_valid = jnp.concatenate([jnp.array([True], bool),     final_valid])
-            return cand_slots, cand_valid
-
-        def _select_cands_knn(src_slot):
-            """Plain K-nearest-neighbours: the K-1 closest planets of any owner.
-
-            No per-owner quotas — just distance. Slot 0 is the no-op; comets and
-            the source planet are still excluded (same reasons as the category
-            selector). Empty trailing slots (fewer than K-1 planets) are invalid.
-            """
-            src_x       = state.p_x[src_slot]
-            src_y       = state.p_y[src_slot]
-            dist_to_src = jnp.hypot(state.p_x - src_x, state.p_y - src_y)
-            excl_mask   = state.p_alive & (planet_idx != src_slot) & ~state.p_is_comet
-
-            sorted_dist = jnp.where(excl_mask, dist_to_src, INF)
-            nn_slots    = jnp.argsort(sorted_dist)[:K - 1]          # [K-1]
-            nn_valid    = sorted_dist[nn_slots] < INF
-
-            cand_slots = jnp.concatenate([jnp.array([-1], jnp.int32), nn_slots])
-            cand_valid = jnp.concatenate([jnp.array([True], bool),    nn_valid])
-            return cand_slots, cand_valid
-
-        _select = _select_cands_knn if cand_select == "knn" else _select_cands
-        all_cand_slots, all_cand_valid = jax.vmap(_select)(src_slots)
-        # [MAX_SRC, K], [MAX_SRC, K]
         safe_slots = jnp.clip(all_cand_slots, 0, MAX_PLANETS - 1)  # [MAX_SRC, K]
 
         # ── Ship counts (per-candidate offensive estimate, unused for blocking) ──
@@ -459,6 +485,14 @@ def _make_env_encoder(K: int, env_cfg):
         is_neutral  = (tgt_owner == -1).astype(jnp.float32)
         is_friendly = (tgt_owner == player).astype(jnp.float32)
         is_enemy    = ((tgt_owner != -1) & (tgt_owner != player)).astype(jnp.float32)
+
+        # Per-candidate category + distance for K-pool reconstruction. cat marks
+        # empties / no-op as -1 (slot 0 is always the no-op) so a K_max shard can be
+        # re-sliced to a smaller K by re-running the quota+overflow selection offline.
+        cand_cat = jnp.where(tgt_owner == -1, jnp.int8(1),
+                     jnp.where(tgt_owner == player, jnp.int8(2), jnp.int8(0)))
+        cand_cat = jnp.where(all_cand_valid, cand_cat, jnp.int8(-1)).at[:, 0].set(jnp.int8(-1))
+        cand_dist = (tgt_dist / board_size).astype(jnp.float32).at[:, 0].set(jnp.float32(0.0))
 
         tgt_init_x  = state.p_init_x[safe_slots]
         tgt_init_y  = state.p_init_y[safe_slots]
@@ -572,7 +606,7 @@ def _make_env_encoder(K: int, env_cfg):
                 tick_rot_c,
                 tick_rot_s,
             ),
-            jnp.arange(1, _T_INBOUND + 1, dtype=jnp.int32),
+            jnp.arange(1, MAX_TICKS_IN + 1, dtype=jnp.int32),
         )  # [MAX_PLANETS, MAX_FLEETS] / [MAX_PLANETS]
 
         inbound_sim    = inbound_all[safe_slots]                           # [MAX_SRC, K, MAX_FLEETS]
@@ -755,6 +789,8 @@ def _make_env_encoder(K: int, env_cfg):
             cand_mask       = cand_mask,
             angles          = angles,
             cand_feats      = cand_feats,
+            cand_cat        = cand_cat,
+            cand_dist       = cand_dist,
             global_feat     = global_feat,
             step            = state.step,
         )

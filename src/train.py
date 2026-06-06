@@ -27,7 +27,7 @@ from .vec_env import SubprocVecEnv
 # Groups all planet decisions that happened within one game tick for one env.
 # After env.step(), we know the reward for that tick and whether the episode ended.
 # indices: row positions in the flat training buffer (self_rows, values, etc.)
-@dataclass(slots=True)
+@dataclass
 class StepGroup:
     indices: list[int]
     reward: float

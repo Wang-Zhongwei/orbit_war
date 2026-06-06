@@ -8,7 +8,7 @@ from typing import Any
 import yaml
 
 
-@dataclass(slots=True)
+@dataclass
 class EnvConfig:
     board_size: float = 100.0
     episode_steps: int = 500
@@ -19,12 +19,12 @@ class EnvConfig:
     max_production: float = 5.0
 
 
-@dataclass(slots=True)
+@dataclass
 class ModelConfig:
     hidden_size: int = 128
 
 
-@dataclass(slots=True)
+@dataclass
 class PPOConfig:
     rollout_steps: int = 32
     num_envs: int = 4
@@ -39,7 +39,7 @@ class PPOConfig:
     max_grad_norm: float = 0.5
 
 
-@dataclass(slots=True)
+@dataclass
 class TrainConfig:
     seed: int = 42
     run_name: str = "orbit_wars_template_ppo"

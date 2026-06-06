@@ -8,7 +8,7 @@ from torch.distributions import Categorical
 from .policy import PolicyOutput
 
 
-@dataclass(slots=True)
+@dataclass
 class SampledAction:
     target_index: torch.Tensor
     log_prob: torch.Tensor
@@ -17,7 +17,7 @@ class SampledAction:
 
 # One row per planet decision collected during a rollout.
 # Flattened across all envs and all rollout steps — fed directly into ppo_update.
-@dataclass(slots=True)
+@dataclass
 class TransitionBatch:
     self_features: torch.Tensor       # [N, self_dim]    — features of the acting planet
     candidate_features: torch.Tensor  # [N, K, cand_dim] — features of each candidate target

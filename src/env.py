@@ -8,7 +8,7 @@ from .features import TurnBatch, encode_turn
 from .agents.rule_based.base import OpponentPolicy
 
 
-@dataclass(slots=True)
+@dataclass
 class StepResult:
     batch: TurnBatch
     reward: float

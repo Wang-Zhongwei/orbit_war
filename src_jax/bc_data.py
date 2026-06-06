@@ -1,40 +1,64 @@
 """
 Behavior-cloning data pipeline: episode JSON → flat (features, labels) arrays.
 
-Each training sample = one source-planet decision at one timestep:
+Shards use the **K-pool** format: the candidate pool is encoded once at POOL_K and
+re-sliced to any training K <= POOL_K offline via assemble_for_k(). Each stored
+sample = one source-planet decision at one timestep:
   self_feats   : [SELF_DIM]
-  cand_feats   : [K, CAND_DIM]
   global_feats : [GLOB_DIM]
-  cand_mask    : [K]
-  fleet_feats  : [MAX_FLEETS, FLEET_DIM]
-  fleet_mask   : [MAX_FLEETS]
-  target_idx   : int in [0, K)   — which candidate the expert chose
+  pool_feats   : [POOL_K, CAND_DIM]   candidate features at the pool size
+  pool_slot    : [POOL_K] int32       planet slot per candidate
+  pool_cat     : [POOL_K] int8        owner category 0/1/2 (enemy/neutral/friendly); -1 = no-op/empty
+  pool_dist    : [POOL_K] float32     source→candidate distance (board units)
+  pool_mask    : [POOL_K] bool        valid & ~blocked (slot 0 = no-op = True)
+  target_slot  : int32                planet slot the expert hit, or -1 (no-op) — K-independent
 
-Label extraction:
-  - source planet: matched by planet_id in encoder's src_ids
-  - target candidate: matched by recomputing the intercept angle to each candidate
-    using the expert's ACTUAL ship count (act_ships), then finding the candidate
-    whose recomputed angle is closest to the action's launch angle.
-    Using actual ships (vs the encoder's estimated src_ships//2) matters for
-    rotating targets whose lead angle depends on fleet speed.
+assemble_for_k(samples, K) materializes the legacy fixed-K training dict
+(self_feats / cand_feats / global_feats / cand_mask / target_idx) by re-running the
+encoder's category-quota + overflow selection over the pool and mapping target_slot
+to a candidate index. Storing the K-independent target_slot (vs a K-specific index)
+is what lets one shard serve k8 / k12 / any K <= POOL_K.
+
+Label extraction (trajectory method)
+------------------------------------
+The expert's target is found by *replaying the physics of the launched fleet*:
+the fleet flies a straight line at the constant speed the engine assigns it, while
+every planet keeps rotating tick-by-tick.  Per tick we run the exact swept-circle
+collision the engine uses (physics._phase_move_fleets / _swept_pair_hit_batch) and
+report the first planet the fleet's path actually sweeps into — that planet *is*
+the target, by construction.  A fleet that leaves the board, falls into the sun, or
+never arrives within the horizon is labelled as the no-op slot 0.
+
+This replaces the earlier nearest-launch-angle heuristic, which was ambiguous when
+two candidates shared a bearing and relied on an approximate intercept solver.
+
+The hot path uses `simulate_episode_targets_jax`: a jitted, vmapped-over-fleets,
+scanned-over-ticks simulator that flies every launch in an episode in one call on
+the accelerator.
 """
 
 from __future__ import annotations
 
+import functools
 import json
-import math
 import multiprocessing as mp
 import os
 import time
 import zipfile
+from enum import IntEnum
 from pathlib import Path
-from typing import Iterator
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .constants import CENTER, MAX_SHIP_SPEED, ROTATION_RADIUS_LIMIT
+from .constants import (
+    BOARD_SIZE,
+    CENTER,
+    LAUNCH_SURFACE_EPS,
+    ROTATION_RADIUS_LIMIT,
+    SUN_RADIUS,
+)
 from .physics import (
     EnvState,
     MAX_BASE_PLANETS,
@@ -42,13 +66,19 @@ from .physics import (
     MAX_PATH_LEN,
     MAX_PLANETS,
     N_COMET_GROUPS,
+    _fleet_speed,
 )
 
-# Maximum angular distance (radians) to accept an angle match.
-# ~34 degrees; tight enough to avoid mis-labeling, loose enough for imperfect expert angles.
-_ANGLE_MATCH_THRESHOLD: float = 0.6
+# How many ticks forward to fly a fleet before giving up and calling it a no-op.
+# Covers essentially all genuine arrivals (see test/flight_time_dist.py); beyond
+# this a fleet has almost certainly left the board or missed.
+MAX_FLY_TICKS: int = 30
 
-_MAX_TICKS_PY: int = 25  # must match features.py's _MAX_TICKS
+# Candidate pool size baked into shards. Shards are encoded once at POOL_K and
+# re-sliced offline to any training K <= POOL_K via assemble_for_k(). POOL_K is
+# the encoder's *total* K (no-op slot included): per-category quotas are K//3
+# enemy / K//3 friendly / remainder neutral — see features._make_env_encoder.
+POOL_K: int = 12
 
 
 def _pad_size_for(n: int) -> int:
@@ -58,6 +88,7 @@ def _pad_size_for(n: int) -> int:
             return s
     return n  # >512 states: unique shape, one extra compile
 
+
 # Ordered pad sizes used to bucket episode batch sizes.  The smallest size that
 # fits the episode is chosen so encode_fn compiles at most len(_PAD_SIZES) times
 # instead of once per distinct episode length (each XLA recompilation costs 2-5s).
@@ -65,53 +96,16 @@ def _pad_size_for(n: int) -> int:
 _PAD_SIZES: tuple[int, ...] = (256, 512)
 
 
-def _find_angles_for_action(
-    src_x: float, src_y: float, src_radius: float,
-    tgt_x: np.ndarray, tgt_y: np.ndarray, tgt_radius: np.ndarray,  # [K]
-    ships: float, angular_velocity: float,
-    valid_mask: np.ndarray,  # [K] bool — which candidates to process
-) -> np.ndarray:
-    """Compute intercept angles to all K candidates in one vectorized sweep.
+# ---------------------------------------------------------------------------
+# Parsed data format
+# ---------------------------------------------------------------------------
 
-    The 25-tick scan stays in a Python loop but operates on K-wide numpy arrays,
-    replacing K separate Python calls with 25 numpy operations over K elements.
-    """
-    s = max(ships, 1.0)
-    spd = 1.0 + (MAX_SHIP_SPEED - 1.0) * (math.log(s) / math.log(1000.0)) ** 1.5
-
-    dx0 = tgt_x - CENTER
-    dy0 = tgt_y - CENTER
-    orb_r = np.sqrt(dx0 * dx0 + dy0 * dy0)
-    rotating  = (orb_r + tgt_radius) < ROTATION_RADIUS_LIMIT  # [K]
-    inv_orb_r = np.reciprocal(np.maximum(orb_r, 1e-6))
-    c_now     = dx0 * inv_orb_r
-    s_now     = dy0 * inv_orb_r
-    c_step    = math.cos(angular_velocity)
-    s_step    = math.sin(angular_velocity)
-    c_t       = c_step * c_now - s_step * s_now
-    s_t       = s_step * c_now + c_step * s_now
-
-    # Static fallback — non-rotating targets and rotating ones with no intercept
-    angles = np.arctan2(tgt_y - src_y, tgt_x - src_x)         # [K]
-    found      = np.zeros(len(tgt_x), dtype=bool)
-    needs_scan = rotating & valid_mask
-
-    for tick in range(1, _MAX_TICKS_PY + 1):
-        remaining = needs_scan & ~found
-        if not remaining.any():
-            break
-        t    = float(tick)
-        tx   = CENTER + orb_r * c_t
-        ty   = CENTER + orb_r * s_t
-        dx   = tx - src_x
-        dy   = ty - src_y
-        gap  = spd * t - (np.sqrt(dx * dx + dy * dy) - src_radius)
-        hit  = remaining & (np.abs(gap) < tgt_radius)
-        angles = np.where(hit, np.arctan2(dy, dx), angles)
-        found |= hit
-        c_t, s_t = c_step * c_t - s_step * s_t, s_step * c_t + c_step * s_t
-
-    return angles  # [K]
+class HitKind(IntEnum):
+    """Outcome of flying a launched fleet forward through the physics."""
+    NONE      = 0   # never resolved within the horizon -> no-op label
+    PLANET    = 1   # swept into a planet -> that planet is the target
+    SUN       = 2   # fell into the sun -> no-op label
+    OUT       = 3   # left the board -> no-op label
 
 
 # ---------------------------------------------------------------------------
@@ -230,98 +224,235 @@ def obs_to_env_state(obs: dict, num_agents: int = 2) -> EnvState:
 
 
 # ---------------------------------------------------------------------------
+# Physics replica — vectorized / JIT'd batch simulator (hot path)
+# ---------------------------------------------------------------------------
+
+def _planet_pos_at_jax(step, p_init_x, p_init_y, p_x, p_y, rotating, ang_vel):
+    """[MAX_P] planet positions at absolute `step` (jax mirror of numpy version)."""
+    dx = p_init_x - CENTER
+    dy = p_init_y - CENTER
+    ang = ang_vel * step.astype(jnp.float32)
+    c, s = jnp.cos(ang), jnp.sin(ang)
+    rot_x = CENTER + c * dx - s * dy
+    rot_y = CENTER + s * dx + c * dy
+    return jnp.where(rotating, rot_x, p_x), jnp.where(rotating, rot_y, p_y)
+
+
+def _swept_entry_time_jax(fa_x, fa_y, fb_x, fb_y, pa_x, pa_y, pb_x, pb_y, r):
+    """[MAX_P] per-planet entry time in [0,1] for this tick, or +inf if no hit.
+
+    Mirrors physics._swept_pair_hit_batch but returns the entry time t1 so the
+    caller can pick the *earliest* arrival within a tick rather than the engine's
+    slot-index tie-break (an implementation artefact, not the intended target).
+    """
+    d0x = fa_x - pa_x
+    d0y = fa_y - pa_y
+    dvx = (fb_x - fa_x) - (pb_x - pa_x)
+    dvy = (fb_y - fa_y) - (pb_y - pa_y)
+    a = dvx * dvx + dvy * dvy
+    b = 2.0 * (d0x * dvx + d0y * dvy)
+    c = d0x * d0x + d0y * d0y - r * r
+    disc = b * b - 4.0 * a * c
+    sq = jnp.sqrt(jnp.maximum(disc, 0.0))
+    inv = 1.0 / (2.0 * a + 1e-12)
+    t1 = (-b - sq) * inv
+    t2 = (-b + sq) * inv
+    moving = a >= 1e-12
+    hit_moving = moving & (disc >= 0.0) & (t2 >= 0.0) & (t1 <= 1.0)
+    hit_static = (~moving) & (c <= 0.0)
+    t_entry = jnp.where(hit_static, 0.0, jnp.clip(t1, 0.0, 1.0))
+    return jnp.where(hit_moving | hit_static, t_entry, jnp.inf)
+
+
+@functools.partial(jax.jit, static_argnames=("max_ticks",))
+def _sim_fleets_jax(
+    src_slot,                       # [F] int32
+    fx0, fy0, cos_a, sin_a, speed,  # [F] float32
+    launch_step,                    # [F] int32
+    ang_vel,                        # [F] float32
+    p_init_x, p_init_y,             # [F, MAX_P]
+    p_x, p_y, p_radius,             # [F, MAX_P]
+    p_alive, is_comet,              # [F, MAX_P] bool
+    max_ticks: int = MAX_FLY_TICKS,
+):
+    """Fly all fleets forward. Returns hit_kind/hit_slot/hit_tick, each [F].
+
+    hit_kind uses the HitKind int codes (0 NONE, 1 PLANET, 2 SUN, 3 OUT).
+    """
+    F, MAX_P = p_x.shape
+
+    def per_fleet(src_slot, fx0, fy0, cos_a, sin_a, speed, launch_step, ang_vel,
+                  p_init_x, p_init_y, p_x, p_y, p_radius, p_alive, is_comet):
+        dx = p_init_x - CENTER
+        dy = p_init_y - CENTER
+        orb_r = jnp.sqrt(dx * dx + dy * dy)
+        rotating = (orb_r + p_radius < ROTATION_RADIUS_LIMIT) & p_alive & ~is_comet
+        is_src = jnp.arange(MAX_P) == src_slot
+
+        px0, py0 = _planet_pos_at_jax(launch_step, p_init_x, p_init_y, p_x, p_y,
+                                      rotating, ang_vel)
+
+        def body(carry, tick):
+            fx, fy, px_old, py_old, done, hk, hslot, htick = carry
+            nfx = fx + cos_a * speed
+            nfy = fy + sin_a * speed
+            px_new, py_new = _planet_pos_at_jax(launch_step + tick, p_init_x, p_init_y,
+                                                p_x, p_y, rotating, ang_vel)
+
+            seg_dx, seg_dy = nfx - fx, nfy - fy
+            seg_l2 = seg_dx * seg_dx + seg_dy * seg_dy
+            t_sun = jnp.where(seg_l2 > 0.0,
+                              jnp.clip(((CENTER - fx) * seg_dx + (CENTER - fy) * seg_dy)
+                                       / (seg_l2 + 1e-30), 0.0, 1.0), 0.0)
+            proj_x = fx + t_sun * seg_dx
+            proj_y = fy + t_sun * seg_dy
+            sun_hit = (proj_x - CENTER) ** 2 + (proj_y - CENTER) ** 2 < SUN_RADIUS ** 2
+
+            t_entry = _swept_entry_time_jax(fx, fy, nfx, nfy, px_old, py_old,
+                                            px_new, py_new, p_radius)
+            valid = p_alive & ~(is_src & (tick == 1))
+            t_entry = jnp.where(valid, t_entry, jnp.inf)
+            best_slot = jnp.argmin(t_entry).astype(jnp.int32)
+            best_t = t_entry[best_slot]
+            planet_hit = jnp.isfinite(best_t)
+
+            oob = ~((0.0 <= nfx) & (nfx <= BOARD_SIZE) & (0.0 <= nfy) & (nfy <= BOARD_SIZE))
+
+            planet_first = planet_hit & (~sun_hit | (best_t <= t_sun))
+            ev_kind = jnp.where(planet_first, HitKind.PLANET,
+                       jnp.where(sun_hit, HitKind.SUN,
+                        jnp.where(oob, HitKind.OUT, HitKind.NONE))).astype(jnp.int32)
+            ev_slot = jnp.where(planet_first, best_slot, -1).astype(jnp.int32)
+            event = ev_kind != HitKind.NONE
+
+            fire = event & ~done
+            hk = jnp.where(fire, ev_kind, hk)
+            hslot = jnp.where(fire, ev_slot, hslot)
+            htick = jnp.where(fire, tick, htick)
+            done = done | event
+            nfx = jnp.where(done, fx, nfx)
+            nfy = jnp.where(done, fy, nfy)
+            return (nfx, nfy, px_new, py_new, done, hk, hslot, htick), None
+
+        init = (fx0, fy0, px0, py0, jnp.bool_(False),
+                jnp.int32(HitKind.NONE), jnp.int32(-1), jnp.int32(-1))
+        carry, _ = jax.lax.scan(body, init, jnp.arange(1, max_ticks + 1, dtype=jnp.int32))
+        _, _, _, _, _, hk, hslot, htick = carry
+        return hk, hslot, htick
+
+    return jax.vmap(per_fleet)(
+        src_slot, fx0, fy0, cos_a, sin_a, speed, launch_step, ang_vel,
+        p_init_x, p_init_y, p_x, p_y, p_radius, p_alive, is_comet)
+
+
+def simulate_episode_targets_jax(
+    flat_actions: list[tuple[int, int, float, float]],
+    *,
+    p_x, p_y, p_init_x, p_init_y, p_radius, p_alive, p_is_comet,  # [T, MAX_P]
+    angular_velocity, step,                                       # [T]
+    max_ticks: int = MAX_FLY_TICKS,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Batch-simulate every launch in an episode in one jitted call.
+
+    flat_actions: list of (timestep, src_slot, act_angle, act_ships) — already
+    resolved to planet slots by the caller. Returns parallel numpy arrays
+    (hit_kind, hit_slot, hit_tick), one entry per action.
+    """
+    if not flat_actions:
+        z = np.zeros(0, np.int32)
+        return z, z, z
+    ts = np.array([a[0] for a in flat_actions], np.int32)
+    ss = np.array([a[1] for a in flat_actions], np.int32)
+    ang = np.array([a[2] for a in flat_actions], np.float32)
+    shp = np.array([a[3] for a in flat_actions], np.float32)
+
+    g = lambda arr: jnp.asarray(np.asarray(arr)[ts])  # [F, MAX_P]
+    pix, piy = g(p_init_x), g(p_init_y)
+    px, py, pr = g(p_x), g(p_y), g(p_radius)
+    pal, pc = g(p_alive), g(p_is_comet)
+    src = jnp.asarray(ss)
+    ang_j = jnp.asarray(ang)
+    speed = _fleet_speed(jnp.asarray(shp))
+    cos_a, sin_a = jnp.cos(ang_j), jnp.sin(ang_j)
+    launch_step = jnp.asarray(np.asarray(step)[ts])
+    ang_vel = jnp.asarray(np.asarray(angular_velocity)[ts])
+
+    src_px = jnp.take_along_axis(px, src[:, None], axis=1)[:, 0]
+    src_py = jnp.take_along_axis(py, src[:, None], axis=1)[:, 0]
+    src_pr = jnp.take_along_axis(pr, src[:, None], axis=1)[:, 0]
+    fx0 = src_px + cos_a * (src_pr + LAUNCH_SURFACE_EPS)
+    fy0 = src_py + sin_a * (src_pr + LAUNCH_SURFACE_EPS)
+
+    hk, hslot, htick = _sim_fleets_jax(
+        src, fx0, fy0, cos_a, sin_a, speed, launch_step, ang_vel,
+        pix, piy, px, py, pr, pal, pc, max_ticks=max_ticks)
+    return np.asarray(hk), np.asarray(hslot), np.asarray(htick)
+
+
+# ---------------------------------------------------------------------------
 # Label extraction
 # ---------------------------------------------------------------------------
 
+def _resolve_src_idx(src_ids: np.ndarray, src_valid: np.ndarray, from_pid: int) -> int:
+    """Map a source planet id to its encoder source index, or -1 if not modelled."""
+    for j in range(len(src_ids)):
+        if src_valid[j] and src_ids[j] == from_pid:
+            return j
+    return -1
 
-def extract_labels(
-    action: list,
-    *,
-    src_ids: np.ndarray,        # [MAX_BASE_PLANETS] int32
-    src_valid: np.ndarray,      # [MAX_BASE_PLANETS] bool
-    src_ships: np.ndarray,      # [MAX_BASE_PLANETS] int32
-    cand_mask: np.ndarray,      # [MAX_BASE_PLANETS, K] bool
-    # State geometry — needed to recompute angles with the expert's actual ship count
-    p_x: np.ndarray,            # [MAX_PLANETS] float32
-    p_y: np.ndarray,            # [MAX_PLANETS] float32
-    p_radius: np.ndarray,       # [MAX_PLANETS] float32
-    angular_velocity: float,
-    src_slots: np.ndarray,      # [MAX_BASE_PLANETS] int32 — planet slot per source
-    cand_slots: np.ndarray,     # [MAX_BASE_PLANETS, K] int32 — planet slot per candidate
-) -> list[tuple[int, int]]:
-    """Return (src_idx, cand_idx) per action.
 
-    If the expert's launch angle is beyond _ANGLE_MATCH_THRESHOLD from every candidate
-    (i.e. the target was outside the candidate pool), the action is labelled as no-op
-    rather than dropped — preserving the training signal that this state called for
-    inaction within the modelled action space.
+
+
+def _add_noop_labels(labels: list[tuple[int, int]], src_valid_i: np.ndarray,
+                     noop: int = 0) -> None:
+    """Append no-op labels for valid sources the expert chose to hold.
+
+    Without these, the policy only sees "given expert decided to launch, where to?"
+    and collapses toward always-launch at inference. ``noop`` is the hold label —
+    candidate index 0 for the legacy format, planet slot -1 for the K-pool format.
     """
-    labels: list[tuple[int, int]] = []
+    acted_src = {src_idx for src_idx, _ in labels}
+    for j in range(len(src_valid_i)):
+        if bool(src_valid_i[j]) and j not in acted_src:
+            labels.append((j, noop))
 
-    for act in action:
-        from_pid  = int(act[0])
-        act_angle = float(act[1])
-        act_ships = int(act[2])
 
-        # Find source slot
-        src_idx = -1
-        for j in range(len(src_ids)):
-            if src_valid[j] and src_ids[j] == from_pid:
-                src_idx = j
-                break
-        if src_idx == -1:
-            continue  # planet not in encoder's source set (< MIN_SOURCE_SHIPS)
+def _flatten_labels(
+    labels_per_state: list[list[tuple[int, int]]],
+    src_valid: np.ndarray,   # [N, MAX_SRC]
+    N: int,
+    noop: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Flatten per-state labels (with no-op holds) into parallel row-index arrays.
 
-        S = int(src_ships[src_idx])
-        if S <= 0:
-            continue
-
-        src_slot  = int(src_slots[src_idx])
-        cslots    = cand_slots[src_idx]          # [K]
-
-        # Exclude the no-op slot (k=0) from angle matching
-        valid_mask = cand_mask[src_idx].copy()
-        valid_mask[0] = False
-
-        # Recompute intercept angles to all K candidates at once with actual act_ships.
-        # This vectorises the per-candidate scan: 25 numpy ops over K instead of K×25 calls.
-        angles_k = _find_angles_for_action(
-            float(p_x[src_slot]), float(p_y[src_slot]), float(p_radius[src_slot]),
-            p_x[cslots], p_y[cslots], p_radius[cslots],
-            float(act_ships), angular_velocity,
-            valid_mask,
-        )
-
-        # Vectorised angular distance; masked candidates get inf
-        diff  = angles_k - act_angle
-        dists = np.abs(np.arctan2(np.sin(diff), np.cos(diff)))
-        dists = np.where(valid_mask, dists, np.inf)
-
-        best_k    = int(np.argmin(dists))
-        best_dist = float(dists[best_k])
-
-        if best_dist > _ANGLE_MATCH_THRESHOLD:
-            # Expert targeted a planet outside the candidate pool → label as no-op.
-            labels.append((src_idx, 0))
-            continue
-
-        labels.append((src_idx, best_k))
-
-    return labels
+    Returns (state_idx, src_idx, target), one entry per output sample, in the
+    same order the old per-row append loop produced: each state's launches first,
+    then its idle-source no-op holds. Callers gather feature rows with a single
+    fancy-index op (self_feats[state_idx, src_idx]) instead of slicing per row.
+    ``noop`` is the hold label appended for idle sources (see _add_noop_labels).
+    """
+    state_idx: list[int] = []
+    src_idx: list[int] = []
+    tgt: list[int] = []
+    for i in range(N):  # only real states, not padding
+        labels = labels_per_state[i]
+        _add_noop_labels(labels, src_valid[i], noop)
+        for s, c in labels:
+            state_idx.append(i)
+            src_idx.append(s)
+            tgt.append(c)
+    n = len(state_idx)
+    return (np.fromiter(state_idx, np.intp, n),
+            np.fromiter(src_idx, np.intp, n),
+            np.fromiter(tgt, np.int32, n))
 
 
 # ---------------------------------------------------------------------------
 # Episode → flat sample arrays
 # ---------------------------------------------------------------------------
 
-def episode_to_samples(
-    episode: dict,
-    encode_fn,
-) -> dict[str, np.ndarray] | None:
-    """Convert one episode JSON to flat numpy arrays of BC training samples.
-
-    encode_fn: the vmapped JAX encoder from _make_env_encoder.
-    Returns None if no valid samples were found.
+def _collect_states_actions(episode: dict):
+    """Shared state/action collection used by both sample functions.
 
     Replay timing: steps[i]['observation'] is the game state AFTER steps[i]['action']
     has been processed.  The agent chose steps[i]['action'] based on the state they
@@ -329,81 +460,6 @@ def episode_to_samples(
         state   = steps[i-1][agent]['observation']
         action  = steps[i][agent]['action']
     """
-    batch_states, batch_players, batch_actions = _collect_states_actions(episode)
-    if not batch_states:
-        return None
-
-    N = len(batch_states)
-    # Pad to the smallest _PAD_SIZES bucket that fits N so encode_fn reuses a
-    # cached XLA kernel instead of recompiling for every distinct episode length.
-    pad_target = _pad_size_for(N)
-    pad_n = pad_target - N
-    all_states  = batch_states  + [batch_states[-1]]  * pad_n
-    all_players = batch_players + [batch_players[-1]] * pad_n
-
-    # np.stack first (fast C loop), then single jnp.asarray per field — avoids
-    # the ~8000 JAX dispatch calls that jnp.stack(list_of_jax_arrays) would cause.
-    batched = jax.tree_util.tree_map(lambda *xs: jnp.asarray(np.stack(xs)), *all_states)
-    players_arr = jnp.array(all_players, dtype=jnp.int32)
-    enc = encode_fn(batched, players_arr)
-    enc_np     = jax.tree_util.tree_map(np.asarray, enc)
-    batched_np = jax.tree_util.tree_map(np.asarray, batched)
-
-    rows_sf, rows_cf, rows_gf, rows_cm = [], [], [], []
-    rows_ff, rows_fm, rows_ti = [], [], []
-
-    for i in range(N):  # only real states, not padding
-        src_ships_i = enc_np.src_ships[i]
-        labels = extract_labels(
-            batch_actions[i],
-            src_ids          = enc_np.src_ids[i],
-            src_valid        = enc_np.src_valid[i],
-            src_ships        = src_ships_i,
-            cand_mask        = enc_np.cand_mask[i],
-            p_x              = batched_np.p_x[i],
-            p_y              = batched_np.p_y[i],
-            p_radius         = batched_np.p_radius[i],
-            angular_velocity = float(batched_np.angular_velocity[i]),
-            src_slots        = enc_np.src_slots[i],
-            cand_slots       = enc_np.cand_slots_safe[i],
-        )
-        # Emit explicit no-op labels for valid sources the expert chose to hold.
-        # Without these, the policy only sees "given expert decided to launch,
-        # where to?" and collapses toward always-launch at inference.
-        acted_src = {src_idx for src_idx, _ in labels}
-        src_valid_i = enc_np.src_valid[i]
-        for j in range(len(src_valid_i)):
-            if bool(src_valid_i[j]) and j not in acted_src:
-                labels.append((j, 0))
-        for src_idx, cand_idx in labels:
-            rows_sf.append(enc_np.self_feats[i,   src_idx])
-            rows_cf.append(enc_np.cand_feats[i,   src_idx])
-            rows_gf.append(enc_np.global_feat[i])
-            rows_cm.append(enc_np.cand_mask[i,    src_idx])
-            # rows_ff.append(enc_np.fleet_feats[i])
-            # rows_fm.append(enc_np.fleet_mask[i])
-            rows_ti.append(cand_idx)
-
-    if not rows_sf:
-        return None
-
-    return {
-        "self_feats":   np.stack(rows_sf).astype(np.float32),
-        "cand_feats":   np.stack(rows_cf).astype(np.float32),
-        "global_feats": np.stack(rows_gf).astype(np.float32),
-        "cand_mask":    np.stack(rows_cm),
-        # "fleet_feats":  np.stack(rows_ff).astype(np.float32),
-        # "fleet_mask":   np.stack(rows_fm),
-        "target_idx":   np.array(rows_ti, dtype=np.int32),
-    }
-
-
-# ---------------------------------------------------------------------------
-# On-device variant for streaming — avoids JAX→numpy→JAX round-trip
-# ---------------------------------------------------------------------------
-
-def _collect_states_actions(episode: dict):
-    """Shared state/action collection used by both sample functions."""
     steps = episode.get("steps", [])
     num_agents = len(steps[0]) if steps else 2
     batch_states: list[EnvState] = []
@@ -429,91 +485,108 @@ def _collect_states_actions(episode: dict):
     return batch_states, batch_players, batch_actions
 
 
-def episode_to_samples_jax(
+def _episode_target_slots(
+    *,
+    src_ids: np.ndarray,        # [N, MAX_SRC]
+    src_valid: np.ndarray,      # [N, MAX_SRC]
+    src_slots: np.ndarray,      # [N, MAX_SRC]
+    p_x: np.ndarray, p_y: np.ndarray,            # [pad, MAX_P]
+    p_init_x: np.ndarray, p_init_y: np.ndarray,  # [pad, MAX_P]
+    p_radius: np.ndarray,                         # [pad, MAX_P]
+    p_alive: np.ndarray, p_is_comet: np.ndarray,  # [pad, MAX_P]
+    angular_velocity: np.ndarray,                 # [pad]
+    step: np.ndarray,                             # [pad]
+    batch_actions: list[list],
+    N: int,
+) -> list[list[tuple[int, int]]]:
+    """Trajectory-label every launch as (src_idx, target_slot).
+
+    Returns labels_per_state[i] = list of (src_idx, target_slot) where target_slot
+    is the planet slot the fleet sweeps into, or -1 for a non-PLANET outcome / no-op.
+    K-independent: the K-pool shard stores these slots so they can be re-sliced to
+    any K offline via assemble_for_k.
+    """
+    flat: list[tuple[int, int, float, float]] = []
+    meta: list[tuple[int, int]] = []  # (timestep, src_idx)
+    for i in range(N):
+        for act in batch_actions[i]:
+            src_idx = _resolve_src_idx(src_ids[i], src_valid[i], int(act[0]))
+            if src_idx == -1:
+                continue
+            flat.append((i, int(src_slots[i][src_idx]), float(act[1]), float(act[2])))
+            meta.append((i, src_idx))
+
+    labels_per_state: list[list[tuple[int, int]]] = [[] for _ in range(N)]
+    if not flat:
+        return labels_per_state
+
+    hit_kind, hit_slot, _ = simulate_episode_targets_jax(
+        flat, p_x=p_x, p_y=p_y, p_init_x=p_init_x, p_init_y=p_init_y,
+        p_radius=p_radius, p_alive=p_alive, p_is_comet=p_is_comet,
+        angular_velocity=angular_velocity, step=step)
+    tslot = np.where(np.asarray(hit_kind) == int(HitKind.PLANET),
+                     np.asarray(hit_slot), -1).astype(np.int32)
+    for n, (i, src_idx) in enumerate(meta):
+        labels_per_state[i].append((src_idx, int(tslot[n])))
+    return labels_per_state
+
+
+def episode_to_samples(
     episode: dict,
     encode_fn,
-) -> dict | None:
-    """Streaming variant of episode_to_samples: feature arrays stay on device.
+) -> dict[str, np.ndarray] | None:
+    """Convert one episode JSON to flat numpy arrays of BC training samples.
 
-    Only the small index/mask arrays needed for label extraction (src_ids, cand_mask, etc.)
-    are copied to CPU. The large feature tensors (self_feats, cand_feats, fleet_feats) are
-    gathered on-device via JAX advanced indexing and returned as JAX arrays.
+    Emits the **K-pool** shard format: the candidate features/metadata are stored
+    at the encoder's POOL_K, and the target is a K-independent planet slot. Call
+    assemble_for_k(samples, K) at train time to materialize cand_feats / cand_mask
+    / target_idx for any K <= POOL_K. encode_fn must therefore be built at POOL_K.
 
-    Use in training loops where you want to avoid the JAX→numpy→JAX round-trip that
-    episode_to_samples incurs when writing shards.
+    Returns None if no valid samples were found.
     """
     batch_states, batch_players, batch_actions = _collect_states_actions(episode)
     if not batch_states:
         return None
 
     N = len(batch_states)
+    # Pad to the smallest _PAD_SIZES bucket that fits N so encode_fn reuses a
+    # cached XLA kernel instead of recompiling for every distinct episode length.
     pad_target = _pad_size_for(N)
     pad_n = pad_target - N
     all_states  = batch_states  + [batch_states[-1]]  * pad_n
     all_players = batch_players + [batch_players[-1]] * pad_n
 
+    # np.stack first (fast C loop), then single jnp.asarray per field — avoids
+    # the ~8000 JAX dispatch calls that jnp.stack(list_of_jax_arrays) would cause.
     batched = jax.tree_util.tree_map(lambda *xs: jnp.asarray(np.stack(xs)), *all_states)
     players_arr = jnp.array(all_players, dtype=jnp.int32)
     enc = encode_fn(batched, players_arr)
+    enc_np     = jax.tree_util.tree_map(np.asarray, enc)
+    batched_np = jax.tree_util.tree_map(np.asarray, batched)
 
-    # Transfer only the small arrays needed for label extraction
-    src_ids_np    = np.asarray(enc.src_ids)
-    src_valid_np  = np.asarray(enc.src_valid)
-    src_ships_np  = np.asarray(enc.src_ships)
-    cand_mask_np  = np.asarray(enc.cand_mask)
-    src_slots_np  = np.asarray(enc.src_slots)
-    cand_slots_np = np.asarray(enc.cand_slots_safe)
-    p_x_np        = np.asarray(batched.p_x)
-    p_y_np        = np.asarray(batched.p_y)
-    p_radius_np   = np.asarray(batched.p_radius)
-    ang_vel_np    = np.asarray(batched.angular_velocity)
+    labels_per_state = _episode_target_slots(
+        src_ids=enc_np.src_ids, src_valid=enc_np.src_valid, src_slots=enc_np.src_slots,
+        p_x=batched_np.p_x, p_y=batched_np.p_y,
+        p_init_x=batched_np.p_init_x, p_init_y=batched_np.p_init_y,
+        p_radius=batched_np.p_radius, p_alive=batched_np.p_alive,
+        p_is_comet=batched_np.p_is_comet,
+        angular_velocity=batched_np.angular_velocity, step=batched_np.step,
+        batch_actions=batch_actions, N=N)
 
-    ts_list: list[int] = []
-    si_list: list[int] = []
-    ci_list: list[int] = []
-
-    for i in range(N):  # only real states, not padding
-        labels = extract_labels(
-            batch_actions[i],
-            src_ids          = src_ids_np[i],
-            src_valid        = src_valid_np[i],
-            src_ships        = src_ships_np[i],
-            cand_mask        = cand_mask_np[i],
-            p_x              = p_x_np[i],
-            p_y              = p_y_np[i],
-            p_radius         = p_radius_np[i],
-            angular_velocity = float(ang_vel_np[i]),
-            src_slots        = src_slots_np[i],
-            cand_slots       = cand_slots_np[i],
-        )
-        # Emit explicit no-op labels for valid sources the expert chose to hold.
-        # Without these, the policy only sees "given expert decided to launch,
-        # where to?" and collapses toward always-launch at inference.
-        acted_src = {src_idx for src_idx, _ in labels}
-        src_valid_i = src_valid_np[i]
-        for j in range(len(src_valid_i)):
-            if bool(src_valid_i[j]) and j not in acted_src:
-                labels.append((j, 0))
-        for src_idx, cand_idx in labels:
-            ts_list.append(i)
-            si_list.append(src_idx)
-            ci_list.append(cand_idx)
-
-    if not ts_list:
+    si, sj, target_slot = _flatten_labels(labels_per_state, enc_np.src_valid, N, noop=-1)
+    if si.size == 0:
         return None
 
-    ts = np.array(ts_list, dtype=np.int32)
-    si = np.array(si_list, dtype=np.int32)
-
-    # Gather features on-device — large tensors never leave the accelerator
+    # Single fancy-index gather per field instead of per-row slice + np.stack.
     return {
-        "self_feats":   enc.self_feats[ts, si],
-        "cand_feats":   enc.cand_feats[ts, si],
-        "global_feats": enc.global_feat[ts],
-        "cand_mask":    enc.cand_mask[ts, si],
-        # "fleet_feats":  enc.fleet_feats[ts],
-        # "fleet_mask":   enc.fleet_mask[ts],
-        "target_idx":   jnp.array(ci_list, dtype=jnp.int32),
+        "self_feats":   enc_np.self_feats[si, sj].astype(np.float32),
+        "global_feats": enc_np.global_feat[si].astype(np.float32),
+        "pool_feats":   enc_np.cand_feats[si, sj].astype(np.float32),     # [n, POOL_K, CAND_DIM]
+        "pool_slot":    enc_np.cand_slots_safe[si, sj].astype(np.int32),  # planet slot per cand
+        "pool_cat":     enc_np.cand_cat[si, sj].astype(np.int8),          # 0/1/2 owner cat, -1 empty
+        "pool_dist":    enc_np.cand_dist[si, sj].astype(np.float32),      # source→cand distance
+        "pool_mask":    enc_np.cand_mask[si, sj],                          # valid & ~blocked
+        "target_slot":  target_slot.astype(np.int32),                     # planet slot, -1 = no-op
     }
 
 
@@ -576,10 +649,6 @@ def concat_samples(sample_list: list[dict[str, np.ndarray]]) -> dict[str, np.nda
 # ---------------------------------------------------------------------------
 
 SHARD_DIR_NAME = "shards"
-
-# ---------------------------------------------------------------------------
-# Multiprocessing worker helpers
-# ---------------------------------------------------------------------------
 
 # Module-level state populated by each worker process via Pool initializer.
 _worker_encode_fn = None
@@ -682,7 +751,7 @@ def encode_to_shards(
             return False
         buffer.append(samples)
         n_episodes += 1
-        n_samples  += len(samples["target_idx"])
+        n_samples  += len(samples["target_slot"])
         if len(buffer) >= episodes_per_shard:
             _maybe_flush()
             if num_shards is not None and shard_idx >= num_shards:
@@ -776,3 +845,104 @@ def shard_episode_counts(shard_paths: list[Path], episodes_per_shard_fallback: i
             counts.append(episodes_per_shard_fallback)
         d.close()
     return counts
+
+
+# ---------------------------------------------------------------------------
+# K-pool → fixed-K materialization (train-time)
+# ---------------------------------------------------------------------------
+
+def is_pool_shard(data) -> bool:
+    """True if a loaded shard uses the K-pool format (vs the legacy fixed-K format)."""
+    return "pool_feats" in data
+
+
+def _k_quota(K: int) -> tuple[int, int, int]:
+    """(K_enemy, K_neutral, K_friendly) for total K — mirrors _make_env_encoder."""
+    K_e = K // 3
+    K_f = K // 3
+    K_n = K - 1 - K_e - K_f
+    return K_e, K_n, K_f
+
+
+def assemble_for_k(data, K: int) -> dict[str, np.ndarray]:
+    """Re-slice a K-pool shard to a fixed candidate count K (<= POOL_K).
+
+    Reproduces _make_env_encoder's category-quota + overflow candidate selection
+    offline, over the stored pool, then maps the K-independent ``target_slot`` to a
+    candidate index. Returns the legacy fixed-K training dict: self_feats /
+    cand_feats / global_feats / cand_mask / target_idx.
+
+    Correctness rests on set-monotonicity of the selection (the K-pool is a superset
+    of any smaller-K pool); see test/test_kmax_pool_parity.py which verifies parity
+    against a live _make_env_encoder(K) on real states.
+    """
+    pf    = data["pool_feats"]                       # [N, P, D]
+    pslot = data["pool_slot"]                         # [N, P]
+    pcat  = np.asarray(data["pool_cat"], np.int64)    # [N, P]
+    pdist = np.asarray(data["pool_dist"], np.float32) # [N, P]
+    pmask = np.asarray(data["pool_mask"], bool)       # [N, P]
+    tslot = np.asarray(data["target_slot"])           # [N]
+    N, P, _ = pf.shape
+    if K > P:
+        raise ValueError(f"assemble_for_k: K={K} exceeds stored pool size {P}")
+
+    K_e, K_n, K_f = _k_quota(K)
+    INF = np.float32(1e30)
+    rows = np.arange(N)
+
+    def _cat_pick(c: int, kc: int):
+        """The kc nearest pool positions of category c (padded with junk; valid flags)."""
+        if kc == 0:
+            return np.zeros((N, 0), np.intp), np.zeros((N, 0), bool)
+        key   = np.where(pcat == c, pdist, INF)               # [N, P]
+        order = np.argsort(key, axis=1, kind="stable")        # nearest-first
+        pos   = order[:, :kc].astype(np.intp)
+        valid = np.take_along_axis(key, pos, axis=1) < INF
+        return pos, valid
+
+    pe, ve = _cat_pick(0, K_e)
+    pn, vn = _cat_pick(1, K_n)
+    pfr, vf = _cat_pick(2, K_f)
+    per_pos = np.concatenate([pe, pn, pfr], axis=1)            # [N, K-1] (enemy,neutral,friendly)
+    per_val = np.concatenate([ve, vn, vf], axis=1)
+    Km1 = per_pos.shape[1]
+
+    # Overflow: fill short quota slots with the nearest unclaimed real candidates,
+    # mirroring the encoder's exclusive-prefix-sum slot assignment.
+    claimed = np.zeros((N, P), bool)
+    if Km1:
+        ii = np.broadcast_to(rows[:, None], per_pos.shape)[per_val]
+        jj = per_pos[per_val]
+        claimed[ii, jj] = True
+    real     = pcat >= 0
+    ovfl_key = np.where(real & ~claimed, pdist, INF)
+    ovfl_ord = np.argsort(ovfl_key, axis=1, kind="stable")    # [N, P] nearest unclaimed first
+    ovfl_oks = np.take_along_axis(ovfl_key, ovfl_ord, axis=1) < INF
+    inv      = (~per_val).astype(np.int64)
+    ovfl_idx = np.minimum(np.cumsum(inv, axis=1) - inv, max(Km1 - 1, 0))
+    ovfl_pos = np.take_along_axis(ovfl_ord, ovfl_idx, axis=1) if Km1 else per_pos
+    ovfl_ok  = np.take_along_axis(ovfl_oks, ovfl_idx, axis=1) if Km1 else per_val
+    final_pos = np.where(per_val, per_pos, ovfl_pos).astype(np.intp)
+    final_ok  = np.where(per_val, True, ovfl_ok)
+
+    # Prepend the no-op slot (pool position 0) and gather.
+    pos = np.concatenate([np.zeros((N, 1), np.intp), final_pos], axis=1)   # [N, K]
+    cand_feats = np.take_along_axis(pf, pos[:, :, None], axis=1).astype(np.float32)
+    cand_mask  = np.take_along_axis(pmask, pos, axis=1)
+    cand_mask &= np.concatenate([np.ones((N, 1), bool), final_ok], axis=1)
+    cand_mask[:, 0] = True
+
+    # Map the planet-slot target to a candidate index (require usable mask; k=0 = no-op).
+    sel_slot = np.take_along_axis(pslot, pos, axis=1)          # [N, K]
+    match = (sel_slot == tslot[:, None]) & cand_mask
+    match[:, 0] = False
+    has = match.any(axis=1)
+    target_idx = np.where(has, match.argmax(axis=1), 0).astype(np.int32)
+
+    return {
+        "self_feats":   data["self_feats"],
+        "cand_feats":   cand_feats,
+        "global_feats": data["global_feats"],
+        "cand_mask":    cand_mask,
+        "target_idx":   target_idx,
+    }

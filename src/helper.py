@@ -23,6 +23,10 @@ from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet, SUN_RA
 
 DirectedFleet = NamedTuple("DirectedFleet", [("owner", int), ("src_id", int), ("tgt_id", int), ("angle", float), ("ships", int), ("arrive_tick", int)])
 
+# Offset, beyond the source planet's surface, at which a launched fleet spawns.
+# Matches the kaggle engine (orbit_wars.py: `from_planet[4] + 0.1`).
+LAUNCH_SURFACE_EPS: float = 0.1
+
 # ---------------------------------------------------------------------------
 # Game constants
 # ---------------------------------------------------------------------------
@@ -208,8 +212,8 @@ def find_angle(src, tgt, ships: int, traj_cache: dict,
         tx, ty = traj[first]
         dx, dy = tx - src.x, ty - src.y
         angle = math.atan2(dy, dx)
-        lx = src.x + math.cos(angle) * src.radius
-        ly = src.y + math.sin(angle) * src.radius
+        lx = src.x + math.cos(angle) * (src.radius + LAUNCH_SURFACE_EPS)
+        ly = src.y + math.sin(angle) * (src.radius + LAUNCH_SURFACE_EPS)
         if hits_sun(lx, ly, angle, spd, tick):
             return angle, tick, True
         if blockers and path_blocked(lx, ly, tx, ty, tick, spd, blockers, traj_cache):
@@ -218,11 +222,11 @@ def find_angle(src, tgt, ships: int, traj_cache: dict,
     else:
         dx, dy = tgt.x - src.x, tgt.y - src.y
         angle = math.atan2(dy, dx)
-        dist = math.hypot(dx, dy) - src.radius
+        dist = math.hypot(dx, dy) - (src.radius + LAUNCH_SURFACE_EPS)
         tick = math.ceil((dist - tgt.radius) / spd)
 
-        lx = src.x + math.cos(angle) * src.radius
-        ly = src.y + math.sin(angle) * src.radius
+        lx = src.x + math.cos(angle) * (src.radius + LAUNCH_SURFACE_EPS)
+        ly = src.y + math.sin(angle) * (src.radius + LAUNCH_SURFACE_EPS)
         if hits_sun(lx, ly, angle, spd, tick):
             return angle, tick, True
 

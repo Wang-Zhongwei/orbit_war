@@ -32,7 +32,7 @@ def build_train_state(cfg, seed: int = 0) -> TrainState:
     return TrainState.create(apply_fn=module.apply, params=params, tx=tx)
 
 
-@dataclass(slots=True)
+@dataclass
 class TrainingBatch:
     self_features: jax.Array        # [B, MAX_SRC, self_dim]
     candidate_features: jax.Array   # [B, MAX_SRC, K, cand_dim]

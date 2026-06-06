@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 
-@dataclass(slots=True)
+@dataclass
 class PolicyOutput:
     target_logits: torch.Tensor  # [N, K]
     value: torch.Tensor          # [N]

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 
-@dataclass(slots=True)
+@dataclass
 class PlanetState:
     id: int
     owner: int
@@ -16,7 +16,7 @@ class PlanetState:
     production: int
 
 
-@dataclass(slots=True)
+@dataclass
 class FleetState:
     id: int
     owner: int
@@ -27,7 +27,7 @@ class FleetState:
     ships: int
 
 
-@dataclass(slots=True)
+@dataclass
 class GameState:
     step: int
     player: int

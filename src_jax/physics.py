@@ -43,6 +43,7 @@ from .constants import (
     COMET_SPAWN_STEPS,
     COMET_SPEED,
     EPISODE_STEPS,
+    LAUNCH_SURFACE_EPS,
     MAX_ANGULAR_VELOCITY,
     MAX_SHIP_SPEED,
     MIN_ANGULAR_VELOCITY,
@@ -442,8 +443,8 @@ def _phase_process_moves(state: EnvState, actions: jnp.ndarray) -> EnvState:
         # Compute fleet launch position (just outside planet surface)
         cos_a   = jnp.cos(angle)
         sin_a   = jnp.sin(angle)
-        lx      = p_x_[slot] + cos_a * (p_radius_[slot] + 0.1)
-        ly      = p_y_[slot] + sin_a * (p_radius_[slot] + 0.1)
+        lx      = p_x_[slot] + cos_a * (p_radius_[slot] + LAUNCH_SURFACE_EPS)
+        ly      = p_y_[slot] + sin_a * (p_radius_[slot] + LAUNCH_SURFACE_EPS)
 
         # Write to next free fleet slot
         fslot = jnp.clip(next_slot, 0, MAX_FLEETS - 1)

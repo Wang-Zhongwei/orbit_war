@@ -17,7 +17,7 @@ MIN_SOURCE_SHIPS: int = 13      # only generate decisions for planets with ships
 FLEET_ANGLE_THRESHOLD: float = 0.25  # radians — max heading deviation to count a fleet as en route to a planet
 
 
-@dataclass(slots=True)
+@dataclass
 class DecisionContext:
     env_index: int
     source_id: int
@@ -28,7 +28,7 @@ class DecisionContext:
     source_ships: int
 
 
-@dataclass(slots=True)
+@dataclass
 class TurnBatch:
     self_features: np.ndarray
     candidate_features: np.ndarray
