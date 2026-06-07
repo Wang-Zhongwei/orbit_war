@@ -63,6 +63,8 @@ def main() -> None:
                         help="Re-encode even if shards already exist")
     parser.add_argument("--workers", type=int, default=-1,
                         help="Worker processes for parallel encoding. -1=all CPUs, 1=single-threaded (default: -1)")
+    parser.add_argument("--num_shards", type=int, default=None,
+                        help="Stop after writing this many shards (useful for quick tests).")
     args = parser.parse_args()
 
     cfg = load_train_config(args.config) if args.config is not None else TrainConfig()
@@ -89,6 +91,7 @@ def main() -> None:
             episodes_dir,
             encode_fn=None,
             episodes_per_shard=args.episodes_per_shard,
+            num_shards=args.num_shards,
             winner_only=args.winner_only,
             force=args.force,
             workers=args.workers,

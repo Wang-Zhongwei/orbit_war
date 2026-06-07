@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing
+import os
 import pickle
 import time
 from collections import deque
@@ -48,7 +49,6 @@ from .bc_data import (
     SHARD_DIR_NAME,
     _iter_episode_jsons,
     assemble_for_k,
-    episode_to_samples,
     find_shards,
     is_pool_shard,
     shard_episode_counts,
@@ -100,7 +100,7 @@ def _encode_episode(args: tuple) -> "dict | None":
             return None
         episode = _filter_winner(episode, winning_player)
 
-    return _eps(episode, _g_encode_fn, 1)
+    return _eps(episode, _g_encode_fn)
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +115,7 @@ def _bc_step(
     gf: jax.Array,   # [N, global_dim]
     cm: jax.Array,   # [N, K]
     ti: jax.Array,   # [N]  int32  target index
+    w: jax.Array,    # [N]  float32 per-sample loss weight (win/loss)
 ) -> tuple[TrainState, jax.Array, jax.Array]:
     def loss_fn(params):
         sv  = jnp.ones(sf.shape[0], dtype=jnp.bool_)
@@ -122,7 +123,8 @@ def _bc_step(
         N   = ti.shape[0]
 
         tgt_lp   = jax.nn.log_softmax(out.target_logits, axis=-1)
-        tgt_loss = -tgt_lp[jnp.arange(N), ti].mean()
+        ce       = -tgt_lp[jnp.arange(N), ti]
+        tgt_loss = (w * ce).sum() / (w.sum() + 1e-8)   # weighted CE; zero-weight rows ignored
         tgt_acc  = (jnp.argmax(out.target_logits, axis=-1) == ti).astype(jnp.float32).mean()
 
         return tgt_loss, tgt_acc
@@ -130,6 +132,21 @@ def _bc_step(
     (loss, tgt_acc), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     state = state.apply_gradients(grads=grads)
     return state, loss, tgt_acc
+
+
+def _sample_weights(data, bc) -> np.ndarray:
+    """Per-sample loss weight from the stored episode reward (winner ≈ +1, loser ≈ -1).
+
+    Winners get 1.0; losers get ``bc.loser_weight`` (0.0 when ``winner_only`` is set,
+    which drops them from the weighted CE). Legacy shards without a ``reward`` field
+    fall back to uniform 1.0 (train on all players equally).
+    """
+    n = int(data["target_idx"].shape[0])
+    if "reward" not in data:
+        return np.ones(n, np.float32)
+    lw = 0.0 if bc.winner_only else float(bc.loser_weight)
+    rwd = np.asarray(data["reward"], np.float32)
+    return np.where(rwd > 0.0, 1.0, lw).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +236,8 @@ def train(
                 "candidate_count": cfg.env.candidate_count,
                 "top_k_episodes": bc.top_k_episodes,
                 "hidden_size": cfg.model.hidden_size,
+                "winner_only": bc.winner_only,
+                "loser_weight": bc.loser_weight,
             },
         )
 
@@ -250,16 +269,18 @@ def train(
             gf = jnp.asarray(data["global_feats"][perm])
             cm = jnp.asarray(data["cand_mask"][perm])
             ti = jnp.asarray(data["target_idx"][perm])
+            w  = jnp.asarray(_sample_weights(data, bc)[perm])
 
             # D4 augmentation: expand shard N→N*len(aug_ids) then re-shuffle.
             if bc.augment:
                 sf, cf, gf, cm, ti = expand_with_augmentations(
                     sf, cf, gf, cm, ti, aug_ids
                 )
+                w = jnp.concatenate([w] * len(aug_ids), axis=0)  # tile to match expansion
                 N = sf.shape[0]
                 perm2 = jnp.asarray(rng.permutation(N))
                 sf, cf, gf = sf[perm2], cf[perm2], gf[perm2]
-                cm, ti = cm[perm2], ti[perm2]
+                cm, ti, w = cm[perm2], ti[perm2], w[perm2]
 
             shard_losses: list[jax.Array] = []
             shard_tgt_a: list[jax.Array] = []
@@ -268,7 +289,7 @@ def train(
                 state, loss, tgt_a = _bc_step(
                     state,
                     sf[start:end], cf[start:end], gf[start:end], cm[start:end],
-                    ti[start:end],
+                    ti[start:end], w[start:end],
                 )
                 shard_losses.append(loss)
                 shard_tgt_a.append(tgt_a)
@@ -447,25 +468,28 @@ def train_stream(
 
     def _drain_buffer(buf: list[dict]) -> None:
         nonlocal state, global_step, n_samples
-        # buf items are numpy dicts from workers; jnp.concatenate accepts numpy
+        # buf items are pool-format numpy dicts from workers; concatenate then assemble
         keys = buf[0].keys()
-        data = {k: jnp.concatenate([s[k] for s in buf], axis=0) for k in keys}
+        data = {k: np.concatenate([s[k] for s in buf], axis=0) for k in keys}
+        data = assemble_for_k(data, cfg.env.candidate_count)
         N    = int(data["target_idx"].shape[0])
         perm = jnp.array(rng.permutation(N))
-        sf = data["self_feats"][perm]
-        cf = data["cand_feats"][perm]
-        gf = data["global_feats"][perm]
-        cm = data["cand_mask"][perm]
-        ti = data["target_idx"][perm]
+        sf = jnp.asarray(data["self_feats"][perm])
+        cf = jnp.asarray(data["cand_feats"][perm])
+        gf = jnp.asarray(data["global_feats"][perm])
+        cm = jnp.asarray(data["cand_mask"][perm])
+        ti = jnp.asarray(data["target_idx"][perm])
+        w  = jnp.asarray(_sample_weights(data, bc)[perm])
 
         if bc.augment:
             sf, cf, gf, cm, ti = expand_with_augmentations(
                 sf, cf, gf, cm, ti, aug_ids
             )
+            w = jnp.concatenate([w] * len(aug_ids), axis=0)  # tile to match expansion
             N = int(sf.shape[0])
             perm2 = jnp.array(rng.permutation(N))
             sf, cf, gf = sf[perm2], cf[perm2], gf[perm2]
-            cm, ti = cm[perm2], ti[perm2]
+            cm, ti, w = cm[perm2], ti[perm2], w[perm2]
 
         buf_losses: list[jax.Array] = []
         buf_tgt_a: list[jax.Array] = []
@@ -474,7 +498,7 @@ def train_stream(
             state, loss, tgt_a = _bc_step(
                 state,
                 sf[start:end], cf[start:end], gf[start:end], cm[start:end],
-                ti[start:end],
+                ti[start:end], w[start:end],
             )
             buf_losses.append(loss)
             buf_tgt_a.append(tgt_a)
@@ -488,13 +512,20 @@ def train_stream(
           f"encode_workers={num_workers}", flush=True)
     print(f"Checkpoints → {Path(bc.out_dir) / bc.run_name}", flush=True)
 
+    # Workers must not try to initialize the GPU backend — they do CPU encoding.
+    # Set JAX_PLATFORMS=cpu in the environment *before* spawning so the workers
+    # inherit it at spawn time (the `spawn` start method imports bc_train.py which
+    # triggers `import jax` before the initializer callback runs).
+    _saved_jax_platforms = os.environ.get("JAX_PLATFORMS")
+    os.environ["JAX_PLATFORMS"] = "cpu"
     mp_ctx = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(
+    try:
+      with ProcessPoolExecutor(
         max_workers=num_workers,
         initializer=_worker_init,
         initargs=(cfg.env,),
         mp_context=mp_ctx,
-    ) as pool:
+      ) as pool:
 
         def _iter_all():
             for d in episodes_dirs:
@@ -592,6 +623,12 @@ def train_stream(
                 )
 
             save_bc_checkpoint(Path(bc.out_dir), bc.run_name, epoch, state, cfg)
+
+    finally:
+        if _saved_jax_platforms is None:
+            os.environ.pop("JAX_PLATFORMS", None)
+        else:
+            os.environ["JAX_PLATFORMS"] = _saved_jax_platforms
 
     if use_wandb:
         import wandb

@@ -103,6 +103,12 @@ class BCConfig:
     batch_size: int = 2048
     lr: float = 3e-4
     winner_only: bool = False
+    # Per-sample loss weight applied to losing-player samples (winners always 1.0).
+    # 1.0 = train on all players equally; 0.0 = winner-only (losers contribute nothing,
+    # equivalent to winner_only). Values in between mix winning/losing behavior, e.g.
+    # 0.5 keeps loser-state coverage while trusting winner moves more. Read from the
+    # per-sample `reward` field stored in shards (winner ≈ +1, loser ≈ -1).
+    loser_weight: float = 1.0
     use_shard: bool = False
     stream_buffer: int = 200
     top_k_episodes: int | None = None

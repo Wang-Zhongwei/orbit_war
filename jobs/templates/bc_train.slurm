@@ -12,7 +12,9 @@
 
 set -euo pipefail
 
-module load nvhpc-hpcx-cuda12/24.11
+# Do NOT load nvhpc-hpcx-cuda12 here — it overrides the venv-bundled nvidia-*
+# CUDA libraries (cublas, cudnn, etc.) and causes JAX to fail with
+# "the library was not initialized". The uv venv carries everything needed.
 export WANDB_MODE=offline
 
 REPO_ROOT="${SLURM_SUBMIT_DIR:-}"
@@ -69,5 +71,5 @@ uv run python -m src_jax.bc_train "${args[@]}"
 echo "Done."
 
 echo "Syncing W&B offline runs from ${SLURM_SUBMIT_HOST}"
-ssh "${SLURM_SUBMIT_HOST}" "cd ${REPO_ROOT} && .venv/bin/wandb sync wandb/offline-run-*/"
+ssh coe-hpc1 "cd ${REPO_ROOT} && .venv/bin/wandb sync wandb/offline-run-*/"
 echo "Done."

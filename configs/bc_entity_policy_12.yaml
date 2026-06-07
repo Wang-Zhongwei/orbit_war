@@ -12,6 +12,7 @@ bc:
   batch_size: 8192
   lr: 3e-4
   winner_only: false
+  loser_weight: 0.5   # weight on losing-player samples (1.0 = all-equal, 0.0 = winner-only)
   use_shard: true
   out_dir: artifacts/bc
   run_name: bc_pretrain_entity_mlp_k12

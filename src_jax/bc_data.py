@@ -12,6 +12,7 @@ sample = one source-planet decision at one timestep:
   pool_dist    : [POOL_K] float32     source→candidate distance (board units)
   pool_mask    : [POOL_K] bool        valid & ~blocked (slot 0 = no-op = True)
   target_slot  : int32                planet slot the expert hit, or -1 (no-op) — K-independent
+  step         : int32                game tick — used by assemble_for_k to apply the correct time-varying quota
 
 assemble_for_k(samples, K) materializes the legacy fixed-K training dict
 (self_feats / cand_feats / global_feats / cand_mask / target_idx) by re-running the
@@ -78,7 +79,7 @@ MAX_FLY_TICKS: int = 30
 # re-sliced offline to any training K <= POOL_K via assemble_for_k(). POOL_K is
 # the encoder's *total* K (no-op slot included): per-category quotas are K//3
 # enemy / K//3 friendly / remainder neutral — see features._make_env_encoder.
-POOL_K: int = 12
+POOL_K: int = 24
 
 
 def _pad_size_for(n: int) -> int:
@@ -92,8 +93,29 @@ def _pad_size_for(n: int) -> int:
 # Ordered pad sizes used to bucket episode batch sizes.  The smallest size that
 # fits the episode is chosen so encode_fn compiles at most len(_PAD_SIZES) times
 # instead of once per distinct episode length (each XLA recompilation costs 2-5s).
-# From the 2026-05-24 data: p50=89, p95=247, p99=471, max=481 states/episode.
-_PAD_SIZES: tuple[int, ...] = (256, 512)
+# From the 2026-06-04 data (both agents): p50=228, p90=539, p99=885, max=936 states/episode.
+# encode_fn cost scales with the *padded* row count and pad rows are pure waste
+# (computed, then sliced off in episode_to_samples), so the ladder trades a few
+# extra one-time compiles for less per-episode waste: the coarse (256,512,1024)
+# wasted ~33% of encode compute on padding, this 5-bucket ladder cuts it to ~24%.
+_PAD_SIZES: tuple[int, ...] = (256, 384, 512, 768, 1024)
+
+
+# Fleet-count buckets for simulate_episode_targets_jax. The fleet simulator is
+# vmapped over F (one launch per entry) and jitted, so a distinct F triggers an
+# XLA recompile (~0.4s). Rounding F up to one of these buckets caps the number of
+# compiles at ~len(ladder) instead of one-per-episode; for F above the ladder we
+# round up to the next multiple of the top bucket.
+_FLEET_BUCKETS: tuple[int, ...] = (64, 128, 256, 512, 1024, 2048, 4096)
+
+
+def _fleet_bucket(f: int) -> int:
+    """Smallest fleet bucket >= f, or f rounded up to a multiple of the top bucket."""
+    for b in _FLEET_BUCKETS:
+        if f <= b:
+            return b
+    top = _FLEET_BUCKETS[-1]
+    return -(-f // top) * top  # ceil-div * top
 
 
 # ---------------------------------------------------------------------------
@@ -361,12 +383,27 @@ def simulate_episode_targets_jax(
     if not flat_actions:
         z = np.zeros(0, np.int32)
         return z, z, z
+    F = len(flat_actions)
     ts = np.array([a[0] for a in flat_actions], np.int32)
     ss = np.array([a[1] for a in flat_actions], np.int32)
     ang = np.array([a[2] for a in flat_actions], np.float32)
     shp = np.array([a[3] for a in flat_actions], np.float32)
 
-    g = lambda arr: jnp.asarray(np.asarray(arr)[ts])  # [F, MAX_P]
+    # Pad the fleet count F up to a fixed bucket so the vmapped, jitted simulator
+    # reuses a cached XLA kernel instead of recompiling for every distinct F.
+    # F varies per episode (one entry per launch, ~tens to thousands), and a
+    # recompile costs ~0.4s — ~95% of the per-episode label-extraction time
+    # otherwise (see test/flight_time_dist.py notes). Pad entries reference
+    # timestep 0 / slot 0; their results are sliced off below.
+    Fb = _fleet_bucket(F)
+    if Fb > F:
+        pad = Fb - F
+        ts  = np.concatenate([ts,  np.zeros(pad, np.int32)])
+        ss  = np.concatenate([ss,  np.zeros(pad, np.int32)])
+        ang = np.concatenate([ang, np.zeros(pad, np.float32)])
+        shp = np.concatenate([shp, np.zeros(pad, np.float32)])
+
+    g = lambda arr: jnp.asarray(np.asarray(arr)[ts])  # [Fb, MAX_P]
     pix, piy = g(p_init_x), g(p_init_y)
     px, py, pr = g(p_x), g(p_y), g(p_radius)
     pal, pc = g(p_alive), g(p_is_comet)
@@ -386,7 +423,8 @@ def simulate_episode_targets_jax(
     hk, hslot, htick = _sim_fleets_jax(
         src, fx0, fy0, cos_a, sin_a, speed, launch_step, ang_vel,
         pix, piy, px, py, pr, pal, pc, max_ticks=max_ticks)
-    return np.asarray(hk), np.asarray(hslot), np.asarray(htick)
+    # Drop the padding rows so callers see exactly one result per real launch.
+    return np.asarray(hk)[:F], np.asarray(hslot)[:F], np.asarray(htick)[:F]
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +512,9 @@ def _collect_states_actions(episode: dict):
             if agent_data.get("status") == "DONE":
                 continue
             prev_obs = steps[i - 1][agent_idx]["observation"]
+            if "step" not in prev_obs:
+                # Kaggle replays omit 'step' from non-primary agent observations
+                prev_obs = {**prev_obs, "step": steps[i - 1][0]["observation"].get("step", i - 1)}
             try:
                 state = obs_to_env_state(prev_obs, num_agents)
             except Exception:
@@ -510,6 +551,8 @@ def _episode_target_slots(
     meta: list[tuple[int, int]] = []  # (timestep, src_idx)
     for i in range(N):
         for act in batch_actions[i]:
+            if not act:
+                continue
             src_idx = _resolve_src_idx(src_ids[i], src_valid[i], int(act[0]))
             if src_idx == -1:
                 continue
@@ -577,6 +620,15 @@ def episode_to_samples(
     if si.size == 0:
         return None
 
+    # Per-sample final episode reward of the player who took the action (winner ≈ +1,
+    # loser ≈ -1). Stored so winner-only / reward-weighted BC can be decided at train
+    # time from all-player shards, instead of hard-filtering losers at encode time.
+    rewards = episode.get("rewards", [])
+    def _player_reward(p: int) -> float:
+        return float(rewards[p]) if (0 <= p < len(rewards) and rewards[p] is not None) else 0.0
+    state_reward  = np.array([_player_reward(int(p)) for p in batch_players], np.float32)  # [N]
+    sample_reward = state_reward[si].astype(np.float32)
+
     # Single fancy-index gather per field instead of per-row slice + np.stack.
     return {
         "self_feats":   enc_np.self_feats[si, sj].astype(np.float32),
@@ -587,6 +639,8 @@ def episode_to_samples(
         "pool_dist":    enc_np.cand_dist[si, sj].astype(np.float32),      # source→cand distance
         "pool_mask":    enc_np.cand_mask[si, sj],                          # valid & ~blocked
         "target_slot":  target_slot.astype(np.int32),                     # planet slot, -1 = no-op
+        "step":         enc_np.step[si].astype(np.int32),                 # game tick — for assemble_for_k quota
+        "reward":       sample_reward,                                     # player's final reward (+1 win / -1 loss)
     }
 
 
@@ -856,12 +910,22 @@ def is_pool_shard(data) -> bool:
     return "pool_feats" in data
 
 
-def _k_quota(K: int) -> tuple[int, int, int]:
-    """(K_enemy, K_neutral, K_friendly) for total K — mirrors _make_env_encoder."""
-    K_e = K // 3
-    K_f = K // 3
-    K_n = K - 1 - K_e - K_f
-    return K_e, K_n, K_f
+def _k_quota(K: int, step: int) -> tuple[int, int, int]:
+    """(K_enemy, K_neutral, K_friendly) for total K at a given game tick.
+
+    Mirrors the time-varying quota in features._select_sources_and_candidates
+    exactly: linearly interpolates between T0/T1 fractions over [T0, T1] ticks,
+    then clamps each category to >=1; friendly takes the remainder.
+    """
+    from .features import _Q_NEUTRAL_T0, _Q_NEUTRAL_T1, _Q_ENEMY_T0, _Q_ENEMY_T1, T0, T1
+    n_real = K - 1
+    t_frac = float(np.clip((step - T0) / (T1 - T0), 0.0, 1.0))
+    f_neutral = _Q_NEUTRAL_T0 + (_Q_NEUTRAL_T1 - _Q_NEUTRAL_T0) * t_frac
+    f_enemy   = _Q_ENEMY_T0   + (_Q_ENEMY_T1   - _Q_ENEMY_T0)   * t_frac
+    k_n = max(int(round(f_neutral * n_real)), 1)
+    k_e = max(int(round(f_enemy   * n_real)), 1)
+    k_f = max(n_real - k_n - k_e, 1)
+    return k_e, k_n, k_f
 
 
 def assemble_for_k(data, K: int) -> dict[str, np.ndarray]:
@@ -882,48 +946,61 @@ def assemble_for_k(data, K: int) -> dict[str, np.ndarray]:
     pdist = np.asarray(data["pool_dist"], np.float32) # [N, P]
     pmask = np.asarray(data["pool_mask"], bool)       # [N, P]
     tslot = np.asarray(data["target_slot"])           # [N]
+    steps = np.asarray(data["step"], np.int32)        # [N] game tick per sample
     N, P, _ = pf.shape
     if K > P:
         raise ValueError(f"assemble_for_k: K={K} exceeds stored pool size {P}")
 
-    K_e, K_n, K_f = _k_quota(K)
     INF = np.float32(1e30)
-    rows = np.arange(N)
 
-    def _cat_pick(c: int, kc: int):
-        """The kc nearest pool positions of category c (padded with junk; valid flags)."""
-        if kc == 0:
-            return np.zeros((N, 0), np.intp), np.zeros((N, 0), bool)
-        key   = np.where(pcat == c, pdist, INF)               # [N, P]
-        order = np.argsort(key, axis=1, kind="stable")        # nearest-first
-        pos   = order[:, :kc].astype(np.intp)
-        valid = np.take_along_axis(key, pos, axis=1) < INF
-        return pos, valid
+    # Quota is time-varying (mirrors features._select_sources_and_candidates).
+    # Group samples by their (K_e, K_n, K_f) triple — only a handful of distinct
+    # values exist since quota snaps to integers over [T0, T1] ticks.
+    quota_per_sample = np.array([_k_quota(K, int(s)) for s in steps])  # [N, 3]
 
-    pe, ve = _cat_pick(0, K_e)
-    pn, vn = _cat_pick(1, K_n)
-    pfr, vf = _cat_pick(2, K_f)
-    per_pos = np.concatenate([pe, pn, pfr], axis=1)            # [N, K-1] (enemy,neutral,friendly)
-    per_val = np.concatenate([ve, vn, vf], axis=1)
-    Km1 = per_pos.shape[1]
+    final_pos = np.empty((N, K - 1), np.intp)
+    final_ok  = np.empty((N, K - 1), bool)
 
-    # Overflow: fill short quota slots with the nearest unclaimed real candidates,
-    # mirroring the encoder's exclusive-prefix-sum slot assignment.
-    claimed = np.zeros((N, P), bool)
-    if Km1:
-        ii = np.broadcast_to(rows[:, None], per_pos.shape)[per_val]
-        jj = per_pos[per_val]
-        claimed[ii, jj] = True
-    real     = pcat >= 0
-    ovfl_key = np.where(real & ~claimed, pdist, INF)
-    ovfl_ord = np.argsort(ovfl_key, axis=1, kind="stable")    # [N, P] nearest unclaimed first
-    ovfl_oks = np.take_along_axis(ovfl_key, ovfl_ord, axis=1) < INF
-    inv      = (~per_val).astype(np.int64)
-    ovfl_idx = np.minimum(np.cumsum(inv, axis=1) - inv, max(Km1 - 1, 0))
-    ovfl_pos = np.take_along_axis(ovfl_ord, ovfl_idx, axis=1) if Km1 else per_pos
-    ovfl_ok  = np.take_along_axis(ovfl_oks, ovfl_idx, axis=1) if Km1 else per_val
-    final_pos = np.where(per_val, per_pos, ovfl_pos).astype(np.intp)
-    final_ok  = np.where(per_val, True, ovfl_ok)
+    unique_quotas = {tuple(q) for q in quota_per_sample}
+    for quota in unique_quotas:
+        K_e, K_n, K_f = quota
+        mask_g = np.all(quota_per_sample == quota, axis=1)   # [N] bool
+        g_pcat  = pcat[mask_g]
+        g_pdist = pdist[mask_g]
+        Ng = g_pcat.shape[0]
+        rows_g = np.arange(Ng)
+
+        def _cat_pick(c: int, kc: int):
+            if kc == 0:
+                return np.zeros((Ng, 0), np.intp), np.zeros((Ng, 0), bool)
+            key   = np.where(g_pcat == c, g_pdist, INF)
+            order = np.argsort(key, axis=1, kind="stable")
+            pos   = order[:, :kc].astype(np.intp)
+            valid = np.take_along_axis(key, pos, axis=1) < INF
+            return pos, valid
+
+        pe, ve = _cat_pick(0, K_e)
+        pn, vn = _cat_pick(1, K_n)
+        pfr, vf = _cat_pick(2, K_f)
+        per_pos = np.concatenate([pe, pn, pfr], axis=1)
+        per_val = np.concatenate([ve, vn, vf], axis=1)
+        Km1 = per_pos.shape[1]
+
+        claimed = np.zeros((Ng, P), bool)
+        if Km1:
+            ii = np.broadcast_to(rows_g[:, None], per_pos.shape)[per_val]
+            jj = per_pos[per_val]
+            claimed[ii, jj] = True
+        real     = g_pcat >= 0
+        ovfl_key = np.where(real & ~claimed, g_pdist, INF)
+        ovfl_ord = np.argsort(ovfl_key, axis=1, kind="stable")
+        ovfl_oks = np.take_along_axis(ovfl_key, ovfl_ord, axis=1) < INF
+        inv      = (~per_val).astype(np.int64)
+        ovfl_idx = np.minimum(np.cumsum(inv, axis=1) - inv, max(Km1 - 1, 0))
+        ovfl_pos = np.take_along_axis(ovfl_ord, ovfl_idx, axis=1) if Km1 else per_pos
+        ovfl_ok  = np.take_along_axis(ovfl_oks, ovfl_idx, axis=1) if Km1 else per_val
+        final_pos[mask_g] = np.where(per_val, per_pos, ovfl_pos).astype(np.intp)
+        final_ok[mask_g]  = np.where(per_val, True, ovfl_ok)
 
     # Prepend the no-op slot (pool position 0) and gather.
     pos = np.concatenate([np.zeros((N, 1), np.intp), final_pos], axis=1)   # [N, K]
@@ -939,10 +1016,15 @@ def assemble_for_k(data, K: int) -> dict[str, np.ndarray]:
     has = match.any(axis=1)
     target_idx = np.where(has, match.argmax(axis=1), 0).astype(np.int32)
 
-    return {
+    result = {
         "self_feats":   data["self_feats"],
         "cand_feats":   cand_feats,
         "global_feats": data["global_feats"],
         "cand_mask":    cand_mask,
         "target_idx":   target_idx,
     }
+    # K-independent per-sample reward rides through unchanged so the train loop can
+    # weight the loss by win/loss. Absent on legacy shards encoded before this field.
+    if "reward" in data:
+        result["reward"] = np.asarray(data["reward"], np.float32)
+    return result
