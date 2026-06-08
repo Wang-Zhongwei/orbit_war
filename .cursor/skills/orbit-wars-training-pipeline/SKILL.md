@@ -72,7 +72,7 @@ CLI args override config file values when provided. All BC fields are optional:
 - `--epochs N` / `--batch_size N` / `--lr F` — training hyperparams
 - `--stream` / `--no_stream` — enable or disable on-the-fly encoding
 - `--stream_buffer N` — episodes to buffer before a training pass (default: 200). Larger = better shuffle within buffer.
-- `--winner_only` — only learn from the winning agent's actions.
+- `--loser_weight F` — loss weight for losing-player samples (1.0=equal, 0.0=winner-only, default 1.0).
 - `--out_dir DIR` / `--run_name NAME` — output paths
 - `--episode_dirs` accepts multiple dates: `episodes/2026-05-24 episodes/2026-05-25`
 
@@ -89,7 +89,7 @@ conda run --no-capture-output -n torch-gpu python -u -m src_jax.bc_encode \
 # → episodes/2026-05-24/shards/shard_0000.npz ...
 ```
 
-Use `--force` to re-encode from scratch. Use `--winner_only` to encode only the winning agent's actions.
+Use `--force` to re-encode from scratch. All players are always encoded; winner/loser weighting is controlled at train time via `--loser_weight`.
 
 Verification gate:
 ```bash

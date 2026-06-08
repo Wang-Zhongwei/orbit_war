@@ -57,8 +57,6 @@ def main() -> None:
                              "(smoke-test mode).")
     parser.add_argument("--episodes_per_shard", type=int, default=100,
                         help="Episodes per shard file (default: 100)")
-    parser.add_argument("--winner_only", action="store_true",
-                        help="Encode only the winning agent's actions")
     parser.add_argument("--force", action="store_true",
                         help="Re-encode even if shards already exist")
     parser.add_argument("--workers", type=int, default=-1,
@@ -92,7 +90,6 @@ def main() -> None:
             encode_fn=None,
             episodes_per_shard=args.episodes_per_shard,
             num_shards=args.num_shards,
-            winner_only=args.winner_only,
             force=args.force,
             workers=args.workers,
             encode_fn_factory=_make_env_encoder,

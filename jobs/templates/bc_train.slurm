@@ -3,8 +3,8 @@
 #SBATCH --output=./jobs/logs/bc_train-%j.out
 #SBATCH --error=./jobs/logs/bc_train-%j.err
 #SBATCH --time=00:30:00
-#SBATCH --ntasks=8
-#SBATCH --cpus-per-task=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
 #SBATCH --partition=condo
 #SBATCH --gres=gpu:h100:1
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -44,11 +44,12 @@ fi
 if [[ -n "${LR:-}" ]]; then
   args+=(--lr "${LR}")
 fi
+
 if [[ -n "${TOP_K_EPISODES:-}" ]]; then
   args+=(--top_k_episodes "${TOP_K_EPISODES}")
 fi
-if [[ "${WINNER_ONLY:-0}" == "1" ]]; then
-  args+=(--winner_only)
+if [[ -n "${LOSER_WEIGHT:-}" ]]; then
+  args+=(--loser_weight "${LOSER_WEIGHT}")
 fi
 if [[ "${AUGMENT:-0}" == "1" ]]; then
   args+=(--augment)
@@ -58,7 +59,7 @@ if [[ "${USE_SHARD:-0}" == "1" ]]; then
 else
   # Streaming mode: reserve one CPU for the main process
   args+=(--no_use_shard)
-  args+=(--encode_workers "$(( SLURM_NTASKS - 1 ))")
+  args+=(--encode_workers "$(( SLURM_CPUS_PER_TASK - 1 ))")
 fi
 if [[ "${NO_WANDB:-0}" == "1" ]]; then
   args+=(--no_wandb)

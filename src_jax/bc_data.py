@@ -574,9 +574,40 @@ def _episode_target_slots(
     return labels_per_state
 
 
+def _load_avg_score_map(episodes_dir: Path) -> dict[int, float]:
+    """episode_id -> avg_score from the day's manifest.csv (empty dict if absent).
+
+    avg_score is the mean Kaggle leaderboard (ELO-like) score of the agents in that
+    match — a per-game skill/quality measure used for skill-weighted BC. The replay
+    JSON carries no rating, so it is joined in here via info.EpisodeId.
+    """
+    import csv
+    mpath = Path(episodes_dir) / "manifest.csv"
+    if not mpath.exists():
+        return {}
+    out: dict[int, float] = {}
+    with open(mpath, newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                out[int(row["episode_id"])] = float(row["avg_score"])
+            except (KeyError, ValueError, TypeError):
+                continue
+    return out
+
+
+def _episode_avg_score(episode: dict, avg_map: dict[int, float]) -> float:
+    """avg_score for this episode via info.EpisodeId, or NaN if unavailable."""
+    eid = episode.get("info", {}).get("EpisodeId")
+    try:
+        return avg_map.get(int(eid), float("nan"))
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def episode_to_samples(
     episode: dict,
     encode_fn,
+    avg_score: float = float("nan"),
 ) -> dict[str, np.ndarray] | None:
     """Convert one episode JSON to flat numpy arrays of BC training samples.
 
@@ -641,6 +672,7 @@ def episode_to_samples(
         "target_slot":  target_slot.astype(np.int32),                     # planet slot, -1 = no-op
         "step":         enc_np.step[si].astype(np.int32),                 # game tick — for assemble_for_k quota
         "reward":       sample_reward,                                     # player's final reward (+1 win / -1 loss)
+        "avg_score":    np.full(si.size, np.float32(avg_score), np.float32),  # per-game skill (manifest avg_score); NaN if unjoined
     }
 
 
@@ -678,16 +710,6 @@ def _iter_episode_jsons(episodes_dir: Path):
                 continue
 
 
-def _filter_winner(episode: dict, winner: int) -> dict:
-    """Return episode with only the winner's actions kept, loser gets action=[]."""
-    import copy
-    ep = copy.deepcopy(episode)
-    for step in ep["steps"]:
-        for agent_idx, agent_data in enumerate(step):
-            if agent_idx != winner:
-                agent_data["action"] = []
-    return ep
-
 
 # ---------------------------------------------------------------------------
 # Concatenate sample dicts
@@ -708,33 +730,52 @@ SHARD_DIR_NAME = "shards"
 _worker_encode_fn = None
 
 
+def _enable_compile_cache() -> None:
+    """Point JAX at an on-disk compilation cache so the encode_fn + simulator XLA
+    programs are compiled once and reused — across the pool's worker processes and
+    across days — instead of every spawn worker redundantly recompiling the same
+    pad/fleet-bucket shapes (the dominant warmup cost). Sharing is via disk: the first
+    process to compile a program writes the binary; the rest read it. Override the
+    location with BC_JAX_CACHE_DIR (defaults to <repo>/.jax_cache)."""
+    import jax
+    cache_dir = os.environ.get(
+        "BC_JAX_CACHE_DIR",
+        str(Path(__file__).resolve().parents[1] / ".jax_cache"),
+    )
+    jax.config.update("jax_compilation_cache_dir", cache_dir)
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
+
+
+def _prewarm_compile_cache(episodes_dir, encode_fn_factory, factory_args,
+                           avg_map, n_warm: int = 3) -> None:
+    """Compile encode_fn + simulator once in the parent before the pool spawns, so the
+    shared on-disk cache is warm and the workers read binaries instead of each
+    recompiling. Warms on the first few episodes (covering the common bucket shapes);
+    any rarer shape still compiles on demand in a worker but is then cache-shared."""
+    warm_fn = encode_fn_factory(*factory_args)
+    seen = 0
+    for _name, ep in _iter_episode_jsons(episodes_dir):
+        if isinstance(ep, dict) and "steps" in ep:
+            episode_to_samples(ep, warm_fn, avg_score=_episode_avg_score(ep, avg_map))
+            seen += 1
+            if seen >= n_warm:
+                break
+
+
 def _worker_init(encode_fn_factory, factory_args) -> None:
     """Called once per worker process. Builds encode_fn locally (avoids pickling JAX fn)."""
     import os
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
+    _enable_compile_cache()
     global _worker_encode_fn
     _worker_encode_fn = encode_fn_factory(*factory_args)
 
 
-def _worker_encode_episode(args: tuple) -> dict | None:
-    """Top-level worker task: encode one episode dict → samples dict (numpy arrays)."""
-    episode, winner_only = args
-    if winner_only:
-        rewards  = episode.get("rewards", [])
-        statuses = episode.get("statuses", [])
-        valid_rewards = [r for r in rewards if r is not None]
-        if not valid_rewards:
-            return None
-        best = max(valid_rewards)
-        winning_player = next(
-            (i for i, (r, s) in enumerate(zip(rewards, statuses))
-             if r == best and s == "DONE"),
-            None,
-        )
-        if winning_player is None:
-            return None
-        episode = _filter_winner(episode, winning_player)
-    return episode_to_samples(episode, _worker_encode_fn)
+def _worker_encode_episode(task) -> dict | None:
+    """Top-level worker task: encode (episode, avg_score) → samples dict (all players; reward + skill tagged)."""
+    episode, avg_score = task
+    return episode_to_samples(episode, _worker_encode_fn, avg_score=avg_score)
 
 
 def encode_to_shards(
@@ -743,7 +784,6 @@ def encode_to_shards(
     *,
     episodes_per_shard: int = 100,
     num_shards: int | None = None,
-    winner_only: bool = False,
     force: bool = False,
     workers: int = -1,
     encode_fn_factory=None,
@@ -758,6 +798,9 @@ def encode_to_shards(
     single-threaded. For workers>1 you must pass encode_fn_factory and
     encode_fn_factory_args so each worker can re-build the (non-picklable) JAX
     encode_fn locally.
+
+    All players are always encoded; winner/loser weighting is handled at train time
+    via BCConfig.loser_weight using the per-sample ``reward`` field in each shard.
     """
     shard_dir = episodes_dir / SHARD_DIR_NAME
     if not force and any(shard_dir.glob("*.npz")):
@@ -771,13 +814,16 @@ def encode_to_shards(
     if not use_mp and encode_fn is None:
         if encode_fn_factory is None:
             raise ValueError("encode_fn or encode_fn_factory must be provided")
+        _enable_compile_cache()
         encode_fn = encode_fn_factory(*encode_fn_factory_args)
+
+    # Per-game skill score joined from the day's manifest (info.EpisodeId -> avg_score).
+    avg_map = _load_avg_score_map(episodes_dir)
 
     total_files = _count_episode_jsons(episodes_dir)
     print(f"Found {total_files} episode files in {episodes_dir}"
-          + (f" | workers={n_workers}" if use_mp else ""))
-    if winner_only:
-        print("  winner_only=True: encoding only winning agent's actions")
+          + (f" | workers={n_workers}" if use_mp else "")
+          + (f" | manifest avg_score: {len(avg_map)} episodes" if avg_map else " | no manifest.csv (avg_score=NaN)"))
 
     shard_dir.mkdir(exist_ok=True)
     buffer: list[dict[str, np.ndarray]] = []
@@ -817,6 +863,14 @@ def encode_to_shards(
         return False
 
     if use_mp:
+        # Warm the shared compilation cache once in the parent so the n_workers spawned
+        # below read the encode_fn + simulator binaries from disk instead of each
+        # recompiling the same bucket shapes (the redundant-compile warmup stall).
+        _enable_compile_cache()
+        _tw = time.time()
+        print("  pre-warming shared compilation cache in parent …", flush=True)
+        _prewarm_compile_cache(episodes_dir, encode_fn_factory, encode_fn_factory_args, avg_map)
+        print(f"  compilation cache warm ({time.time() - _tw:.1f}s); spawning {n_workers} workers", flush=True)
         ctx = mp.get_context("spawn")
         pool = ctx.Pool(
             processes=n_workers,
@@ -824,7 +878,7 @@ def encode_to_shards(
             initargs=(encode_fn_factory, encode_fn_factory_args),
         )
         episodes_iter = (
-            (ep, winner_only)
+            (ep, _episode_avg_score(ep, avg_map))
             for _name, ep in _iter_episode_jsons(episodes_dir)
             if isinstance(ep, dict) and "steps" in ep
         )
@@ -845,7 +899,8 @@ def encode_to_shards(
             if not isinstance(episode, dict) or "steps" not in episode:
                 n_skipped += 1
                 continue
-            samples = episode_to_samples(episode, encode_fn)
+            samples = episode_to_samples(episode, encode_fn,
+                                         avg_score=_episode_avg_score(episode, avg_map))
             if _process_result(samples):
                 break
         else:
@@ -952,55 +1007,42 @@ def assemble_for_k(data, K: int) -> dict[str, np.ndarray]:
         raise ValueError(f"assemble_for_k: K={K} exceeds stored pool size {P}")
 
     INF = np.float32(1e30)
+    OVERFLOW_BIAS = np.float32(1e6)   # mirror features._select_sources_and_candidates
 
-    # Quota is time-varying (mirrors features._select_sources_and_candidates).
-    # Group samples by their (K_e, K_n, K_f) triple — only a handful of distinct
-    # values exist since quota snaps to integers over [T0, T1] ticks.
-    quota_per_sample = np.array([_k_quota(K, int(s)) for s in steps])  # [N, 3]
+    # Per-sample (K_e, K_n, K_f) quota, time-varying by tick. Compute once per
+    # distinct step value (only ~T1 distinct ticks) then scatter back to all rows.
+    uniq_steps, inv = np.unique(steps, return_inverse=True)
+    q_uniq = np.array([_k_quota(K, int(s)) for s in uniq_steps], np.int64)  # [U, 3]
+    quota = q_uniq[inv]                                    # [N, 3] cols=(enemy,neutral,friendly)
 
-    final_pos = np.empty((N, K - 1), np.intp)
-    final_ok  = np.empty((N, K - 1), bool)
-
-    unique_quotas = {tuple(q) for q in quota_per_sample}
-    for quota in unique_quotas:
-        K_e, K_n, K_f = quota
-        mask_g = np.all(quota_per_sample == quota, axis=1)   # [N] bool
-        g_pcat  = pcat[mask_g]
-        g_pdist = pdist[mask_g]
-        Ng = g_pcat.shape[0]
-        rows_g = np.arange(Ng)
-
-        def _cat_pick(c: int, kc: int):
-            if kc == 0:
-                return np.zeros((Ng, 0), np.intp), np.zeros((Ng, 0), bool)
-            key   = np.where(g_pcat == c, g_pdist, INF)
-            order = np.argsort(key, axis=1, kind="stable")
-            pos   = order[:, :kc].astype(np.intp)
-            valid = np.take_along_axis(key, pos, axis=1) < INF
-            return pos, valid
-
-        pe, ve = _cat_pick(0, K_e)
-        pn, vn = _cat_pick(1, K_n)
-        pfr, vf = _cat_pick(2, K_f)
-        per_pos = np.concatenate([pe, pn, pfr], axis=1)
-        per_val = np.concatenate([ve, vn, vf], axis=1)
-        Km1 = per_pos.shape[1]
-
-        claimed = np.zeros((Ng, P), bool)
-        if Km1:
-            ii = np.broadcast_to(rows_g[:, None], per_pos.shape)[per_val]
-            jj = per_pos[per_val]
-            claimed[ii, jj] = True
-        real     = g_pcat >= 0
-        ovfl_key = np.where(real & ~claimed, g_pdist, INF)
-        ovfl_ord = np.argsort(ovfl_key, axis=1, kind="stable")
-        ovfl_oks = np.take_along_axis(ovfl_key, ovfl_ord, axis=1) < INF
-        inv      = (~per_val).astype(np.int64)
-        ovfl_idx = np.minimum(np.cumsum(inv, axis=1) - inv, max(Km1 - 1, 0))
-        ovfl_pos = np.take_along_axis(ovfl_ord, ovfl_idx, axis=1) if Km1 else per_pos
-        ovfl_ok  = np.take_along_axis(ovfl_oks, ovfl_idx, axis=1) if Km1 else per_val
-        final_pos[mask_g] = np.where(per_val, per_pos, ovfl_pos).astype(np.intp)
-        final_ok[mask_g]  = np.where(per_val, True, ovfl_ok)
+    # Candidate selection mirrors features._select_sources_and_candidates exactly:
+    # build ONE sort key over the stored pool — in-quota planets by distance, then
+    # nearest out-of-quota planets (overflow backfill) offset by OVERFLOW_BIAS, then
+    # ineligible at INF — and take the K-1 smallest. This is robust when the rounded
+    # quotas sum to more than K-1 (the >=1 clamps in _k_quota over-allocate for small
+    # K): the top-(K-1) truncation simply drops the farthest, identical to the live
+    # encoder's argsort(key)[:K-1]. Set-monotonicity of the K-pool (see the parity
+    # test test/test_kmax_pool_parity.py) makes the in-pool category ranks match the
+    # board ranks the encoder uses.
+    eligible = pcat >= 0                                   # [N, P]; no-op slot (cat<0) excluded
+    # Within-category distance rank: # of same-category planets strictly nearer.
+    same_cat = (pcat[:, :, None] == pcat[:, None, :]) & eligible[:, None, :]
+    closer   = same_cat & (pdist[:, None, :] < pdist[:, :, None])
+    cat_rank = closer.sum(axis=2)                          # [N, P]
+    # Each planet's category quota (clip keeps the gather in-range; eligible masks <0).
+    plan_quota = np.take_along_axis(quota, np.clip(pcat, 0, 2), axis=1)   # [N, P]
+    in_quota = eligible & (cat_rank < plan_quota)
+    key = np.where(eligible,
+                   np.where(in_quota, pdist, OVERFLOW_BIAS + pdist),
+                   INF).astype(np.float32)
+    # Stable sort: on equal keys (exact-distance ties, common on the mirror-symmetric
+    # board) ties resolve by pool position. The pool is stored in the POOL_K encoder's
+    # own selection order, so this reproduces the encoder's tie-breaking — verified
+    # near-exact by a direct encoder-parity check (re-breaking ties by planet slot
+    # via lexsort instead made disagreement much worse: do NOT do that).
+    order     = np.argsort(key, axis=1, kind="stable")    # [N, P]
+    final_pos = order[:, :K - 1].astype(np.intp)          # [N, K-1] pool positions
+    final_ok  = np.take_along_axis(key, final_pos, axis=1) < INF
 
     # Prepend the no-op slot (pool position 0) and gather.
     pos = np.concatenate([np.zeros((N, 1), np.intp), final_pos], axis=1)   # [N, K]
@@ -1027,4 +1069,7 @@ def assemble_for_k(data, K: int) -> dict[str, np.ndarray]:
     # weight the loss by win/loss. Absent on legacy shards encoded before this field.
     if "reward" in data:
         result["reward"] = np.asarray(data["reward"], np.float32)
+    # Per-game skill score rides through unchanged for skill-weighted BC.
+    if "avg_score" in data:
+        result["avg_score"] = np.asarray(data["avg_score"], np.float32)
     return result

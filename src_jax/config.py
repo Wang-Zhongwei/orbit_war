@@ -57,7 +57,7 @@ class EnvConfig:
 
 @dataclass
 class ModelConfig:
-    hidden_size: int = 128
+    hidden_size: int = 256
     # Policy architecture (see src_jax/policies/__init__.py):
     #   "cross_source"    — per-source candidate-scoring net (default).
     #   "entity_mlp"      — entity-transformer backbone + joint MLP head.
@@ -102,20 +102,36 @@ class BCConfig:
     epochs: int = 1
     batch_size: int = 2048
     lr: float = 3e-4
-    winner_only: bool = False
-    # Per-sample loss weight applied to losing-player samples (winners always 1.0).
-    # 1.0 = train on all players equally; 0.0 = winner-only (losers contribute nothing,
-    # equivalent to winner_only). Values in between mix winning/losing behavior, e.g.
-    # 0.5 keeps loser-state coverage while trusting winner moves more. Read from the
-    # per-sample `reward` field stored in shards (winner ≈ +1, loser ≈ -1).
-    loser_weight: float = 1.0
+    # Per-sample loss weight for losing-player samples (winners always 1.0).
+    # 1.0 = train all players equally; 0.0 = winner-only (losers contribute nothing);
+    # 0.5 = keep loser coverage while trusting winner moves more.
+    loser_weight: float = 0.0
+    # Skill-based sample weighting from the per-episode manifest avg_score.
+    # R = clip band: a sample's skill weight is clip(exp((avg_score-median)/T), 1/R, R),
+    # with T auto-chosen so a p95 game maps to weight R. 1.0 = disabled (no skill weight).
+    # Requires shards encoded with the per-sample ``avg_score`` field (re-encode to enable).
+    skill_clip_ratio: float = 1.5
+    # Recency-based sample weighting (shard-training only). A sample's weight is
+    # multiplied by 0.5 ** (days_old / recency_half_life), where days_old is the gap
+    # in days between the shard's date and recency_ref_date. Captures "same score,
+    # later date = stronger player" in a relative-rating (ELO/TrueSkill) population.
+    # <= 0 disables (no-op). Date is parsed from the shard path episodes/<date>/shards/.
+    recency_half_life: float = 14.0
+    # Reference date ("YYYY-MM-DD") that recency decay is measured back from.
+    # Empty -> use the latest shard date present in the run (so the newest day = weight 1).
+    recency_ref_date: str = ""
     use_shard: bool = False
+    # Cap shards loaded per date directory (shard mode). 0 = use all. Useful for fast
+    # screening sweeps: keeps every date represented (unlike top_k_episodes, which
+    # truncates from the earliest dates) while bounding total compute.
+    max_shards_per_date: int = 0
     stream_buffer: int = 200
     top_k_episodes: int | None = None
     out_dir: str = "artifacts/bc"
     run_name: str = "bc_pretrain"
     augment: bool = True
     encode_workers: int = 0  # CPU encoder processes; 0 = auto (cpu_count - 1)
+    checkpoint_every: int = 100
 
     def __setstate__(self, state) -> None: _setstate(self, state)
 

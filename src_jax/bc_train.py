@@ -28,12 +28,15 @@ The saved checkpoint is compatible with train.py --resume so you can warm-start 
 from __future__ import annotations
 
 import argparse
+import math
 import multiprocessing
 import os
 import pickle
 import time
 from collections import deque
 from concurrent.futures import Future, ProcessPoolExecutor
+from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -47,7 +50,9 @@ import optax
 from .augment import DEFAULT_AUG_IDS, expand_with_augmentations
 from .bc_data import (
     SHARD_DIR_NAME,
+    _episode_avg_score,
     _iter_episode_jsons,
+    _load_avg_score_map,
     assemble_for_k,
     find_shards,
     is_pool_shard,
@@ -76,31 +81,15 @@ def _worker_init(env_cfg) -> None:
     _g_encode_fn = _mee(env_cfg.candidate_count, env_cfg)
 
 
-def _encode_episode(args: tuple) -> "dict | None":
-    """Worker task: winner-filter + encode one episode → numpy dict."""
-    episode, winner_only = args
-    from src_jax.bc_data import episode_to_samples as _eps, _filter_winner  # absolute
+def _encode_episode(task) -> "dict | None":
+    """Worker task: encode (episode, avg_score) → numpy dict (all players; reward + skill tagged)."""
+    from src_jax.bc_data import episode_to_samples as _eps  # absolute
 
+    episode, avg_score = task
     if not isinstance(episode, dict) or "steps" not in episode:
         return None
 
-    if winner_only:
-        rewards       = episode.get("rewards", [])
-        statuses      = episode.get("statuses", [])
-        valid_rewards = [r for r in rewards if r is not None]
-        if not valid_rewards:
-            return None
-        best = max(valid_rewards)
-        winning_player = next(
-            (i for i, (r, s) in enumerate(zip(rewards, statuses))
-             if r == best and s == "DONE"),
-            None,
-        )
-        if winning_player is None:
-            return None
-        episode = _filter_winner(episode, winning_player)
-
-    return _eps(episode, _g_encode_fn)
+    return _eps(episode, _g_encode_fn, avg_score=avg_score)
 
 
 # ---------------------------------------------------------------------------
@@ -134,19 +123,178 @@ def _bc_step(
     return state, loss, tgt_acc
 
 
-def _sample_weights(data, bc) -> np.ndarray:
-    """Per-sample loss weight from the stored episode reward (winner ≈ +1, loser ≈ -1).
+@jax.jit
+def _bc_eval_batch(
+    state: TrainState,
+    sf: jax.Array, cf: jax.Array, gf: jax.Array, cm: jax.Array, ti: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Eval-only forward: returns (sum_correct, sum_ce) over the batch (unweighted)."""
+    sv  = jnp.ones(sf.shape[0], dtype=jnp.bool_)
+    out = state.apply_fn(state.params, sf, cf, gf, cm, sv)
+    N   = ti.shape[0]
+    tgt_lp  = jax.nn.log_softmax(out.target_logits, axis=-1)
+    ce_sum  = -tgt_lp[jnp.arange(N), ti].sum()
+    correct = (jnp.argmax(out.target_logits, axis=-1) == ti).sum()
+    return correct.astype(jnp.float32), ce_sum
 
-    Winners get 1.0; losers get ``bc.loser_weight`` (0.0 when ``winner_only`` is set,
-    which drops them from the weighted CE). Legacy shards without a ``reward`` field
-    fall back to uniform 1.0 (train on all players equally).
+
+def evaluate_target_acc(state, shard_paths, cfg, *, batch_size: int = 8192) -> dict:
+    """Unweighted held-out target-action accuracy / CE over the given shards.
+
+    No augmentation, no gradient — measures how well the policy matches the experts
+    in `shard_paths` (the held-out target distribution). Returns {n, acc, ce}.
+    """
+    tot_n = 0
+    tot_correct = 0.0
+    tot_ce = 0.0
+    for p in shard_paths:
+        data = np.load(p)
+        if is_pool_shard(data):
+            data = assemble_for_k(data, cfg.env.candidate_count)
+        N = int(data["target_idx"].shape[0])
+        sf = jnp.asarray(data["self_feats"])
+        cf = jnp.asarray(data["cand_feats"])
+        gf = jnp.asarray(data["global_feats"])
+        cm = jnp.asarray(data["cand_mask"])
+        ti = jnp.asarray(data["target_idx"])
+        for start in range(0, N, batch_size):
+            end = min(start + batch_size, N)
+            c, ce = _bc_eval_batch(state, sf[start:end], cf[start:end],
+                                   gf[start:end], cm[start:end], ti[start:end])
+            tot_correct += float(c)
+            tot_ce += float(ce)
+            tot_n += end - start
+    acc = tot_correct / max(tot_n, 1)
+    ce = tot_ce / max(tot_n, 1)
+    return {"n": tot_n, "acc": acc, "ce": ce}
+
+
+@dataclass
+class _SkillNorm:
+    """Maps a per-game ``avg_score`` to a bounded skill weight.
+
+    weight = clip(exp((avg_score - median) / T), 1/R, R). T is chosen by
+    _build_skill_norm so a reference-percentile (p95) game maps to exactly R.
+    Because the BC loss is a weighted mean (sum(w·ce)/sum(w)), only *relative*
+    weights matter, so centering at the median is cosmetic and the absolute
+    scale is irrelevant — R and the clip band are what shape the gradients.
+    """
+    median: float
+    T: float
+    R: float
+
+    def weights(self, avg_score) -> np.ndarray:
+        s = np.asarray(avg_score, np.float64)
+        # Clip the exponent to the band first — equivalent to clipping exp() to
+        # [1/R, R] but avoids overflow warnings on extreme/NaN scores.
+        z = np.clip((s - self.median) / self.T, -math.log(self.R), math.log(self.R))
+        w = np.exp(z)
+        # Games with no manifest match (NaN) get a neutral weight of 1.
+        return np.where(np.isfinite(s), w, 1.0).astype(np.float32)
+
+
+def _build_skill_norm(episodes_dirs, R, ref_pct: float = 95.0) -> "_SkillNorm | None":
+    """Compute the skill-weight normalization from the manifest avg_score spread.
+
+    T is set so a ref_pct (p95) game maps to weight R: T = (p95 - median)/ln(R).
+    Returns None (skill weighting off) if R <= 1, no manifests are found, or the
+    spread is degenerate.
+    """
+    if R is None or R <= 1.0:
+        return None
+    vals: list[float] = []
+    for d in episodes_dirs:
+        vals.extend(_load_avg_score_map(d).values())
+    if not vals:
+        print(f"  skill_clip_ratio={R} set but no manifest.csv found — skill weighting OFF", flush=True)
+        return None
+    arr = np.asarray(vals, np.float64)
+    median = float(np.median(arr))
+    p = float(np.percentile(arr, ref_pct))
+    T = (p - median) / math.log(R)
+    if not (T > 0.0):
+        print(f"  skill weighting OFF: degenerate spread (median={median:.1f}, p{ref_pct:.0f}={p:.1f})",
+              flush=True)
+        return None
+    print(f"  skill weighting ON: R={R}  median={median:.1f}  p{ref_pct:.0f}={p:.1f}  "
+          f"T={T:.1f}  (p{ref_pct:.0f} game → weight {R}, clipped to [1/{R}, {R}])", flush=True)
+    return _SkillNorm(median=median, T=T, R=float(R))
+
+
+def _shard_date(path: Path) -> "date | None":
+    """Parse the YYYY-MM-DD date from a shard path episodes/<date>/shards/shard_*.npz."""
+    # shard file -> shards dir -> date dir
+    name = path.parent.parent.name
+    try:
+        return datetime.strptime(name, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _build_recency(shard_paths, half_life: float, ref_date_str: str):
+    """Return (ref_date, per-path multiplier dict) for recency weighting, or (None, None) if off.
+
+    multiplier = 0.5 ** (days_old / half_life), days_old = (ref_date - shard_date).days,
+    clamped at >= 0 so future-dated shards (days_old < 0) are not up-weighted past 1.0.
+    """
+    if half_life is None or half_life <= 0.0:
+        return None, None
+    dates = {p: _shard_date(p) for p in shard_paths}
+    known = [d for d in dates.values() if d is not None]
+    if not known:
+        print(f"  recency_half_life={half_life} set but no dated shard paths — recency OFF", flush=True)
+        return None, None
+    if ref_date_str:
+        ref = datetime.strptime(ref_date_str, "%Y-%m-%d").date()
+    else:
+        ref = max(known)
+    mult = {}
+    for p, d in dates.items():
+        if d is None:
+            mult[p] = 1.0  # undated shard: neutral
+            continue
+        days_old = max((ref - d).days, 0)
+        mult[p] = float(0.5 ** (days_old / half_life))
+    lo, hi = min(mult.values()), max(mult.values())
+    print(f"  recency weighting ON: half_life={half_life}d  ref={ref}  "
+          f"mult range [{lo:.3f}, {hi:.3f}] over {len(known)} dated shards", flush=True)
+    return ref, mult
+
+
+def _drop_losers(data, bc) -> dict:
+    """When loser_weight == 0, drop loser rows entirely (speed: they'd be zero-weighted anyway).
+
+    The weighted-mean loss already ignores zero-weight rows, so this changes nothing
+    numerically — it just stops wasting batch slots on samples that contribute nothing.
+    Returns a plain dict (works on both NpzFile and dict inputs).
+    """
+    if bc.loser_weight != 0.0 or "reward" not in data:
+        return data
+    keep = np.asarray(data["reward"], np.float32) > 0.0
+    if keep.all():
+        return data
+    n = keep.shape[0]
+    return {k: (np.asarray(data[k])[keep] if np.asarray(data[k]).shape[:1] == (n,) else np.asarray(data[k]))
+            for k in data.keys()}
+
+
+def _sample_weights(data, bc, skill: "_SkillNorm | None" = None) -> np.ndarray:
+    """Per-sample loss weight = win/loss weight × skill weight.
+
+    Win/loss: winners get 1.0, losers get ``bc.loser_weight``. Legacy shards
+    without a ``reward`` field fall back to uniform 1.0. Skill: if ``skill`` is set
+    and the shard carries ``avg_score``, multiply by the bounded skill weight;
+    shards encoded before that field simply skip it.
     """
     n = int(data["target_idx"].shape[0])
     if "reward" not in data:
-        return np.ones(n, np.float32)
-    lw = 0.0 if bc.winner_only else float(bc.loser_weight)
-    rwd = np.asarray(data["reward"], np.float32)
-    return np.where(rwd > 0.0, 1.0, lw).astype(np.float32)
+        base = np.ones(n, np.float32)
+    else:
+        rwd = np.asarray(data["reward"], np.float32)
+        base = np.where(rwd > 0.0, 1.0, float(bc.loser_weight)).astype(np.float32)
+    if skill is not None and "avg_score" in data:
+        base = base * skill.weights(data["avg_score"])
+    return base.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +346,16 @@ def train(
         recursive=recursive,
     )
     shard_paths = find_shards(episodes_dirs)
+    if bc.max_shards_per_date > 0:
+        kept: list[Path] = []
+        per_date: dict[str, int] = {}
+        for p in shard_paths:
+            day = p.parent.parent.name
+            if per_date.get(day, 0) < bc.max_shards_per_date:
+                kept.append(p)
+                per_date[day] = per_date.get(day, 0) + 1
+        print(f"  max_shards_per_date={bc.max_shards_per_date}: {len(shard_paths)} → {len(kept)} shards", flush=True)
+        shard_paths = kept
     if bc.top_k_episodes is not None:
         counts = shard_episode_counts(shard_paths)
         cumulative = 0
@@ -212,6 +370,11 @@ def train(
           + (f" | top_k_episodes={bc.top_k_episodes}" if bc.top_k_episodes else "")
           + (f" | augment={aug_ids}" if bc.augment else ""))
 
+    skill = _build_skill_norm(episodes_dirs, bc.skill_clip_ratio)
+    _, recency_mult = _build_recency(shard_paths, bc.recency_half_life, bc.recency_ref_date)
+    if bc.loser_weight == 0.0:
+        print("  loser_weight=0 → loser rows dropped at load (winner-only training)", flush=True)
+
     policy = build_policy(cfg)
     params = init_params(policy, cfg.seed)
     tx = optax.chain(
@@ -222,7 +385,7 @@ def train(
 
     if use_wandb:
         import wandb
-        wandb.init(
+        run = wandb.init(
             project="orbit-war",
             name=bc.run_name,
             config={
@@ -236,10 +399,16 @@ def train(
                 "candidate_count": cfg.env.candidate_count,
                 "top_k_episodes": bc.top_k_episodes,
                 "hidden_size": cfg.model.hidden_size,
-                "winner_only": bc.winner_only,
                 "loser_weight": bc.loser_weight,
+                "skill_clip_ratio": bc.skill_clip_ratio,
+                "recency_half_life": bc.recency_half_life,
+                "recency_ref_date": bc.recency_ref_date,
             },
         )
+        # Sidecar: let the (separate) eval job resume this exact W&B run.
+        run_dir = Path(bc.out_dir) / bc.run_name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "wandb_run_id.txt").write_text(run.id)
 
     print(f"Starting BC training: {bc.epochs} epochs, batch={bc.batch_size}", flush=True)
     print(f"Checkpoints → {Path(bc.out_dir) / bc.run_name}", flush=True)
@@ -261,15 +430,24 @@ def train(
             # Legacy fixed-K shards already carry cand_feats/target_idx directly.
             if is_pool_shard(data):
                 data = assemble_for_k(data, cfg.env.candidate_count)
+            data = _drop_losers(data, bc)
             N    = data["target_idx"].shape[0]
             perm = rng.permutation(N)
+
+            w_all = _sample_weights(data, bc, skill)
+            if recency_mult is not None:
+                w_all = w_all * recency_mult.get(shard_paths[shard_i], 1.0)
+            if skill is not None and si == 0 and epoch == 1:
+                ess = float(w_all.sum() ** 2 / (np.square(w_all).sum() + 1e-12))
+                print(f"  skill weights: mean={w_all.mean():.3f} min={w_all.min():.3f} "
+                      f"max={w_all.max():.3f}  ESS/N={ess / max(len(w_all), 1):.2f}", flush=True)
 
             sf = jnp.asarray(data["self_feats"][perm])
             cf = jnp.asarray(data["cand_feats"][perm])
             gf = jnp.asarray(data["global_feats"][perm])
             cm = jnp.asarray(data["cand_mask"][perm])
             ti = jnp.asarray(data["target_idx"][perm])
-            w  = jnp.asarray(_sample_weights(data, bc)[perm])
+            w  = jnp.asarray(w_all[perm])
 
             # D4 augmentation: expand shard N→N*len(aug_ids) then re-shuffle.
             if bc.augment:
@@ -324,7 +502,7 @@ def train(
                     step=global_step,
                 )
 
-            if (si + 1) % 5 == 0:
+            if (si + 1) % cfg.bc.checkpoint_every == 0:
                 save_bc_checkpoint(
                     Path(bc.out_dir), bc.run_name, epoch, state, cfg,
                     tag=f"{epoch:06d}_shard{si+1:04d}",
@@ -431,6 +609,13 @@ def train_stream(
 
     episodes_dirs = _resolve_episode_dirs(episodes_dirs, recursive=recursive)
 
+    skill = _build_skill_norm(episodes_dirs, bc.skill_clip_ratio)
+    if bc.loser_weight == 0.0:
+        print("  loser_weight=0 → loser rows dropped before training (winner-only)", flush=True)
+    # Per-directory episode_id -> avg_score maps for the skill join (read in the
+    # main process; threaded to workers alongside each episode).
+    dir_avg_maps = {d: _load_avg_score_map(d) for d in episodes_dirs}
+
     policy = build_policy(cfg)
     params = init_params(policy, cfg.seed)
     tx = optax.chain(
@@ -445,7 +630,7 @@ def train_stream(
 
     if use_wandb:
         import wandb
-        wandb.init(
+        run = wandb.init(
             project="orbit-war",
             name=bc.run_name,
             config={
@@ -461,8 +646,14 @@ def train_stream(
                 "candidate_count": cfg.env.candidate_count,
                 "hidden_size": cfg.model.hidden_size,
                 "encode_workers": num_workers,
+                "loser_weight": bc.loser_weight,
+                "skill_clip_ratio": bc.skill_clip_ratio,
             },
         )
+        # Sidecar: let the (separate) eval job resume this exact W&B run.
+        run_dir = Path(bc.out_dir) / bc.run_name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "wandb_run_id.txt").write_text(run.id)
 
     rng = np.random.default_rng(cfg.seed)
 
@@ -472,6 +663,7 @@ def train_stream(
         keys = buf[0].keys()
         data = {k: np.concatenate([s[k] for s in buf], axis=0) for k in keys}
         data = assemble_for_k(data, cfg.env.candidate_count)
+        data = _drop_losers(data, bc)
         N    = int(data["target_idx"].shape[0])
         perm = jnp.array(rng.permutation(N))
         sf = jnp.asarray(data["self_feats"][perm])
@@ -479,7 +671,7 @@ def train_stream(
         gf = jnp.asarray(data["global_feats"][perm])
         cm = jnp.asarray(data["cand_mask"][perm])
         ti = jnp.asarray(data["target_idx"][perm])
-        w  = jnp.asarray(_sample_weights(data, bc)[perm])
+        w  = jnp.asarray(_sample_weights(data, bc, skill)[perm])
 
         if bc.augment:
             sf, cf, gf, cm, ti = expand_with_augmentations(
@@ -529,8 +721,9 @@ def train_stream(
 
         def _iter_all():
             for d in episodes_dirs:
+                avg_map = dir_avg_maps.get(d, {})
                 for _name, ep in _iter_episode_jsons(d):
-                    yield ep
+                    yield ep, _episode_avg_score(ep, avg_map)
 
         for epoch in range(1, bc.epochs + 1):
             losses, tgt_accs = [], []
@@ -549,18 +742,18 @@ def train_stream(
 
             # Pre-fill sliding window
             for _ in range(_INFLIGHT):
-                ep = next(ep_iter, None)
-                if ep is None:
+                task = next(ep_iter, None)
+                if task is None:
                     break
-                pending.append(pool.submit(_encode_episode, (ep, bc.winner_only)))
+                pending.append(pool.submit(_encode_episode, task))
 
             while pending:
                 f = pending.popleft()
 
                 # Refill window before blocking on result (keeps workers busy)
-                ep = next(ep_iter, None)
-                if ep is not None and (bc.top_k_episodes is None or n_episodes < bc.top_k_episodes):
-                    pending.append(pool.submit(_encode_episode, (ep, bc.winner_only)))
+                task = next(ep_iter, None)
+                if task is not None and (bc.top_k_episodes is None or n_episodes < bc.top_k_episodes):
+                    pending.append(pool.submit(_encode_episode, task))
 
                 samples = f.result()
                 if samples is None:
@@ -660,11 +853,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
-    parser.add_argument("--winner_only", default=None, action="store_true")
+    parser.add_argument("--loser_weight", type=float, default=None,
+                        help="Loss weight for losing-player samples (1.0=equal, 0.0=winner-only, 0.5=default mix)")
+    parser.add_argument("--skill_clip_ratio", type=float, default=None,
+                        help="R: skill-weight clip band [1/R, R] from manifest avg_score; T auto-set so a "
+                             "p95 game → weight R. 1.0=off. Requires shards re-encoded with avg_score.")
+    parser.add_argument("--recency_half_life", type=float, default=None,
+                        help="Recency decay half-life in days (shard mode): a shard's samples are "
+                             "weighted by 0.5**(days_old/half_life). <=0 or omitted = off.")
+    parser.add_argument("--recency_ref_date", type=str, default=None,
+                        help="Reference date YYYY-MM-DD recency decays back from (default: latest shard date)")
+    parser.add_argument("--checkpoint_every", type=int, default=None,
+                        help="Save a checkpoint every N shards within an epoch (shard mode).")
     parser.add_argument("--stream_buffer", type=int, default=None)
     parser.add_argument("--top_k_episodes", type=int, default=None,
                         help="Process only the first N valid episodes (zip-streaming mode only)")
     parser.add_argument("--run_name", default=None)
+    parser.add_argument("--hidden_size", type=int, default=None,
+                        help="Override model.hidden_size (e.g. for a capacity sweep)")
+    parser.add_argument("--candidate_count", type=int, default=None,
+                        help="Override env.candidate_count K (re-sliced from the POOL_K=24 shard pool; "
+                             "must be <= POOL_K). For a candidate-count sweep.")
     parser.add_argument("--augment", default=None, action="store_true")
     parser.add_argument("--no_augment", dest="augment", action="store_false")
     # Runtime flags — accepted in both modes
@@ -692,10 +901,16 @@ def main() -> None:
     if args.epochs         is not None: bc.epochs         = args.epochs
     if args.batch_size     is not None: bc.batch_size     = args.batch_size
     if args.lr             is not None: bc.lr             = args.lr
-    if args.winner_only    is not None: bc.winner_only    = args.winner_only
+    if args.loser_weight   is not None: bc.loser_weight   = args.loser_weight
+    if args.skill_clip_ratio is not None: bc.skill_clip_ratio = args.skill_clip_ratio
+    if args.recency_half_life is not None: bc.recency_half_life = args.recency_half_life
+    if args.recency_ref_date is not None: bc.recency_ref_date = args.recency_ref_date
+    if args.checkpoint_every is not None: bc.checkpoint_every = args.checkpoint_every
     if args.stream_buffer  is not None: bc.stream_buffer  = args.stream_buffer
     if args.top_k_episodes is not None: bc.top_k_episodes = args.top_k_episodes
     if args.run_name       is not None: bc.run_name       = args.run_name
+    if args.hidden_size    is not None: cfg.model.hidden_size = args.hidden_size
+    if args.candidate_count is not None: cfg.env.candidate_count = args.candidate_count
     if args.augment        is not None: bc.augment        = args.augment
     if args.use_shard      is not None: bc.use_shard      = args.use_shard
     if args.encode_workers is not None: bc.encode_workers = args.encode_workers

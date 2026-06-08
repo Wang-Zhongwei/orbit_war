@@ -161,6 +161,21 @@ def play_match(
 # Multiprocessing worker  (must be a module-level function for pickling)
 # ---------------------------------------------------------------------------
 
+_WORKER_JAX_CHECKPOINT: str | None = None
+_WORKER_JAX_NAME: str = "jax"
+_WORKER_JAX_DETERMINISTIC: bool = True
+
+
+def _worker_init(checkpoint_path: str | None, name: str, deterministic: bool) -> None:
+    """Pool initializer: register the JAX agent once per worker process."""
+    global _WORKER_JAX_CHECKPOINT, _WORKER_JAX_NAME, _WORKER_JAX_DETERMINISTIC
+    _WORKER_JAX_CHECKPOINT = checkpoint_path
+    _WORKER_JAX_NAME = name
+    _WORKER_JAX_DETERMINISTIC = deterministic
+    if checkpoint_path is not None:
+        _register_jax_agent(checkpoint_path, deterministic=deterministic, name=name)
+
+
 def _match_task(task: dict) -> dict:
     """Run one match in a worker process and return rows + metadata (no I/O).
 
@@ -203,6 +218,9 @@ def tournament(
     flush_period: int = 10,
     workers: int = 1,
     verbose: bool = True,
+    jax_checkpoint: str | None = None,
+    jax_name: str = "jax",
+    jax_deterministic: bool = True,
 ) -> None:
     """Round-robin 1v1 with randomized slot ordering.
 
@@ -265,7 +283,12 @@ def tournament(
         for task in tasks:
             _handle_result(_match_task(task))
     else:
-        with multiprocessing.Pool(workers) as pool:
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(
+            workers,
+            initializer=_worker_init,
+            initargs=(jax_checkpoint, jax_name, jax_deterministic),
+        ) as pool:
             for result in pool.imap_unordered(_match_task, tasks):
                 _handle_result(result)
 
@@ -387,6 +410,9 @@ def main(argv: Iterable[str] | None = None) -> int:
             flush_period=args.flush_period,
             workers=args.workers,
             verbose=not args.quiet,
+            jax_checkpoint=getattr(args, "jax_checkpoint", None),
+            jax_name=getattr(args, "jax_name", "jax"),
+            jax_deterministic=not getattr(args, "jax_stochastic", False),
         )
         return 0
 
