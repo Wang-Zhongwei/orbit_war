@@ -261,6 +261,53 @@ def _build_recency(shard_paths, half_life: float, ref_date_str: str):
     return ref, mult
 
 
+def _make_optimizer(bc, total_steps: int | None = None) -> optax.GradientTransformation:
+    """Build the BC optimizer from cfg.bc stability knobs.
+
+    - grad_clip > 0     -> global-norm clip before the optimizer
+    - warmup_steps > 0  -> linear LR warmup 0->lr over warmup_steps
+    - lr_schedule cosine-> after warmup, cosine-decay lr->lr_final over total_steps
+                           (falls back to warmup+constant if total_steps is unknown)
+    - lr_schedule const -> hold lr after warmup
+    - weight_decay > 0  -> AdamW (decoupled decay); else plain Adam
+    """
+    warm = bc.warmup_steps if (bc.warmup_steps and bc.warmup_steps > 0) else 0
+    if getattr(bc, "lr_schedule", "constant") == "cosine" and total_steps and total_steps > warm:
+        lr = optax.warmup_cosine_decay_schedule(
+            init_value=0.0,
+            peak_value=bc.lr,
+            warmup_steps=warm,
+            decay_steps=total_steps,   # total horizon; cosine spans (total_steps - warm)
+            end_value=bc.lr_final,
+        )
+    else:
+        lr = optax.linear_schedule(0.0, bc.lr, warm) if warm else bc.lr
+    core = (optax.adamw(lr, weight_decay=bc.weight_decay)
+            if bc.weight_decay and bc.weight_decay > 0.0 else optax.adam(lr))
+    stages = []
+    if bc.grad_clip and bc.grad_clip > 0.0:
+        stages.append(optax.clip_by_global_norm(bc.grad_clip))
+    stages.append(core)
+    return optax.chain(*stages)
+
+
+def _estimate_total_steps(shard_paths, bc, aug_ids, K: int, epochs: int) -> int:
+    """Estimate total optimizer steps for the cosine horizon.
+
+    Peeks the first shard (post loser-drop + augmentation expansion) for a
+    representative steps/shard, then scales by shard count × epochs. Shards are
+    near-uniform in size, so this is within a few % — plenty for a cosine horizon.
+    """
+    data = np.load(shard_paths[0])
+    if is_pool_shard(data):
+        data = assemble_for_k(data, K)
+    data = _drop_losers(data, bc)
+    n = int(data["target_idx"].shape[0])
+    n_aug = n * (len(aug_ids) if bc.augment else 1)
+    steps_per_shard = max(1, n_aug // bc.batch_size)
+    return steps_per_shard * len(shard_paths) * max(1, epochs)
+
+
 def _drop_losers(data, bc) -> dict:
     """When loser_weight == 0, drop loser rows entirely (speed: they'd be zero-weighted anyway).
 
@@ -377,10 +424,14 @@ def train(
 
     policy = build_policy(cfg)
     params = init_params(policy, cfg.seed)
-    tx = optax.chain(
-        optax.clip_by_global_norm(0.5),
-        optax.adam(bc.lr),
-    )
+    total_steps = None
+    if bc.lr_schedule == "cosine":
+        total_steps = bc.decay_steps if bc.decay_steps > 0 else _estimate_total_steps(
+            shard_paths, bc, aug_ids, cfg.env.candidate_count, bc.epochs)
+        print(f"  cosine LR: warmup={bc.warmup_steps} → peak={bc.lr} → "
+              f"end={bc.lr_final} over ~{total_steps} steps"
+              f"{' (auto)' if bc.decay_steps <= 0 else ''}", flush=True)
+    tx = _make_optimizer(bc, total_steps)
     state = TrainState.create(apply_fn=policy.apply, params=params, tx=tx)
 
     if use_wandb:
@@ -394,6 +445,12 @@ def train(
                 "epochs": bc.epochs,
                 "batch_size": bc.batch_size,
                 "lr": bc.lr,
+                "weight_decay": bc.weight_decay,
+                "warmup_steps": bc.warmup_steps,
+                "lr_schedule": bc.lr_schedule,
+                "lr_final": bc.lr_final,
+                "decay_steps": bc.decay_steps,
+                "grad_clip": bc.grad_clip,
                 "augment": bc.augment,
                 "aug_ids": aug_ids if bc.augment else [],
                 "candidate_count": cfg.env.candidate_count,
@@ -618,10 +675,9 @@ def train_stream(
 
     policy = build_policy(cfg)
     params = init_params(policy, cfg.seed)
-    tx = optax.chain(
-        optax.clip_by_global_norm(0.5),
-        optax.adam(bc.lr),
-    )
+    # Episode mode can't cheaply pre-count steps; cosine needs an explicit decay_steps,
+    # else _make_optimizer falls back to warmup+constant.
+    tx = _make_optimizer(bc, bc.decay_steps if bc.decay_steps > 0 else None)
     state = TrainState.create(apply_fn=policy.apply, params=params, tx=tx)
 
     num_workers = bc.encode_workers if bc.encode_workers > 0 else max(1, multiprocessing.cpu_count() - 1)
@@ -638,6 +694,12 @@ def train_stream(
                 "epochs": bc.epochs,
                 "batch_size": bc.batch_size,
                 "lr": bc.lr,
+                "weight_decay": bc.weight_decay,
+                "warmup_steps": bc.warmup_steps,
+                "lr_schedule": bc.lr_schedule,
+                "lr_final": bc.lr_final,
+                "decay_steps": bc.decay_steps,
+                "grad_clip": bc.grad_clip,
                 "use_shard": False,
                 "stream_buffer": bc.stream_buffer,
                 "top_k_episodes": bc.top_k_episodes,
@@ -853,6 +915,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--weight_decay", type=float, default=None,
+                        help="AdamW decoupled weight decay; >0 switches Adam->AdamW (0=plain Adam)")
+    parser.add_argument("--warmup_steps", type=int, default=None,
+                        help="Linear LR warmup 0->lr over N optimizer steps, then hold/decay (0=off)")
+    parser.add_argument("--lr_schedule", choices=["constant", "cosine"], default=None,
+                        help="Post-warmup LR schedule: constant (hold) or cosine (decay to lr_final)")
+    parser.add_argument("--lr_final", type=float, default=None,
+                        help="Cosine end LR (absolute); only used with --lr_schedule cosine")
+    parser.add_argument("--decay_steps", type=int, default=None,
+                        help="Cosine step horizon; 0=auto-estimate from shard count (shard mode)")
+    parser.add_argument("--grad_clip", type=float, default=None,
+                        help="Global-norm gradient clip before the optimizer (<=0 disables)")
     parser.add_argument("--loser_weight", type=float, default=None,
                         help="Loss weight for losing-player samples (1.0=equal, 0.0=winner-only, 0.5=default mix)")
     parser.add_argument("--skill_clip_ratio", type=float, default=None,
@@ -901,6 +975,12 @@ def main() -> None:
     if args.epochs         is not None: bc.epochs         = args.epochs
     if args.batch_size     is not None: bc.batch_size     = args.batch_size
     if args.lr             is not None: bc.lr             = args.lr
+    if args.weight_decay   is not None: bc.weight_decay   = args.weight_decay
+    if args.warmup_steps   is not None: bc.warmup_steps   = args.warmup_steps
+    if args.lr_schedule    is not None: bc.lr_schedule    = args.lr_schedule
+    if args.lr_final       is not None: bc.lr_final       = args.lr_final
+    if args.decay_steps    is not None: bc.decay_steps    = args.decay_steps
+    if args.grad_clip      is not None: bc.grad_clip      = args.grad_clip
     if args.loser_weight   is not None: bc.loser_weight   = args.loser_weight
     if args.skill_clip_ratio is not None: bc.skill_clip_ratio = args.skill_clip_ratio
     if args.recency_half_life is not None: bc.recency_half_life = args.recency_half_life

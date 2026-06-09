@@ -102,6 +102,22 @@ class BCConfig:
     epochs: int = 1
     batch_size: int = 2048
     lr: float = 3e-4
+    # Optimizer stability knobs (shard- and episode-mode training share these).
+    # weight_decay > 0 switches Adam -> AdamW (decoupled decay); 0.0 == plain Adam.
+    weight_decay: float = 0.0
+    # Linear LR warmup: ramp 0 -> lr over this many optimizer steps, then hold lr
+    # (or decay, if lr_schedule="cosine"). 0 = no warmup. Targets early Adam spikes.
+    warmup_steps: int = 0
+    # LR schedule after warmup: "constant" (hold lr) or "cosine" (decay lr -> lr_final
+    # over the run). Cosine needs a step horizon; see decay_steps.
+    lr_schedule: str = "constant"
+    # Cosine end LR (absolute). Only used when lr_schedule="cosine".
+    lr_final: float = 0.0
+    # Total optimizer steps for the cosine horizon. 0 = auto-estimate from a one-shard
+    # peek × shard count × epochs (shard mode). Ignored when lr_schedule="constant".
+    decay_steps: int = 0
+    # Global-norm gradient clip applied before the optimizer. <= 0 disables.
+    grad_clip: float = 0.5
     # Per-sample loss weight for losing-player samples (winners always 1.0).
     # 1.0 = train all players equally; 0.0 = winner-only (losers contribute nothing);
     # 0.5 = keep loser coverage while trusting winner moves more.

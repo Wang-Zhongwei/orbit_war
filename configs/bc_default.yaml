@@ -1,16 +1,23 @@
 seed: 42
 
 env:
-  candidate_count: 8
+  candidate_count: 12
 
 model:
-  hidden_size: 128
+  hidden_size: 256
 
 bc:
   epochs: 1
-  batch_size: 8192
-  lr: 3e-4
+  batch_size: 4096
+  lr: 1e-4
+  warmup_steps: 2000   
+  weight_decay: 0.01   # AdamW (decoupled decay); 0 = plain Adam
+  loser_weight: 0.0
+  lr_schedule: cosine
+  lr_final: 1e-5      # small floor rather than 0 is often safer
+  skill_clip_ratio: 1.0
+  recency_half_life: 14.0
   use_shard: true
   out_dir: artifacts/bc
-  run_name: bc_pretrain
+  run_name: bc_pretrain_default
   augment: true
