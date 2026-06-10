@@ -33,6 +33,8 @@ def main() -> int:
     ap.add_argument("--n", type=int, default=300, help="max episodes to scan")
     ap.add_argument("--max_ticks", type=int, default=bd.MAX_FLY_TICKS)
     ap.add_argument("--chunk", type=int, default=20000, help="fleets per sim call")
+    ap.add_argument("--bin_width", type=int, default=5,
+                    help="bin width (ticks) for the full distribution table")
     args = ap.parse_args()
 
     print(f"episodes_dir={args.episodes_dir}  n={args.n}  max_ticks={args.max_ticks}")
@@ -133,6 +135,23 @@ def main() -> int:
     for lo, hi, c in zip(edges[:-1], edges[1:], hist):
         bar = "#" * int(60 * c / max(hist.max(), 1))
         print(f"  [{lo:>4},{hi if hi<99999 else 'inf':>5}): {c:8d} {bar}")
+
+    # --- full distribution: fixed-width bins across the whole range (PMF + CDF) ---
+    bw = args.bin_width
+    top = int(ticks.max())
+    fedges = list(range(0, top + bw, bw))
+    fhist, _ = np.histogram(ticks, bins=fedges)
+    fmax = max(fhist.max(), 1)
+    cum = 0
+    print(f"\nfull flight-time distribution (bin width={bw} ticks, "
+          f"PMF=share in bin, CDF=cumulative):")
+    print(f"  {'bin':>11} {'count':>8} {'PMF':>7} {'CDF':>7}")
+    for lo, hi, c in zip(fedges[:-1], fedges[1:], fhist):
+        cum += int(c)
+        pmf = 100 * c / ticks.size
+        cdf = 100 * cum / ticks.size
+        bar = "#" * int(50 * c / fmax)
+        print(f"  [{lo:>4},{hi:>4}) {int(c):>8} {pmf:6.2f}% {cdf:6.2f}% {bar}")
 
     print("\nDONE")
     return 0

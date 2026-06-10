@@ -30,7 +30,7 @@ eval_opponents:
   - sub_v52
 eval_rounds: 32
 eval_update_interval: 80
-eval_workers: 2  # match --cpus-per-task in the slurm to avoid CPU oversubscription
+eval_workers: 32  # match --cpus-per-task in the slurm to avoid CPU oversubscription
 
 env:
   candidate_count: 12   # must match BC checkpoint (sweep_loser_0_0 = K12)
