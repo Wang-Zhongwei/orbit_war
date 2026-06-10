@@ -65,12 +65,69 @@ def save_checkpoint(save_dir: Path, run_name: str, update: int, train_state: Tra
             pickle.dump(ckpt, f)
 
 
+def _restore_params(fresh_params, ckpt_params):
+    """Load checkpoint params into the current model, tolerating a top-level
+    module-key mismatch.
+
+    When the trees match exactly (a normal same-arch resume) this is a plain
+    strict load. When they differ — e.g. a separate-encoder BC checkpoint loaded
+    into a ``shared_backbone`` model — take every top-level module the model
+    still has and the checkpoint provides (matching structure), keep fresh init
+    for any the model has but the checkpoint lacks, and drop any the model no
+    longer has (the always-cold ``value_encoder``/``value_xsrc``). The exact
+    disposition is printed so a genuine wrong-checkpoint mistake stays visible.
+    """
+    if jax.tree_util.tree_structure(fresh_params) == jax.tree_util.tree_structure(ckpt_params):
+        return ckpt_params
+    fresh, loaded = fresh_params["params"], ckpt_params["params"]
+    merged, taken, kept = dict(fresh), [], []
+    for name, sub in fresh.items():
+        if name in loaded and jax.tree_util.tree_structure(loaded[name]) == jax.tree_util.tree_structure(sub):
+            merged[name] = loaded[name]
+            taken.append(name)
+        else:
+            kept.append(name)
+    dropped = [name for name in loaded if name not in fresh]
+    print("  partial restore (param tree changed since checkpoint):")
+    print(f"    loaded from ckpt : {sorted(taken)}")
+    print(f"    kept fresh init  : {sorted(kept)}")
+    print(f"    dropped from ckpt: {sorted(dropped)}")
+    return {"params": merged}
+
+
+def _enable_compile_cache() -> None:
+    """Point JAX at an on-disk compilation cache so the (slow, multi-minute) first
+    compile of the rollout + ppo_update XLA programs is written to disk once and
+    reused on every later launch — restarts, resumes, re-submits — instead of
+    recompiling from scratch each time. Mirrors the BC encode path's cache. Shared
+    dir with BC via JAX_CACHE_DIR (defaults to <repo>/.jax_cache)."""
+    import os
+    cache_dir = os.environ.get(
+        "JAX_CACHE_DIR",
+        os.environ.get("BC_JAX_CACHE_DIR",
+                       str(Path(__file__).resolve().parents[1] / ".jax_cache")),
+    )
+    jax.config.update("jax_compilation_cache_dir", cache_dir)
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
+    print(f"JAX persistent compile cache: {cache_dir}", flush=True)
+
+
 def main() -> None:
     from .accel import setup_accelerator
     setup_accelerator()  # CPU / GPU / TPU — pins matmul precision for backend parity
+    _enable_compile_cache()
 
     args  = parse_args()
     cfg   = load_train_config(args.config)
+
+    # Optional matmul-precision override (e.g. "default"/"bfloat16" to unlock
+    # bf16 tensor cores on H100). Safe to set here: it's only a config flag, and
+    # nothing has been compiled yet (build_train_state / rollout compile below).
+    if getattr(cfg.ppo, "matmul_precision", ""):
+        jax.config.update("jax_default_matmul_precision", cfg.ppo.matmul_precision)
+        print(f"matmul precision override: {cfg.ppo.matmul_precision}", flush=True)
+
     N     = cfg.ppo.num_envs if cfg.ppo.num_envs > 0 else 10
     cfg.ppo.num_envs = N
     K     = cfg.env.candidate_count
@@ -118,7 +175,8 @@ def main() -> None:
     if resume:
         with open(resume, "rb") as f:
             ckpt = pickle.load(f)
-        restored = {"params": jax.tree_util.tree_map(jnp.asarray, ckpt["params"])}
+        ckpt_params = jax.tree_util.tree_map(jnp.asarray, ckpt["params"])
+        restored = {"params": _restore_params(train_state.params, ckpt_params)}
         if "opt_state" in ckpt:
             restored_opt = jax.tree_util.tree_map(jnp.asarray, ckpt["opt_state"])
             # Only reuse the saved optimizer state if it matches the current
@@ -245,7 +303,7 @@ def main() -> None:
             if cfg.eval_opponents and update % cfg.eval_update_interval == 0:
                 eval_results = run_eval(train_state.params, cfg)
                 for opp, wr in eval_results.items():
-                    print(f"  eval vs {opp}: win_rate={wr:.3f}")
+                    print(f"  eval vs {opp}: win_rate={wr:.3f}", flush=True)
 
             # ── Logging ───────────────────────────────────────────────────────
             if update % cfg.log_every == 0:
@@ -263,7 +321,9 @@ def main() -> None:
                     f" entropy={metrics['entropy']:.3f}"
                     f" clip={metrics['clip_fraction']:.3f}"
                     f"  {elapsed:.0f}s ({updates_per_s:.2f} updates/s, {update_time:.1f}s/update)"
-                    f"  [collect={t_collect:.2f}s batch={t_batch:.2f}s ppo={t_ppo:.2f}s]"
+                    f"  [collect={t_collect:.2f}s batch={t_batch:.2f}s ppo={t_ppo:.2f}s]",
+                    flush=True,  # else stdout block-buffers to the slurm file and
+                                 # progress is invisible for ~1-2h (buffer ~4-8KB)
                 )
                 if use_wandb:
                     import wandb

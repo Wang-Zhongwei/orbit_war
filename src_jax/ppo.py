@@ -20,11 +20,47 @@ class TrainState(train_state.TrainState):
     """Thin subclass — makes isinstance checks easier."""
 
 
+def _adam(lr: float, wd: float):
+    return optax.adamw(lr, weight_decay=wd) if wd > 0.0 else optax.adam(lr)
+
+
+def _policy_value_labels(params):
+    """Label every leaf 'value' or 'policy' by its top-level module name.
+
+    With separate encoders the flax module name partitions the tree cleanly:
+    value_encoder / value_xsrc / value_head -> 'value'; everything else
+    (policy_*, score*) -> 'policy'. NOTE: with model.shared_backbone=True there
+    is no value_encoder/value_xsrc, so only value_head falls under 'value' and
+    the shared backbone trains at the policy lr — i.e. value_lr governs the value
+    HEAD only. (With value_stop_grad=True the value loss never reaches the
+    backbone anyway, so this is consistent.)
+    Uses tree_map_with_path so the returned label tree keeps the exact container
+    types/structure optax.multi_transform expects.
+    """
+    def label(path, _leaf):
+        # path like (DictKey('params'), DictKey('value_encoder'), ...)
+        names = [getattr(k, "key", None) for k in path]
+        module = names[1] if len(names) > 1 and names[0] == "params" else (
+            names[0] if names else None)
+        return "value" if isinstance(module, str) and module.startswith("value_") else "policy"
+    return jax.tree_util.tree_map_with_path(label, params)
+
+
 def build_train_state(cfg, seed: int = 0) -> TrainState:
     module = build_policy(cfg)
     params = init_params(module, seed)
     wd = cfg.ppo.weight_decay
-    opt = optax.adamw(cfg.ppo.lr, weight_decay=wd) if wd > 0.0 else optax.adam(cfg.ppo.lr)
+    value_lr = getattr(cfg.ppo, "value_lr", 0.0)
+    if value_lr and value_lr > 0.0:
+        # Separate LR for the (fresh) value branch vs the (BC-pretrained) policy
+        # branch. A single global-norm clip is applied across both before the
+        # per-group Adam updates, matching the single-optimizer path.
+        opt = optax.multi_transform(
+            {"policy": _adam(cfg.ppo.lr, wd), "value": _adam(value_lr, wd)},
+            _policy_value_labels,
+        )
+    else:
+        opt = _adam(cfg.ppo.lr, wd)
     tx = optax.chain(
         optax.clip_by_global_norm(cfg.ppo.max_grad_norm),
         opt,
@@ -162,20 +198,13 @@ def _ppo_update_jit(
     GLOB_DIM = gf.shape[-1]
     K        = cm.shape[-1]
 
-    # Precompute ref policy logits for the full batch once (outside any loop).
-    # Avoids epochs×n_mb redundant forward passes when KL regularisation is active.
-    if use_kl:
-        gf_exp_full  = jnp.broadcast_to(gf[:, None, :], (B, MAX_SRC, GLOB_DIM))
-        ref_out_full = jax.vmap(
-            lambda sf_i, cf_i, gf_i, cm_i, sv_i: state.apply_fn(
-                ref_params, sf_i, cf_i, gf_i, cm_i, sv_i
-            )
-        )(sf, cf, gf_exp_full, cm, sv)
-        ref_tgt_all = _safe_target_logits(
-            ref_out_full.target_logits.reshape(B * MAX_SRC, K)
-        ).reshape(B, MAX_SRC, K)
-    else:
-        ref_tgt_all = None
+    # Reference (frozen) policy logits for the KL term are computed PER MINIBATCH
+    # inside mb_step (see below), not for the whole batch at once. The full-batch
+    # forward materialises the transformer's attention activations for all B rows
+    # simultaneously (~hundreds of GiB at num_envs×rollout_steps), which OOMs even
+    # an 80 GB H100. Per-minibatch caps the footprint at the same size as the
+    # policy forward, at the cost of recomputing the (forward-only, frozen) ref
+    # pass epochs×n_mb times — cheap relative to the policy forward+backward.
 
     # Pre-split one key per epoch so the scan carries only the TrainState.
     key, *epoch_keys = jax.random.split(key, epochs + 1)
@@ -185,6 +214,21 @@ def _ppo_update_jit(
     def mb_step(state: TrainState, idx: jax.Array) -> tuple[TrainState, jax.Array]:
         """idx: [mb] int32 — row indices into the full batch."""
         sv_mb = sv[idx]
+
+        # Frozen reference logits for this minibatch only (forward-only; ref_params
+        # is a constant w.r.t. the differentiated params, so no grad flows here).
+        if use_kl:
+            gf_exp_r = jnp.broadcast_to(gf[idx][:, None, :], (mb, MAX_SRC, GLOB_DIM))
+            ref_out_mb = jax.vmap(
+                lambda sf_i, cf_i, gf_i, cm_i, sv_i: state.apply_fn(
+                    ref_params, sf_i, cf_i, gf_i, cm_i, sv_i
+                )
+            )(sf[idx], cf[idx], gf_exp_r, cm[idx], sv_mb)
+            ref_tgt_mb = _safe_target_logits(
+                ref_out_mb.target_logits.reshape(mb * MAX_SRC, K)
+            )
+        else:
+            ref_tgt_mb = None
 
         def _fwd(params):
             gf_exp = jnp.broadcast_to(gf[idx][:, None, :], (mb, MAX_SRC, GLOB_DIM))
@@ -215,9 +259,8 @@ def _ppo_update_jit(
             em = (ent * valid_m).sum() / n_v
 
             if use_kl:
-                ref_tgt = ref_tgt_all[idx].reshape(mb * MAX_SRC, K)
                 new_tgt = _safe_target_logits(flat_out.target_logits)
-                kl      = (_categorical_kl(ref_tgt, new_tgt).reshape(mb, MAX_SRC) * valid_m).sum() / n_v
+                kl      = (_categorical_kl(ref_tgt_mb, new_tgt).reshape(mb, MAX_SRC) * valid_m).sum() / n_v
             else:
                 kl = jnp.float32(0.0)
 

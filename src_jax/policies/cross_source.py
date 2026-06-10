@@ -187,6 +187,12 @@ def build(cfg) -> CrossSourcePolicy:
     Architecture dispatch (``cfg.model.arch``) lives in ``policies/__init__.py``;
     this just builds the net. ``init_params`` is the package-level generic.
     """
+    if getattr(cfg.model, "shared_backbone", False):
+        raise NotImplementedError(
+            "model.shared_backbone is only supported by the entity_* arches "
+            "(the cross_source net fuses its backbone into each head). "
+            "Set arch=entity_mlp/entity_deep_mlp or shared_backbone=false."
+        )
     return CrossSourcePolicy(
         self_dim        = self_feature_dim(),
         candidate_dim   = candidate_feature_dim(),

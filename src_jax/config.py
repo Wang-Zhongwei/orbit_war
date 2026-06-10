@@ -69,6 +69,19 @@ class ModelConfig:
     ff_dim: int = 0          # 0 → default to 2 * hidden_size at build time
     value_queries: int = 4
     score_blocks: int = 2    # residual head depth (entity_deep_mlp only)
+    # Shared-backbone option (entity_* arches only). When True the value head
+    # reuses the policy backbone (encoder + cross-source mixer) instead of its
+    # own separate encoder — one encode pass instead of two, halving backbone
+    # params/compute. The two heads stay separate. A BC checkpoint trained with
+    # separate encoders loads cleanly: its policy_encoder/policy_xsrc become the
+    # shared backbone and the (always-cold) value_encoder/value_xsrc are dropped
+    # by the partial-restore loader; no BC retraining needed.
+    shared_backbone: bool = False
+    # When sharing the backbone, stop the value loss gradient from flowing into
+    # it, so the backbone is shaped only by the policy objective (recovers the
+    # original "value update doesn't perturb the action head" property while
+    # still saving the second encode). No effect unless shared_backbone=True.
+    value_stop_grad: bool = False
 
     def __setstate__(self, state) -> None: _setstate(self, state)
 
@@ -86,10 +99,23 @@ class PPOConfig:
     ent_coef: float = 0.05
     vf_coef: float = 0.5
     kl_coef: float = 0.0
-    lr: float = 3e-4
+    lr: float = 3e-4           # policy-branch (and default) learning rate
+    # Separate LR for the value branch. The policy and value branches share no
+    # weights, so they can be optimized independently. When warm-starting from a
+    # BC checkpoint the policy head is pretrained (wants a small lr) while the
+    # value head is randomly initialized (wants a larger lr to catch up). 0.0 =
+    # disabled: the whole network uses `lr` (a single optimizer, as before).
+    value_lr: float = 0.0
     weight_decay: float = 0.0  # AdamW decoupled weight decay; 0.0 = plain Adam
     max_grad_norm: float = 0.5
     augment: bool = False
+    # Matmul compute precision for the GPU forward/backward (overrides the
+    # backend default set in accel.py). "" = leave the backend default ("high"
+    # = TF32 on GPU). "default"/"bfloat16" = single-pass bf16 — much higher
+    # throughput on H100 tensor cores; params/optimizer state stay float32, only
+    # the matmul interiors run in bf16. "high" = TF32, "highest" = full float32.
+    # bf16 trades a little numerical accuracy; watch value_loss / explained_var.
+    matmul_precision: str = ""
     fleet_penalty:        float = 0.0    # per-fleet dispatch penalty (0 = disabled)
     capture_bonus:        float = 0.0    # per-planet capture bonus (0 = disabled)
     capture_time_weight:  float = 0.5    # extra bonus fraction awarded for early captures

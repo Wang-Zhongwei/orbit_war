@@ -26,9 +26,12 @@ from .backbone import EntityEncoder, CrossSourceMixer, MultiQueryValueHead
 class _EntityBackbonePolicy(nn.Module):
     """Shared encode + value plumbing; subclasses implement ``_score``.
 
-    Policy and value branches use fully separate encoders (no shared weights),
-    matching the upstream ActorCritic's split between action heads and the
-    ValueHead.
+    By default the policy and value branches use fully separate encoders (no
+    shared weights), matching the upstream ActorCritic's split between action
+    heads and the ValueHead. With ``shared_backbone=True`` the value head reuses
+    the policy backbone (encoder + cross-source mixer) and only the heads stay
+    separate — one encode pass instead of two. ``value_stop_grad`` then controls
+    whether the value loss is allowed to reshape that shared backbone.
     """
 
     self_dim: int
@@ -40,6 +43,8 @@ class _EntityBackbonePolicy(nn.Module):
     n_layers: int = 2
     ff_dim: int = 256
     value_queries: int = 4
+    shared_backbone: bool = False
+    value_stop_grad: bool = False
 
     def _score(
         self,
@@ -73,14 +78,26 @@ class _EntityBackbonePolicy(nn.Module):
         # Finite floor (not -inf) keeps entropy / log_softmax NaN-free.
         target_logits = jnp.where(candidate_mask, target_logits, MASK_LOGIT)
 
-        # ── Value branch (separate parameters) ────────────────────────────
-        v_self, v_global, v_cand = EntityEncoder(
-            d_model=H, n_layers=self.n_layers, n_heads=self.n_heads, ff_dim=self.ff_dim,
-            name="value_encoder",
-        )(self_features, global_features, candidate_features, candidate_mask)
-        v_self = CrossSourceMixer(d_model=H, n_heads=self.n_heads, name="value_xsrc")(
-            v_self, src_valid
-        )
+        # ── Value branch ──────────────────────────────────────────────────
+        if self.shared_backbone:
+            # Reuse the policy backbone embeddings (no value_encoder/value_xsrc
+            # params). Optionally detach so the value loss can't reshape the
+            # shared backbone — the value head still trains, the backbone is
+            # driven only by the policy objective.
+            v_self, v_global, v_cand = p_self, p_global, p_cand
+            if self.value_stop_grad:
+                v_self   = jax.lax.stop_gradient(v_self)
+                v_global = jax.lax.stop_gradient(v_global)
+                v_cand   = jax.lax.stop_gradient(v_cand)
+        else:
+            # Fully separate value encoder (default).
+            v_self, v_global, v_cand = EntityEncoder(
+                d_model=H, n_layers=self.n_layers, n_heads=self.n_heads, ff_dim=self.ff_dim,
+                name="value_encoder",
+            )(self_features, global_features, candidate_features, candidate_mask)
+            v_self = CrossSourceMixer(d_model=H, n_heads=self.n_heads, name="value_xsrc")(
+                v_self, src_valid
+            )
         value = MultiQueryValueHead(
             d_model=H, n_queries=self.value_queries, n_heads=self.n_heads, hidden=H,
             name="value_head",
@@ -146,6 +163,8 @@ def _common_kwargs(cfg) -> dict:
         n_layers        = getattr(cfg.model, "n_layers", 2),
         ff_dim          = ff_dim,
         value_queries   = getattr(cfg.model, "value_queries", 4),
+        shared_backbone = getattr(cfg.model, "shared_backbone", False),
+        value_stop_grad = getattr(cfg.model, "value_stop_grad", False),
     )
 
 
