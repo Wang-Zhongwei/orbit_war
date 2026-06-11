@@ -6,8 +6,8 @@ Both constants live at module scope in src_jax.features and are read at trace
 time (jnp.arange / range), so monkeypatching them before _make_env_encoder()
 fully bakes the new horizon into the compiled encoder. We time the full batched
 encoder (jit+vmap over N envs) at each (OUT, IN) setting and report the per-tick
-delta. moving_blockers stays OFF (the production path) to isolate the horizon
-cost.
+delta. Moving-blocker (rotating planet + comet) detection is always on, so the
+numbers include its swept scan at each horizon.
 
 Run on a GPU node.
 """
@@ -42,7 +42,6 @@ def _bench(state, players, K, n_envs, out_ticks, in_ticks):
     features.MAX_TICKS_OUT = out_ticks
     features.MAX_TICKS_IN = in_ticks
     cfg = EnvConfig(candidate_count=K)
-    cfg.moving_blockers = False
     enc = features._make_env_encoder(K, cfg)
     f = lambda: enc(state, players)
     jax.block_until_ready(f())
@@ -74,7 +73,7 @@ def main():
         ("OUT-only (OUT=60, IN=30)", 60, 30),
         ("IN-only  (OUT=30, IN=45)", 30, 45),
     ]
-    print("\n=== encoder wall-time (moving_blockers OFF) ===", flush=True)
+    print("\n=== encoder wall-time ===", flush=True)
     results = {}
     for label, ot, it in settings:
         dt, per = _bench(state, players, K, N_ENVS, ot, it)
