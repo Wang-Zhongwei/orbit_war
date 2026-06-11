@@ -4,7 +4,8 @@ encoder's _find_angle_single.
 The encoder normally treats only *static* planets as flight-path blockers
 (positions frozen at launch). _find_angle_single grew an optional
 `moving_blockers` path that also walks the fleet forward tick-by-tick and tests
-it against every rotating planet's time-varying position
+it against every rotating planet's time-varying position and every comet's
+exact future waypoint, incl. scheduled future spawns
 (O(MAX_TICKS_OUT * MAX_PLANETS) per [src, tgt] pair).
 
 This times the *full* batched encoder (jit+vmap over N envs) both ways on the

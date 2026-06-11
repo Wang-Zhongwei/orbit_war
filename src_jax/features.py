@@ -17,10 +17,12 @@ import jax.numpy as jnp
 
 from .physics import (
     EnvState, MAX_PLANETS, MAX_BASE_PLANETS, MAX_FLEETS,
+    N_COMET_GROUPS, COMET_PER_GROUP, COMET_SLOT_BASE, MAX_PATH_LEN,
     _fleet_speed,
 )
 from .constants import (
-    CENTER, LAUNCH_SURFACE_EPS, ROTATION_RADIUS_LIMIT, SUN_RADIUS,
+    CENTER, COMET_RADIUS, COMET_SPAWN_STEPS, LAUNCH_SURFACE_EPS,
+    ROTATION_RADIUS_LIMIT, SUN_RADIUS,
 )
 
 MIN_SOURCE_SHIPS: int = 10
@@ -72,6 +74,55 @@ def global_feature_dim() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Comet future positions (for the moving-blocker scan)
+# ---------------------------------------------------------------------------
+
+N_COMET_SLOTS: int = N_COMET_GROUPS * COMET_PER_GROUP
+
+
+def _comet_future_positions(
+    state: EnvState, n_ticks: int
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Exact per-tick future comet positions over the next n_ticks.
+
+    Comets advance one waypoint per tick along pre-computed paths, so the
+    position at future tick t is just comet_paths[gi, sj, idx + t] — no
+    approximation. Never-spawned groups are included too (spawn steps are
+    deterministic): they enter at waypoint 0 on their spawn step, so a fleet
+    whose flight crosses a path a comet group will occupy mid-flight is
+    flagged. A comet is inactive outside [0, path_len) or once dead.
+
+    Returns (fut_x, fut_y, fut_active), each [n_ticks, N_COMET_SLOTS].
+    """
+    ticks = jnp.arange(1, n_ticks + 1, dtype=jnp.int32)             # [T]
+    idx_g = state.comet_path_idx                                     # [N_CG]
+    spawn = jnp.asarray(COMET_SPAWN_STEPS, dtype=jnp.int32)          # [N_CG]
+    step  = state.step.astype(jnp.int32)
+    # Future path index per group: spawned groups advance from their current
+    # idx; never-spawned (-2) reach idx 0 on the step where step+t == spawn.
+    base  = jnp.where(idx_g >= -1, idx_g, step - spawn)              # [N_CG]
+    idx_t = base[None, :] + ticks[:, None]                           # [T, N_CG]
+
+    xs, ys, acts = [], [], []
+    for gi in range(N_COMET_GROUPS):
+        it   = idx_t[:, gi]                                          # [T]
+        it_c = jnp.clip(it, 0, MAX_PATH_LEN - 1)
+        # The whole group is deactivated once its *shortest* member's path is
+        # exhausted (_deactivate_comet_slots), so every member is active for
+        # idx in [0, min_len) — not its own path length.
+        g_act = (it >= 0) & (it < jnp.min(state.comet_path_lens[gi]))
+        for sj in range(COMET_PER_GROUP):
+            slot = COMET_SLOT_BASE + gi * COMET_PER_GROUP + sj
+            # Spawned comets may already be dead (fleet combat); unspawned
+            # ones must NOT be gated on p_alive (still False pre-spawn).
+            act = g_act & jnp.where(idx_g[gi] >= -1, state.p_alive[slot], True)
+            xs.append(state.comet_paths[gi, sj, it_c, 0])
+            ys.append(state.comet_paths[gi, sj, it_c, 1])
+            acts.append(act)
+    return jnp.stack(xs, axis=1), jnp.stack(ys, axis=1), jnp.stack(acts, axis=1)
+
+
+# ---------------------------------------------------------------------------
 # Core JAX kernel: find angle + blocking for a single (src, tgt) pair
 # ---------------------------------------------------------------------------
 
@@ -91,6 +142,10 @@ def _find_angle_single(
     all_p_r: jnp.ndarray,
     all_p_alive: jnp.ndarray,
     all_p_is_comet: jnp.ndarray,  # [MAX_PLANETS] bool — comets excluded as blockers
+    moving_blockers: bool = False,  # static arg: also treat rotating planets as time-varying blockers
+    comet_fut: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray] | None = None,
+    # ^ optional (fut_x, fut_y, fut_active), each [MAX_TICKS_OUT, N_COMET_SLOTS]
+    #   from _comet_future_positions — comets join the moving-blocker scan
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Return (angle float32, is_blocked bool, eta_ticks float32) for this (src, tgt) pair.
 
@@ -238,6 +293,67 @@ def _find_angle_single(
     is_blocked = no_intercept | jnp.where(rotating, rot_blk, static_blk)
     static_eta = d_s / jnp.maximum(spd, jnp.float32(1e-6))
     eta_ticks  = jnp.where(use_rot, rot_tick, static_eta)
+
+    # --- Optional: time-varying (rotating planet + comet) blocking -------
+    # The checks above only treat *static* planets as blockers (positions
+    # frozen at launch). A rotating planet can drift onto the flight path —
+    # and a comet can cross it — by the time the fleet reaches it. This walks
+    # the fleet forward tick-by-tick and, at each tick, tests the fleet point
+    # against every rotating planet's *current-for-that-tick* position and,
+    # when comet_fut is given, every comet's exact waypoint for that tick.
+    # O(MAX_TICKS_OUT * MAX_PLANETS) per pair.
+    if moving_blockers:
+        eta_f   = eta_ticks
+        c_a     = jnp.cos(angle)
+        s_a     = jnp.sin(angle)
+        # rotating, alive, non-comet planets, excluding src/tgt themselves.
+        # (Comets are covered by the comet_fut waypoint lookup instead.)
+        mv_mask = (
+            all_p_alive
+            & ~all_p_is_comet
+            & ~is_static_p
+            & (planet_slots != src_slot)
+            & (planet_slots != tgt_slot)
+        )
+        r_sq    = all_p_r ** 2
+        p_c     = jnp.cos(angular_velocity)
+        p_s     = jnp.sin(angular_velocity)
+        comet_r_sq = jnp.float32(COMET_RADIUS * COMET_RADIUS)
+
+        def _mv_body(carry, xs):
+            blk, px, py = carry
+            if comet_fut is not None:
+                t, cf_x, cf_y, cf_act = xs
+            else:
+                t = xs
+            # advance planet positions one angular step about CENTER
+            ddx = px - CENTER
+            ddy = py - CENTER
+            px2 = CENTER + p_c * ddx - p_s * ddy
+            py2 = CENTER + p_s * ddx + p_c * ddy
+            t_f = t.astype(jnp.float32)
+            # fleet point at tick t along the aim ray, from the launch surface
+            fx  = src_x + (src_radius + LAUNCH_SURFACE_EPS + spd * t_f) * c_a
+            fy  = src_y + (src_radius + LAUNCH_SURFACE_EPS + spd * t_f) * s_a
+            active = t_f <= eta_f
+            hit = active & jnp.any(
+                mv_mask & ((px2 - fx) ** 2 + (py2 - fy) ** 2 <= r_sq)
+            )
+            if comet_fut is not None:
+                hit = hit | (active & jnp.any(
+                    cf_act & ((cf_x - fx) ** 2 + (cf_y - fy) ** 2 <= comet_r_sq)
+                ))
+            return (blk | hit, px2, py2), None
+
+        ticks = jnp.arange(1, MAX_TICKS_OUT + 1, dtype=jnp.int32)
+        scan_xs = (ticks,) + comet_fut if comet_fut is not None else ticks
+        (mv_blk, _, _), _ = jax.lax.scan(
+            _mv_body,
+            (jnp.bool_(False), all_p_x, all_p_y),
+            scan_xs,
+        )
+        is_blocked = is_blocked | mv_blk
+
     return angle, is_blocked, eta_ticks
 
 
@@ -416,6 +532,11 @@ def _make_env_encoder(K: int, env_cfg):
             f"Unknown env.cand_select={cand_select!r}; expected 'category' or 'knn'"
         )
 
+    # When True, _find_angle_single also treats rotating planets and comets
+    # (exact future waypoints, incl. scheduled future spawns) as time-varying
+    # blockers (more accurate, more expensive). Default False = static-only.
+    moving_blockers = bool(getattr(env_cfg, "moving_blockers", False))
+
     board_size           = jnp.float32(BOARD_SIZE)
     max_ships            = jnp.float32(env_cfg.max_ships)
     max_production       = jnp.float32(MAX_PRODUCTION)
@@ -440,6 +561,13 @@ def _make_env_encoder(K: int, env_cfg):
         # Fleet size = full src_ships so speed is known exactly. The iterative
         # intercept solver checks sun + static-planet blocking — no re-aim
         # needed after policy output.
+        # Comet future positions are state-only (shared by every pair), so
+        # compute them once here and close over them in the vmapped kernel.
+        comet_fut = (
+            _comet_future_positions(state, MAX_TICKS_OUT)
+            if moving_blockers else None
+        )
+
         def _row(src_slot, tgt_slots_row, n_ships):
             def _pair(tgt_slot):
                 return _find_angle_single(
@@ -447,6 +575,8 @@ def _make_env_encoder(K: int, env_cfg):
                     state.p_x[tgt_slot], state.p_y[tgt_slot], state.p_radius[tgt_slot], tgt_slot,
                     n_ships.astype(jnp.float32), state.angular_velocity,
                     state.p_x, state.p_y, state.p_radius, state.p_alive, state.p_is_comet,
+                    moving_blockers,
+                    comet_fut,
                 )
             return jax.vmap(_pair)(tgt_slots_row)
 
@@ -671,7 +801,7 @@ def _make_env_encoder(K: int, env_cfg):
         would_be_mine_5  = (owner_5_all[safe_slots]  == player).astype(jnp.float32)    # [MAX_SRC, K]
         would_be_mine_10 = (owner_10_all[safe_slots] == player).astype(jnp.float32)    # [MAX_SRC, K]
         would_be_mine_15 = (owner_15_all[safe_slots] == player).astype(jnp.float32)    # [MAX_SRC, K]
-        would_be_mine_30 = (owner_final[safe_slots]  == player).astype(jnp.float32)    # [MAX_SRC, K]
+        would_be_mine_final = (owner_final[safe_slots]  == player).astype(jnp.float32)    # [MAX_SRC, K]
 
         # ── Nearby-planet reachability features ─────────────────────────────
         # For each candidate target, sum garrison ships from my/enemy planets
@@ -797,8 +927,8 @@ def _make_env_encoder(K: int, env_cfg):
             opp_inbound_10_ships,                                              # [15] enemy inbound (10-tick)
             my_inbound_15_ships,                                               # [16] friendly inbound (15-tick)
             opp_inbound_15_ships,                                              # [17] enemy inbound (15-tick)
-            my_inbound_ships,                                                  # [18] friendly inbound (30-tick)
-            opp_inbound_ships,                                                 # [19] enemy inbound (30-tick)
+            my_inbound_ships,                                                  # [18] friendly inbound (MAX_TICKS_IN-tick)
+            opp_inbound_ships,                                                 # [19] enemy inbound (MAX_TICKS_IN-tick)
             # ── nearby planets ──────────────────────────────────────────────
             my_nearby_5_ships,                                                 # [20] my garrison reachable in 5 ticks
             enemy_nearby_5_ships,                                              # [21] enemy garrison reachable in 5 ticks
@@ -810,7 +940,7 @@ def _make_env_encoder(K: int, env_cfg):
             would_be_mine_5,                                                   # [26] will be mine after 5-tick sim
             would_be_mine_10,                                                  # [27] will be mine after 10-tick sim
             would_be_mine_15,                                                  # [28] will be mine after 15-tick sim
-            would_be_mine_30,                                                  # [29] will be mine after 30-tick sim
+            would_be_mine_final,                                                  # [29] will be mine after MAX_TICKS_IN
         ], axis=2).at[:, 0, :].set(0.0)  # [MAX_SRC, K, 30]; no-op slot = zeros
 
         return _EncodedTurn(
