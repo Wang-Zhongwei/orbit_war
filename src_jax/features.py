@@ -10,6 +10,8 @@ Encodes observations for all envs in one JIT+vmap call:
 """
 from __future__ import annotations
 
+import os
+
 from typing import NamedTuple
 
 import jax
@@ -92,9 +94,12 @@ def _comet_future_positions(
     whose flight crosses a path a comet group will occupy mid-flight is
     flagged. A comet is inactive outside [0, path_len) or once dead.
 
-    Returns (fut_x, fut_y, fut_active), each [n_ticks, N_COMET_SLOTS].
+    Row 0 is the *current* tick (t=0), so consecutive rows give the
+    waypoint-to-waypoint segment a comet sweeps during each future tick.
+
+    Returns (fut_x, fut_y, fut_active), each [n_ticks + 1, N_COMET_SLOTS].
     """
-    ticks = jnp.arange(1, n_ticks + 1, dtype=jnp.int32)             # [T]
+    ticks = jnp.arange(0, n_ticks + 1, dtype=jnp.int32)             # [T+1]
     idx_g = state.comet_path_idx                                     # [N_CG]
     spawn = jnp.asarray(COMET_SPAWN_STEPS, dtype=jnp.int32)          # [N_CG]
     step  = state.step.astype(jnp.int32)
@@ -144,8 +149,9 @@ def _find_angle_single(
     all_p_is_comet: jnp.ndarray,  # [MAX_PLANETS] bool — comets excluded as blockers
     moving_blockers: bool = False,  # static arg: also treat rotating planets as time-varying blockers
     comet_fut: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray] | None = None,
-    # ^ optional (fut_x, fut_y, fut_active), each [MAX_TICKS_OUT, N_COMET_SLOTS]
-    #   from _comet_future_positions — comets join the moving-blocker scan
+    # ^ optional (fut_x, fut_y, fut_active), each [MAX_TICKS_OUT+1, N_COMET_SLOTS]
+    #   (row 0 = now) from _comet_future_positions — comets join the
+    #   moving-blocker scan as swept waypoint-to-waypoint segments
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Return (angle float32, is_blocked bool, eta_ticks float32) for this (src, tgt) pair.
 
@@ -279,33 +285,36 @@ def _find_angle_single(
     blk_l = _seg_blocked(el_x, el_y)
     blk_r = _seg_blocked(er_x, er_y)
 
-    # Prefer center; fall back to left then right. Blocked iff all three fail.
-    static_ang = jnp.where(~blk_c, ang_c, jnp.where(~blk_l, ang_l, ang_r))
-    static_blk = blk_c & blk_l & blk_r
-
     # --- Rotating case: single blocking check at predicted intercept point ---
     rot_end_x = jnp.where(use_rot, rot_tx, tgt_x)
     rot_end_y = jnp.where(use_rot, rot_ty, tgt_y)
     rot_blk   = _seg_blocked(rot_end_x, rot_end_y)
 
-    # --- Final selection ---
-    angle      = jnp.where(use_rot, rot_angle, static_ang)
-    is_blocked = no_intercept | jnp.where(rotating, rot_blk, static_blk)
-    static_eta = d_s / jnp.maximum(spd, jnp.float32(1e-6))
-    eta_ticks  = jnp.where(use_rot, rot_tick, static_eta)
-
     # --- Optional: time-varying (rotating planet + comet) blocking -------
-    # The checks above only treat *static* planets as blockers (positions
-    # frozen at launch). A rotating planet can drift onto the flight path —
-    # and a comet can cross it — by the time the fleet reaches it. This walks
-    # the fleet forward tick-by-tick and, at each tick, tests the fleet point
-    # against every rotating planet's *current-for-that-tick* position and,
-    # when comet_fut is given, every comet's exact waypoint for that tick.
+    # _seg_blocked above is exact for the sun and static planets over the
+    # *whole* chord (flights can far outlast the scan horizon), so those stay
+    # on the chord check. Movers get the engine's swept-segment test
+    # (_swept_pair_hit_batch math), fleet segment vs blocker segment per tick,
+    # evaluated for ALL candidate rays — the per-angle results merge into
+    # blk_c/l/r and rot_blk BEFORE angle selection, so a mover blocking the
+    # center ray no longer hides a clear tangent ray.
     # O(MAX_TICKS_OUT * MAX_PLANETS) per pair.
     if moving_blockers:
-        eta_f   = eta_ticks
-        c_a     = jnp.cos(angle)
-        s_a     = jnp.sin(angle)
+        spd_safe = jnp.maximum(spd, jnp.float32(1e-6))
+        # 4 candidate rays: center / left / right tangents + rotating intercept.
+        ang4 = jnp.stack([ang_c, ang_l, ang_r,
+                          jnp.where(use_rot, rot_angle, center_ang)])      # [4]
+        c_a4 = jnp.cos(ang4)
+        s_a4 = jnp.sin(ang4)
+        # Per-ray flight time in ticks (distance to first contact / speed).
+        eta4 = jnp.stack([
+            jnp.hypot(ec_x - src_x, ec_y - src_y) / spd_safe,
+            jnp.hypot(el_x - src_x, el_y - src_y) / spd_safe,
+            jnp.hypot(er_x - src_x, er_y - src_y) / spd_safe,
+            jnp.where(use_rot, rot_tick, d_s / spd_safe),
+        ])                                                                  # [4]
+        launch = src_radius + LAUNCH_SURFACE_EPS
+
         # rotating, alive, non-comet planets, excluding src/tgt themselves.
         # (Comets are covered by the comet_fut waypoint lookup instead.)
         mv_mask = (
@@ -320,10 +329,25 @@ def _find_angle_single(
         p_s     = jnp.sin(angular_velocity)
         comet_r_sq = jnp.float32(COMET_RADIUS * COMET_RADIUS)
 
+        def _swept_hit(fx0, fy0, fx1, fy1, pax, pay, pbx, pby, r2, mask):
+            """[4] bool: min distance² between the fleet segment (per ray) and
+            each blocker's segment over this tick is within the radius —
+            same quadratic as the engine's _swept_pair_hit_batch."""
+            d0x = fx0 - pax
+            d0y = fy0 - pay
+            dvx = (fx1 - fx0) - (pbx - pax)
+            dvy = (fy1 - fy0) - (pby - pay)
+            a = dvx * dvx + dvy * dvy
+            b = 2.0 * (d0x * dvx + d0y * dvy)
+            c = d0x * d0x + d0y * d0y
+            t = jnp.clip(-b / (2.0 * a + 1e-30), 0.0, 1.0)
+            min_d2 = c + (b + a * t) * t
+            return jnp.any(mask & (min_d2 <= r2), axis=-1)
+
         def _mv_body(carry, xs):
-            blk, px, py = carry
+            blk4, px, py = carry
             if comet_fut is not None:
-                t, cf_x, cf_y, cf_act = xs
+                t, pcx, pcy, pca, ccx, ccy, cca = xs
             else:
                 t = xs
             # advance planet positions one angular step about CENTER
@@ -332,27 +356,57 @@ def _find_angle_single(
             px2 = CENTER + p_c * ddx - p_s * ddy
             py2 = CENTER + p_s * ddx + p_c * ddy
             t_f = t.astype(jnp.float32)
-            # fleet point at tick t along the aim ray, from the launch surface
-            fx  = src_x + (src_radius + LAUNCH_SURFACE_EPS + spd * t_f) * c_a
-            fy  = src_y + (src_radius + LAUNCH_SURFACE_EPS + spd * t_f) * s_a
-            active = t_f <= eta_f
-            hit = active & jnp.any(
-                mv_mask & ((px2 - fx) ** 2 + (py2 - fy) ** 2 <= r_sq)
-            )
+            # fleet segment over this tick, per ray, from the launch surface
+            d0  = launch + spd * (t_f - 1.0)
+            d1  = launch + spd * t_f
+            fx0 = (src_x + d0 * c_a4)[:, None]                       # [4, 1]
+            fy0 = (src_y + d0 * s_a4)[:, None]
+            fx1 = (src_x + d1 * c_a4)[:, None]
+            fy1 = (src_y + d1 * s_a4)[:, None]
+            # include the partial landing tick: segment t-1 → t flies iff
+            # the fleet hasn't landed before this tick started
+            active4 = (t_f - 1.0) < eta4                              # [4]
+            hit4 = _swept_hit(fx0, fy0, fx1, fy1,
+                              px[None, :], py[None, :],
+                              px2[None, :], py2[None, :],
+                              r_sq[None, :], mv_mask[None, :])
             if comet_fut is not None:
-                hit = hit | (active & jnp.any(
-                    cf_act & ((cf_x - fx) ** 2 + (cf_y - fy) ** 2 <= comet_r_sq)
-                ))
-            return (blk | hit, px2, py2), None
+                # comet segment = waypoint(t-1) → waypoint(t); requiring BOTH
+                # ends active skips the spawn tick, mirroring the engine's
+                # check_col=False on first placement.
+                hit4 = hit4 | _swept_hit(fx0, fy0, fx1, fy1,
+                                         pcx[None, :], pcy[None, :],
+                                         ccx[None, :], ccy[None, :],
+                                         comet_r_sq, (pca & cca)[None, :])
+            return (blk4 | (active4 & hit4), px2, py2), None
 
         ticks = jnp.arange(1, MAX_TICKS_OUT + 1, dtype=jnp.int32)
-        scan_xs = (ticks,) + comet_fut if comet_fut is not None else ticks
-        (mv_blk, _, _), _ = jax.lax.scan(
+        if comet_fut is not None:
+            cf_x, cf_y, cf_act = comet_fut  # [MAX_TICKS_OUT + 1, NC], row 0 = now
+            scan_xs = (ticks,
+                       cf_x[:-1], cf_y[:-1], cf_act[:-1],
+                       cf_x[1:],  cf_y[1:],  cf_act[1:])
+        else:
+            scan_xs = ticks
+        (mv_blk4, _, _), _ = jax.lax.scan(
             _mv_body,
-            (jnp.bool_(False), all_p_x, all_p_y),
+            (jnp.zeros(4, dtype=jnp.bool_), all_p_x, all_p_y),
             scan_xs,
         )
-        is_blocked = is_blocked | mv_blk
+        blk_c   = blk_c   | mv_blk4[0]
+        blk_l   = blk_l   | mv_blk4[1]
+        blk_r   = blk_r   | mv_blk4[2]
+        rot_blk = rot_blk | mv_blk4[3]
+
+    # Prefer center; fall back to left then right. Blocked iff all three fail.
+    static_ang = jnp.where(~blk_c, ang_c, jnp.where(~blk_l, ang_l, ang_r))
+    static_blk = blk_c & blk_l & blk_r
+
+    # --- Final selection ---
+    angle      = jnp.where(use_rot, rot_angle, static_ang)
+    is_blocked = no_intercept | jnp.where(rotating, rot_blk, static_blk)
+    static_eta = d_s / jnp.maximum(spd, jnp.float32(1e-6))
+    eta_ticks  = jnp.where(use_rot, rot_tick, static_eta)
 
     return angle, is_blocked, eta_ticks
 
@@ -535,7 +589,11 @@ def _make_env_encoder(K: int, env_cfg):
     # When True, _find_angle_single also treats rotating planets and comets
     # (exact future waypoints, incl. scheduled future spawns) as time-varying
     # blockers (more accurate, more expensive). Default False = static-only.
-    moving_blockers = bool(getattr(env_cfg, "moving_blockers", False))
+    # ORBIT_MOVING_BLOCKERS=1 enables it for configs that lack the field
+    # (e.g. checkpoints trained before the flag existed) — A/B at inference.
+    moving_blockers = bool(getattr(env_cfg, "moving_blockers", False)) or bool(
+        int(os.environ.get("ORBIT_MOVING_BLOCKERS", "0"))
+    )
 
     board_size           = jnp.float32(BOARD_SIZE)
     max_ships            = jnp.float32(env_cfg.max_ships)
