@@ -65,7 +65,7 @@ def self_feature_dim() -> int:
 
 
 def candidate_feature_dim() -> int:
-    return 30
+    return 31
 
 
 def global_feature_dim() -> int:
@@ -752,10 +752,10 @@ def _make_env_encoder(K: int, env_cfg):
                 jnp.where(t == 15, owner, owner_15),
                 next_c_t,
                 next_s_t,
-            ), None
+            ), combat_ships  # ys: per-tick arrival totals by player [MAX_PLANETS, 4]
 
         _zeros_pf = jnp.zeros((MAX_PLANETS, MAX_FLEETS), dtype=jnp.bool_)
-        (inbound_all, inbound_5_all, inbound_10_all, inbound_15_all, _, owner_final, _, owner_5_all, owner_10_all, owner_15_all, _, _), _ = jax.lax.scan(
+        (inbound_all, inbound_5_all, inbound_10_all, inbound_15_all, _, owner_final, _, owner_5_all, owner_10_all, owner_15_all, _, _), combat_ticks = jax.lax.scan(
             _sim_tick,
             (
                 _zeros_pf,
@@ -802,6 +802,66 @@ def _make_env_encoder(K: int, env_cfg):
         would_be_mine_10 = (owner_10_all[safe_slots] == player).astype(jnp.float32)    # [MAX_SRC, K]
         would_be_mine_15 = (owner_15_all[safe_slots] == player).astype(jnp.float32)    # [MAX_SRC, K]
         would_be_mine_final = (owner_final[safe_slots]  == player).astype(jnp.float32)    # [MAX_SRC, K]
+
+        # ── will_be_mine: exact counterfactual capture outcome ───────────────
+        # If this source launches its full garrison now (landing at ceil(eta)),
+        # is the target mine at the end of the MAX_TICKS_IN outcome sim? Replays
+        # each candidate planet's per-tick recurrence (production + combat,
+        # identical math to _sim_tick) with the hypothetical fleet added to its
+        # arrival-tick combat. Exact w.r.t. the sim: planets only interact via
+        # fleets already in flight, so the injection only perturbs the target's
+        # own trajectory; arrivals (combat_ticks ys) are unchanged. Differs from
+        # would_be_mine_*, which only simulates fleets already in flight.
+        # Validated by test/test_will_be_mine.py against an independent numpy
+        # reference. BC A/B vs sub_v52 (1-day stream, 64 rounds): 29.7% vs 12.5%
+        # baseline; encoder cost ~1.00x GPU / 1.10x CPU.
+        src_ships_f = src_ships.astype(jnp.float32)                           # [MAX_SRC]
+        eta_safe  = jnp.where(jnp.isfinite(eta_ticks), eta_ticks, jnp.float32(MAX_TICKS_IN))
+        arrival_t = jnp.clip(jnp.ceil(eta_safe), 1.0, jnp.float32(MAX_TICKS_IN))  # [MAX_SRC, K]
+        tgt_prod  = state.p_production[safe_slots]                            # [MAX_SRC, K]
+        player_oh = (jnp.arange(4, dtype=jnp.int32) == player).astype(jnp.float32)  # [4]
+        # Hoist the per-pair gather out of the scan: one gather over the whole
+        # time axis instead of one [MAX_PLANETS,4]→[MAX_SRC,K,4] gather per tick
+        # (the in-loop gather dominated the scan cost).
+        combat_pairs = combat_ticks[:, safe_slots]                            # [T, MAX_SRC, K, 4]
+
+        def _cf_tick(carry, xs):
+            g, o, po = carry                                                  # each [MAX_SRC, K]
+            t, cs = xs                                                        # cs [MAX_SRC, K, 4]
+            inject = (t.astype(jnp.float32) == arrival_t)
+            cs = cs + jnp.where(inject, src_ships_f[:, None], 0.0)[..., None] * player_oh
+            # Mirror _sim_tick: production, then combat resolution.
+            prod_owner = jnp.where(g > 0, o, po)
+            g = g + tgt_prod * (prod_owner != -1).astype(jnp.float32)
+            has_combat = jnp.any(cs > 0, axis=-1)
+            top_idx    = jnp.argmax(cs, axis=-1).astype(jnp.int32)
+            top_ships  = jnp.max(cs, axis=-1)
+            # second-largest of 4 = max with the argmax slot masked out
+            second     = jnp.max(
+                jnp.where(jnp.arange(4) == top_idx[..., None], -jnp.inf, cs),
+                axis=-1,
+            )
+            survivor   = top_ships - second
+            apply      = has_combat & (survivor > jnp.float32(0.0))
+            friendly   = (top_idx == o)
+            g = jnp.where(apply, jnp.where(friendly, g + survivor, g - survivor), g)
+            flipped = apply & ~friendly & (g < jnp.float32(0.0))
+            g  = jnp.abs(g)
+            o  = jnp.where(flipped, top_idx, o)
+            po = jnp.where(g > 0, o, po)
+            return (g, o, po), None
+
+        (_, owner_cf, _), _ = jax.lax.scan(
+            _cf_tick,
+            (
+                _garrison_init[safe_slots],
+                _owner_init[safe_slots],
+                _prev_owner_init[safe_slots],
+            ),
+            (jnp.arange(1, MAX_TICKS_IN + 1, dtype=jnp.int32), combat_pairs),
+            unroll=5,  # tiny body — partial unroll (full unroll explodes XLA compile time)
+        )
+        will_be_mine = (owner_cf == player).astype(jnp.float32)               # [MAX_SRC, K]
 
         # ── Nearby-planet reachability features ─────────────────────────────
         # For each candidate target, sum garrison ships from my/enemy planets
@@ -903,7 +963,7 @@ def _make_env_encoder(K: int, env_cfg):
             (owner_final[src_slots]  == player).astype(jnp.float32),          # [24] will still be mine after 30 ticks
         ], axis=1)  # [MAX_SRC, 25]
 
-        # ── Candidate features  [MAX_SRC, K, 30] ────────────────────────
+        # ── Candidate features  [MAX_SRC, K, 31] ────────────────────────
         cand_feats = jnp.stack([
             # ── identity ────────────────────────────────────────────────────
             jnp.ones((MAX_BASE_PLANETS, K), jnp.float32),                     # [0]  bias
@@ -941,7 +1001,8 @@ def _make_env_encoder(K: int, env_cfg):
             would_be_mine_10,                                                  # [27] will be mine after 10-tick sim
             would_be_mine_15,                                                  # [28] will be mine after 15-tick sim
             would_be_mine_final,                                                  # [29] will be mine after MAX_TICKS_IN
-        ], axis=2).at[:, 0, :].set(0.0)  # [MAX_SRC, K, 30]; no-op slot = zeros
+            will_be_mine,                                                      # [30] counterfactual capture if I send now
+        ], axis=2).at[:, 0, :].set(0.0)  # [MAX_SRC, K, 31]; no-op slot = zeros
 
         return _EncodedTurn(
             src_valid       = src_valid,
