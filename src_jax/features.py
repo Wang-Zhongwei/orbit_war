@@ -24,8 +24,18 @@ from .constants import (
 )
 
 MIN_SOURCE_SHIPS: int = 10
-MAX_TICKS_OUT: int = 30
-MAX_TICKS_IN: int = 30
+# Horizons widened to match the measured flight-time distribution (test/flight_time_by_owner.py):
+#   * Rotating-intercept scan was truncating reachable far targets — neutral p95=65,
+#     enemy p95=47 flight ticks, but the scan only searched 30. Raised to 60 so far
+#     rotating targets are no longer falsely marked blocked (un-hides expansion/attack candidates).
+#   * Inbound / would-be-mine outcome sim: enemy->capture p95=32, p99=63, so a 30-tick
+#     outcome horizon missed the slow-capture tail. Raised to 45 (the final/"30" buckets
+#     now look 45 ticks ahead) to cover ~98% of captures.
+# Validated by BC A/B vs sub_v52 on June data: OUT=60/IN=45 = 67.2% (43/64) win-rate,
+# vs OUT=60/IN=30 = 50.0% (32/64) — the IN=45 slow-capture coverage is worth its cost.
+# MAX_TICKS_OUT widening is ~free; MAX_TICKS_IN dominates encoder time (1.49x at IN=45).
+MAX_TICKS_OUT: int = 60
+MAX_TICKS_IN: int = 45
 
 # ---------------------------------------------------------------------------
 # Time-varying per-owner candidate quota (fractions of the K-1 real candidate
