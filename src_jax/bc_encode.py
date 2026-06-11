@@ -21,7 +21,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .bc_data import POOL_K, SHARD_DIR_NAME, encode_to_shards
+from .bc_data import POOL_K, encode_to_shards, is_shard_dir_name
 from .config import TrainConfig, load_train_config
 from .features import _make_env_encoder
 
@@ -30,12 +30,12 @@ def _find_episode_dirs(root: Path) -> list[Path]:
     """Return every subdirectory under ``root`` that holds raw episode files.
 
     A directory qualifies if it directly contains a ``*.zip`` or ``*.json``
-    episode file. The generated ``shards/`` subdirectory is ignored so re-runs
-    don't treat already-encoded output as a new episode dir.
+    episode file. Any generated ``shards``/``shards_<tag>`` subdirectory is ignored
+    so re-runs don't treat already-encoded output as a new episode dir.
     """
     dirs: list[Path] = []
     for path in sorted(root.rglob("*")):
-        if not path.is_dir() or path.name == SHARD_DIR_NAME:
+        if not path.is_dir() or is_shard_dir_name(path.name):
             continue
         if any(path.glob("*.zip")) or any(path.glob("*.json")):
             dirs.append(path)
@@ -63,9 +63,15 @@ def main() -> None:
                         help="Worker processes for parallel encoding. -1=all CPUs, 1=single-threaded (default: -1)")
     parser.add_argument("--num_shards", type=int, default=None,
                         help="Stop after writing this many shards (useful for quick tests).")
+    parser.add_argument("--shard_tag", default=None,
+                        help="Feature-experiment version: write to episodes/<date>/shards_<tag>/ "
+                             "instead of .../shards/. Defaults to cfg.bc.shard_tag from --config. "
+                             "Train with the matching cfg.bc.shard_tag.")
     args = parser.parse_args()
 
     cfg = load_train_config(args.config) if args.config is not None else TrainConfig()
+    # CLI overrides the config; fall back to cfg.bc.shard_tag so a YAML can carry it.
+    shard_tag = args.shard_tag if args.shard_tag is not None else cfg.bc.shard_tag
 
     # Shards are encoded once at the fixed K-pool size (POOL_K) and re-sliced to the
     # training K offline via assemble_for_k — so the encoded pool is decoupled from
@@ -94,6 +100,7 @@ def main() -> None:
             workers=args.workers,
             encode_fn_factory=_make_env_encoder,
             encode_fn_factory_args=(POOL_K, cfg.env),
+            shard_tag=shard_tag,
         )
         print(f"Done → {shard_dir}")
 

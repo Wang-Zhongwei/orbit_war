@@ -726,6 +726,22 @@ def concat_samples(sample_list: list[dict[str, np.ndarray]]) -> dict[str, np.nda
 
 SHARD_DIR_NAME = "shards"
 
+
+def shard_dir_name(tag: str = "") -> str:
+    """Subdirectory name holding the encoded shards for a date dir.
+
+    Empty tag -> the default ``"shards"``. A non-empty tag isolates a
+    feature-experiment version as ``"shards_<tag>"`` so multiple encodings can
+    coexist under one ``episodes/<date>/`` dir without overwriting each other.
+    """
+    return SHARD_DIR_NAME if not tag else f"{SHARD_DIR_NAME}_{tag}"
+
+
+def is_shard_dir_name(name: str) -> bool:
+    """True if ``name`` is a shard output dir (default ``shards`` or any tagged
+    ``shards_<tag>``) — used to skip shard dirs during episode discovery."""
+    return name == SHARD_DIR_NAME or name.startswith(SHARD_DIR_NAME + "_")
+
 # Module-level state populated by each worker process via Pool initializer.
 _worker_encode_fn = None
 
@@ -788,11 +804,14 @@ def encode_to_shards(
     workers: int = -1,
     encode_fn_factory=None,
     encode_fn_factory_args: tuple = (),
+    shard_tag: str = "",
 ) -> Path:
     """Encode all episodes in episodes_dir and write sharded .npz files.
 
     Skips if shards already exist unless force=True. Returns the shard directory.
     num_shards limits how many shards are written (useful for quick tests).
+    shard_tag selects the output subdir (episodes_dir/shards_<tag>); empty = the
+    default episodes_dir/shards. Use it to keep feature-experiment versions apart.
 
     workers=-1 uses all available CPUs via multiprocessing. workers=1 (or 0) runs
     single-threaded. For workers>1 you must pass encode_fn_factory and
@@ -802,7 +821,7 @@ def encode_to_shards(
     All players are always encoded; winner/loser weighting is handled at train time
     via BCConfig.loser_weight using the per-sample ``reward`` field in each shard.
     """
-    shard_dir = episodes_dir / SHARD_DIR_NAME
+    shard_dir = episodes_dir / shard_dir_name(shard_tag)
     if not force and any(shard_dir.glob("*.npz")):
         print(f"Shards already exist in {shard_dir} — skipping (use --force to re-encode)")
         return shard_dir
@@ -925,15 +944,19 @@ def _flush_shard(shard_dir: Path, idx: int, buffer: list[dict[str, np.ndarray]])
              **concat_samples(buffer))
 
 
-def find_shards(episodes_dirs: list[Path]) -> list[Path]:
-    """Return all shard .npz paths across the given date directories."""
+def find_shards(episodes_dirs: list[Path], shard_tag: str = "") -> list[Path]:
+    """Return all shard .npz paths across the given date directories.
+
+    shard_tag picks the version subdir (shards_<tag>); empty = default shards.
+    """
+    suffix = f" --shard_tag {shard_tag}" if shard_tag else ""
     paths: list[Path] = []
     for d in episodes_dirs:
-        shard_dir = d / SHARD_DIR_NAME
+        shard_dir = d / shard_dir_name(shard_tag)
         if not shard_dir.is_dir() or not any(shard_dir.glob("*.npz")):
             raise FileNotFoundError(
                 f"No shards found in {shard_dir}. "
-                f"Run: python -m src_jax.bc_encode --episodes_dir {d}"
+                f"Run: python -m src_jax.bc_encode --episodes_dir {d}{suffix}"
             )
         paths.extend(sorted(shard_dir.glob("*.npz")))
     return paths
