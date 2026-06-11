@@ -121,6 +121,12 @@ class BCConfig:
     # Empty -> use the latest shard date present in the run (so the newest day = weight 1).
     recency_ref_date: str = ""
     use_shard: bool = False
+    # Feature-experiment shard version. Shards live in episodes/<date>/shards_<tag>/
+    # instead of the default episodes/<date>/shards/ when set. Lets several encodings
+    # (e.g. different feature horizons) coexist under one date dir without overwriting.
+    # bc_encode writes to and bc_train reads from this same tag, so set it identically
+    # for the pair. Empty = the default "shards" dir (backward compatible).
+    shard_tag: str = ""
     # Cap shards loaded per date directory (shard mode). 0 = use all. Useful for fast
     # screening sweeps: keeps every date represented (unlike top_k_episodes, which
     # truncates from the earliest dates) while bounding total compute.

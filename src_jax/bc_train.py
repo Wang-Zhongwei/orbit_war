@@ -49,13 +49,14 @@ import optax
 
 from .augment import DEFAULT_AUG_IDS, expand_with_augmentations
 from .bc_data import (
-    SHARD_DIR_NAME,
     _episode_avg_score,
     _iter_episode_jsons,
     _load_avg_score_map,
     assemble_for_k,
     find_shards,
     is_pool_shard,
+    is_shard_dir_name,
+    shard_dir_name,
     shard_episode_counts,
 )
 from .config import TrainConfig, load_train_config
@@ -344,8 +345,9 @@ def train(
         episodes_dirs,
         include_shard_dirs=True,
         recursive=recursive,
+        shard_tag=bc.shard_tag,
     )
-    shard_paths = find_shards(episodes_dirs)
+    shard_paths = find_shards(episodes_dirs, bc.shard_tag)
     if bc.max_shards_per_date > 0:
         kept: list[Path] = []
         per_date: dict[str, int] = {}
@@ -543,18 +545,19 @@ def _resolve_episode_dirs(
     *,
     include_shard_dirs: bool = False,
     recursive: bool = False,
+    shard_tag: str = "",
 ) -> list[Path]:
     """Auto-expand dirs that contain no episode files directly but have dated subdirs.
 
     A subdir qualifies if it directly holds a ``*.zip``/``*.json`` episode file.
     With ``include_shard_dirs=True`` (shard-based training), a subdir also qualifies
-    if it has an encoded ``shards/`` directory — so already-encoded dates whose raw
-    zip has since been deleted are still picked up.
+    if it has an encoded ``shards``/``shards_<tag>`` directory (per shard_tag) — so
+    already-encoded dates whose raw zip has since been deleted are still picked up.
     """
     def _qualifies(p: Path) -> bool:
         if any(p.glob("*.zip")) or any(p.glob("*.json")):
             return True
-        return include_shard_dirs and (p / SHARD_DIR_NAME).is_dir()
+        return include_shard_dirs and (p / shard_dir_name(shard_tag)).is_dir()
 
     resolved: list[Path] = []
     for d in episodes_dirs:
@@ -565,7 +568,7 @@ def _resolve_episode_dirs(
         if recursive:
             subdirs = [
                 child for child in sorted(d.rglob("*"))
-                if child.is_dir() and child.name != SHARD_DIR_NAME and _qualifies(child)
+                if child.is_dir() and not is_shard_dir_name(child.name) and _qualifies(child)
             ]
             if subdirs:
                 print(f"  recursive-discovered under {d}: {[str(s) for s in subdirs]}", flush=True)
