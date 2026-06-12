@@ -61,6 +61,8 @@ _v51_mod = _load_submission("stateful_v5.1")
 _v52_mod = _load_submission("stateful_v5.2")
 _v6_mod = _load_submission("ppo_from_bc_loser0")
 _v7_mod = _load_submission("ppo_low_kl_v7")
+_v8_mod = _load_submission("sub_v8")
+_v81_mod = _load_submission("sub_v8.1")
 
 
 def sub_stateful_v2(obs) -> list:
@@ -91,6 +93,14 @@ def sub_ppo_low_kl_v7(obs) -> list:
     return _v7_mod.agent(obs)
 
 
+def sub_v8_agent(obs) -> list:
+    return _v8_mod.agent(obs)
+
+
+def sub_v81_agent(obs) -> list:
+    return _v81_mod.agent(obs)
+
+
 # ---------------------------------------------------------------------------
 # Agent registry
 # ---------------------------------------------------------------------------
@@ -118,6 +128,8 @@ AGENTS: dict[str, object] = {
     "sub_v52":    sub_stateful_v52,
     "sub_v6":     sub_ppo_from_bc_loser0,
     "sub_v7":     sub_ppo_low_kl_v7,
+    "sub_v8":     sub_v8_agent,
+    "sub_v81":    sub_v81_agent,
     "exp30":      exp30_agent,
     "random":     _make_random_opponent(),
 }
