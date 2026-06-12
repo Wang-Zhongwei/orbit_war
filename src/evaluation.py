@@ -59,6 +59,8 @@ _v3_mod = _load_submission("stateful_v3")
 _v5_mod = _load_submission("stateful_v5")
 _v51_mod = _load_submission("stateful_v5.1")
 _v52_mod = _load_submission("stateful_v5.2")
+_v6_mod = _load_submission("ppo_from_bc_loser0")
+_v7_mod = _load_submission("ppo_low_kl_v7")
 
 
 def sub_stateful_v2(obs) -> list:
@@ -79,6 +81,14 @@ def sub_stateful_v51(obs) -> list:
 
 def sub_stateful_v52(obs) -> list:
     return _v52_mod.agent(obs)
+
+
+def sub_ppo_from_bc_loser0(obs) -> list:
+    return _v6_mod.agent(obs)
+
+
+def sub_ppo_low_kl_v7(obs) -> list:
+    return _v7_mod.agent(obs)
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +116,8 @@ AGENTS: dict[str, object] = {
     "sub_v5":     sub_stateful_v5,
     "sub_v51":    sub_stateful_v51,
     "sub_v52":    sub_stateful_v52,
+    "sub_v6":     sub_ppo_from_bc_loser0,
+    "sub_v7":     sub_ppo_low_kl_v7,
     "exp30":      exp30_agent,
     "random":     _make_random_opponent(),
 }

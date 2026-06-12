@@ -2,7 +2,7 @@
 #SBATCH --job-name=ppo_train
 #SBATCH --output=/home/018270239/orbit_war/jobs/logs/ppo_train-%j.out
 #SBATCH --error=/home/018270239/orbit_war/jobs/logs/ppo_train-%j.err
-#SBATCH --time=8:00:00
+#SBATCH --time=10:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --partition=gpuqs
@@ -53,23 +53,16 @@ export OMP_NUM_THREADS="${_NCPU}"
 export OPENBLAS_NUM_THREADS="${_NCPU}"
 export MKL_NUM_THREADS="${_NCPU}"
 
-REPO_ROOT="/home/018270239/orbit_war"
+REPO_ROOT="/home/018270239/orbit_war_v7arch"
 cd "${REPO_ROOT}"
 echo "Running from: ${REPO_ROOT}"
 echo "Host: $(hostname) | GPU: ${CUDA_VISIBLE_DEVICES:-?}"
 nvidia-smi -L || true
 
 CONFIG="${CONFIG:-configs/ppo_from_bc_loser0.yaml}"
-RESUME="${RESUME:-./artifacts/bc/sweep_loser_0_0/ckpt_000001_shard1700.pkl}"
-
-if [[ ! -f "${RESUME}" ]]; then
-  echo "ERROR: resume checkpoint not found: ${RESUME}" >&2
-  exit 1
-fi
 
 args=()
 args+=(--config "${CONFIG}")
-args+=(--resume "${RESUME}")
 [[ -n "${RUN_NAME:-}"      ]] && args+=(--run_name      "${RUN_NAME}")
 [[ -n "${TOTAL_UPDATES:-}" ]] && args+=(--total_updates "${TOTAL_UPDATES}")
 [[ -n "${REF_POLICY:-}"    ]] && args+=(--ref_policy    "${REF_POLICY}")
