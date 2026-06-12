@@ -736,7 +736,7 @@ def _make_env_encoder(K: int, env_cfg):
         tick_rot_s = jnp.sin(state.angular_velocity)
 
         def _sim_tick(carry, t):
-            acc, acc_5, acc_10, acc_15, garrison, owner, prev_owner, owner_5, owner_10, owner_15, c_t, s_t = carry
+            acc, acc_5, acc_10, acc_20, garrison, owner, prev_owner, owner_5, owner_10, owner_20, c_t, s_t = carry
             t_f  = t.astype(jnp.float32)
             fx_t = state.f_x + t_f * f_vx_1d                              # [MAX_FLEETS]
             fy_t = state.f_y + t_f * f_vy_1d
@@ -784,19 +784,19 @@ def _make_env_encoder(K: int, env_cfg):
                 new_acc,
                 jnp.where(t <= 5,  new_acc, acc_5),
                 jnp.where(t <= 10, new_acc, acc_10),
-                jnp.where(t <= 15, new_acc, acc_15),
+                jnp.where(t <= 20, new_acc, acc_20),
                 garrison,
                 owner,
                 prev_owner,
                 jnp.where(t == 5,  owner, owner_5),
                 jnp.where(t == 10, owner, owner_10),
-                jnp.where(t == 15, owner, owner_15),
+                jnp.where(t == 20, owner, owner_20),
                 next_c_t,
                 next_s_t,
             ), combat_ships  # ys: per-tick arrival totals by player [MAX_PLANETS, 4]
 
         _zeros_pf = jnp.zeros((MAX_PLANETS, MAX_FLEETS), dtype=jnp.bool_)
-        (inbound_all, inbound_5_all, inbound_10_all, inbound_15_all, _, owner_final, _, owner_5_all, owner_10_all, owner_15_all, _, _), combat_ticks = jax.lax.scan(
+        (inbound_all, inbound_5_all, inbound_10_all, inbound_20_all, _, owner_final, _, owner_5_all, owner_10_all, owner_20_all, _, _), combat_ticks = jax.lax.scan(
             _sim_tick,
             (
                 _zeros_pf,
@@ -818,30 +818,25 @@ def _make_env_encoder(K: int, env_cfg):
         inbound_sim    = inbound_all[safe_slots]                           # [MAX_SRC, K, MAX_FLEETS]
         inbound_5_sim  = inbound_5_all[safe_slots]                        # [MAX_SRC, K, MAX_FLEETS]
         inbound_10_sim = inbound_10_all[safe_slots]                       # [MAX_SRC, K, MAX_FLEETS]
-        inbound_15_sim = inbound_15_all[safe_slots]                       # [MAX_SRC, K, MAX_FLEETS]
+        inbound_20_sim = inbound_20_all[safe_slots]                       # [MAX_SRC, K, MAX_FLEETS]
 
         f_alive_3d  = state.f_alive[None, None, :]
         is_my_3d    = (state.f_owner == player)[None, None, :]
-        is_opp_3d   = (state.f_owner != player)[None, None, :]
         inbound     = inbound_sim & f_alive_3d
 
         f_ships_clipped = jnp.clip(state.f_ships, jnp.float32(0.0), max_ships)[None, None, :]
         my_inbound_ships  = ((inbound & is_my_3d).astype(jnp.float32) * f_ships_clipped).sum(axis=2) / max_ships
-        opp_inbound_ships = ((inbound & is_opp_3d).astype(jnp.float32) * f_ships_clipped).sum(axis=2) / max_ships
 
         inbound_5  = inbound_5_sim  & f_alive_3d
         inbound_10 = inbound_10_sim & f_alive_3d
-        inbound_15 = inbound_15_sim & f_alive_3d
+        inbound_20 = inbound_20_sim & f_alive_3d
         my_inbound_5_ships   = ((inbound_5  & is_my_3d).astype(jnp.float32) * f_ships_clipped).sum(axis=2) / max_ships
-        opp_inbound_5_ships  = ((inbound_5  & is_opp_3d).astype(jnp.float32) * f_ships_clipped).sum(axis=2) / max_ships
         my_inbound_10_ships  = ((inbound_10 & is_my_3d).astype(jnp.float32) * f_ships_clipped).sum(axis=2) / max_ships
-        opp_inbound_10_ships = ((inbound_10 & is_opp_3d).astype(jnp.float32) * f_ships_clipped).sum(axis=2) / max_ships
-        my_inbound_15_ships  = ((inbound_15 & is_my_3d).astype(jnp.float32) * f_ships_clipped).sum(axis=2) / max_ships
-        opp_inbound_15_ships = ((inbound_15 & is_opp_3d).astype(jnp.float32) * f_ships_clipped).sum(axis=2) / max_ships
+        my_inbound_20_ships  = ((inbound_20 & is_my_3d).astype(jnp.float32) * f_ships_clipped).sum(axis=2) / max_ships
 
         would_be_mine_5  = (owner_5_all[safe_slots]  == player).astype(jnp.float32)    # [MAX_SRC, K]
         would_be_mine_10 = (owner_10_all[safe_slots] == player).astype(jnp.float32)    # [MAX_SRC, K]
-        would_be_mine_15 = (owner_15_all[safe_slots] == player).astype(jnp.float32)    # [MAX_SRC, K]
+        would_be_mine_20 = (owner_20_all[safe_slots] == player).astype(jnp.float32)    # [MAX_SRC, K]
         would_be_mine_final = (owner_final[safe_slots]  == player).astype(jnp.float32)    # [MAX_SRC, K]
 
         # ── will_be_mine: exact counterfactual capture outcome ───────────────
@@ -923,20 +918,19 @@ def _make_env_encoder(K: int, env_cfg):
 
         can_reach_5   = (eta_p2c <= 5)  & p_alive_3d
         can_reach_10  = (eta_p2c <= 10) & p_alive_3d
-        can_reach_15  = (eta_p2c <= 15) & p_alive_3d
-        my_nearby_5_ships     = ((can_reach_5  & is_my_p3d).astype(jnp.float32)    * p_ships_3d).sum(axis=2) / max_ships
+        can_reach_20  = (eta_p2c <= 20) & p_alive_3d
         enemy_nearby_5_ships  = ((can_reach_5  & is_enemy_p3d).astype(jnp.float32) * p_ships_3d).sum(axis=2) / max_ships
         my_nearby_10_ships    = ((can_reach_10 & is_my_p3d).astype(jnp.float32)    * p_ships_3d).sum(axis=2) / max_ships
         enemy_nearby_10_ships = ((can_reach_10 & is_enemy_p3d).astype(jnp.float32) * p_ships_3d).sum(axis=2) / max_ships
-        my_nearby_15_ships    = ((can_reach_15 & is_my_p3d).astype(jnp.float32)    * p_ships_3d).sum(axis=2) / max_ships
-        enemy_nearby_15_ships = ((can_reach_15 & is_enemy_p3d).astype(jnp.float32) * p_ships_3d).sum(axis=2) / max_ships
+        my_nearby_20_ships    = ((can_reach_20 & is_my_p3d).astype(jnp.float32)    * p_ships_3d).sum(axis=2) / max_ships
+        enemy_nearby_20_ships = ((can_reach_20 & is_enemy_p3d).astype(jnp.float32) * p_ships_3d).sum(axis=2) / max_ships
 
         # ── Self features  [MAX_SRC, 25] ────────────────────────────────
         # Inbound fleets for each source planet (gathered from simulation above).
         inbound_src    = inbound_all[src_slots]                                # [MAX_SRC, MAX_FLEETS]
         inbound_5_src  = inbound_5_all[src_slots]
         inbound_10_src = inbound_10_all[src_slots]
-        inbound_15_src = inbound_15_all[src_slots]
+        inbound_20_src = inbound_20_all[src_slots]
 
         f_alive_s = state.f_alive[None, :]                                     # [1, MAX_FLEETS]
         is_my_fs  = (state.f_owner == player)[None, :]
@@ -947,8 +941,8 @@ def _make_env_encoder(K: int, env_cfg):
         self_opp_inb_5  = ((inbound_5_src  & f_alive_s & is_opp_fs).astype(jnp.float32) * f_ships_s).sum(axis=1) / max_ships
         self_my_inb_10  = ((inbound_10_src & f_alive_s & is_my_fs).astype(jnp.float32)  * f_ships_s).sum(axis=1) / max_ships
         self_opp_inb_10 = ((inbound_10_src & f_alive_s & is_opp_fs).astype(jnp.float32) * f_ships_s).sum(axis=1) / max_ships
-        self_my_inb_15  = ((inbound_15_src & f_alive_s & is_my_fs).astype(jnp.float32)  * f_ships_s).sum(axis=1) / max_ships
-        self_opp_inb_15 = ((inbound_15_src & f_alive_s & is_opp_fs).astype(jnp.float32) * f_ships_s).sum(axis=1) / max_ships
+        self_my_inb_20  = ((inbound_20_src & f_alive_s & is_my_fs).astype(jnp.float32)  * f_ships_s).sum(axis=1) / max_ships
+        self_opp_inb_20 = ((inbound_20_src & f_alive_s & is_opp_fs).astype(jnp.float32) * f_ships_s).sum(axis=1) / max_ships
         self_my_inb_30  = ((inbound_src    & f_alive_s & is_my_fs).astype(jnp.float32)  * f_ships_s).sum(axis=1) / max_ships
         self_opp_inb_30 = ((inbound_src    & f_alive_s & is_opp_fs).astype(jnp.float32) * f_ships_s).sum(axis=1) / max_ships
 
@@ -964,13 +958,13 @@ def _make_env_encoder(K: int, env_cfg):
         p_ships_s   = jnp.clip(state.p_ships, jnp.float32(0.0), max_ships)[None, :]
         src_reach_5   = (eta_p2src <= 5)  & p_alive_s
         src_reach_10  = (eta_p2src <= 10) & p_alive_s
-        src_reach_15  = (eta_p2src <= 15) & p_alive_s
+        src_reach_20  = (eta_p2src <= 20) & p_alive_s
         self_my_near5     = ((src_reach_5  & is_my_ps).astype(jnp.float32)    * p_ships_s).sum(axis=1) / max_ships
         self_enemy_near5  = ((src_reach_5  & is_enemy_ps).astype(jnp.float32) * p_ships_s).sum(axis=1) / max_ships
         self_my_near10    = ((src_reach_10 & is_my_ps).astype(jnp.float32)    * p_ships_s).sum(axis=1) / max_ships
         self_enemy_near10 = ((src_reach_10 & is_enemy_ps).astype(jnp.float32) * p_ships_s).sum(axis=1) / max_ships
-        self_my_near15    = ((src_reach_15 & is_my_ps).astype(jnp.float32)    * p_ships_s).sum(axis=1) / max_ships
-        self_enemy_near15 = ((src_reach_15 & is_enemy_ps).astype(jnp.float32) * p_ships_s).sum(axis=1) / max_ships
+        self_my_near20    = ((src_reach_20 & is_my_ps).astype(jnp.float32)    * p_ships_s).sum(axis=1) / max_ships
+        self_enemy_near20 = ((src_reach_20 & is_enemy_ps).astype(jnp.float32) * p_ships_s).sum(axis=1) / max_ships
 
         self_feats = jnp.stack([
             # ── static ──────────────────────────────────────────────────────
@@ -986,8 +980,8 @@ def _make_env_encoder(K: int, env_cfg):
             self_opp_inb_5,                                                    # [8]  enemy inbound (5-tick)
             self_my_inb_10,                                                    # [9]  friendly inbound (10-tick)
             self_opp_inb_10,                                                   # [10] enemy inbound (10-tick)
-            self_my_inb_15,                                                    # [11] friendly inbound (15-tick)
-            self_opp_inb_15,                                                   # [12] enemy inbound (15-tick)
+            self_my_inb_20,                                                    # [11] friendly inbound (20-tick)
+            self_opp_inb_20,                                                   # [12] enemy inbound (20-tick)
             self_my_inb_30,                                                    # [13] friendly inbound (30-tick)
             self_opp_inb_30,                                                   # [14] enemy inbound (30-tick)
             # ── nearby planets ──────────────────────────────────────────────
@@ -995,12 +989,12 @@ def _make_env_encoder(K: int, env_cfg):
             self_enemy_near5,                                                  # [16] enemy garrison reachable in 5 ticks
             self_my_near10,                                                    # [17] my garrison reachable in 10 ticks
             self_enemy_near10,                                                 # [18] enemy garrison reachable in 10 ticks
-            self_my_near15,                                                    # [19] my garrison reachable in 15 ticks
-            self_enemy_near15,                                                 # [20] enemy garrison reachable in 15 ticks
+            self_my_near20,                                                    # [19] my garrison reachable in 20 ticks
+            self_enemy_near20,                                                 # [20] enemy garrison reachable in 20 ticks
             # ── prediction ──────────────────────────────────────────────────
             (owner_5_all[src_slots]  == player).astype(jnp.float32),          # [21] will still be mine after 5 ticks
             (owner_10_all[src_slots] == player).astype(jnp.float32),          # [22] will still be mine after 10 ticks
-            (owner_15_all[src_slots] == player).astype(jnp.float32),          # [23] will still be mine after 15 ticks
+            (owner_20_all[src_slots] == player).astype(jnp.float32),          # [23] will still be mine after 20 ticks
             (owner_final[src_slots]  == player).astype(jnp.float32),          # [24] will still be mine after 30 ticks
         ], axis=1)  # [MAX_SRC, 25]
 
@@ -1026,18 +1020,18 @@ def _make_env_encoder(K: int, env_cfg):
             # A/B showed ~zero target-acc/win-rate effect (redundant w/ would_be_mine).
             my_inbound_5_ships,                                                # [12] friendly inbound (5-tick)
             my_inbound_10_ships,                                               # [13] friendly inbound (10-tick)
-            my_inbound_15_ships,                                               # [14] friendly inbound (15-tick)
+            my_inbound_20_ships,                                               # [14] friendly inbound (20-tick)
             my_inbound_ships,                                                  # [15] friendly inbound (MAX_TICKS_IN-tick)
             # ── nearby planets (my_nearby_5 dropped — near-zero importance) ─
             enemy_nearby_5_ships,                                              # [16] enemy garrison reachable in 5 ticks
             my_nearby_10_ships,                                                # [17] my garrison reachable in 10 ticks
             enemy_nearby_10_ships,                                             # [18] enemy garrison reachable in 10 ticks
-            my_nearby_15_ships,                                                # [19] my garrison reachable in 15 ticks
-            enemy_nearby_15_ships,                                             # [20] enemy garrison reachable in 15 ticks
+            my_nearby_20_ships,                                                # [19] my garrison reachable in 20 ticks
+            enemy_nearby_20_ships,                                             # [20] enemy garrison reachable in 20 ticks
             # ── prediction ──────────────────────────────────────────────────
             would_be_mine_5,                                                   # [21] will be mine after 5-tick sim
             would_be_mine_10,                                                  # [22] will be mine after 10-tick sim
-            would_be_mine_15,                                                  # [23] will be mine after 15-tick sim
+            would_be_mine_20,                                                  # [23] will be mine after 20-tick sim
             would_be_mine_final,                                               # [24] will be mine after MAX_TICKS_IN
             will_be_mine,                                                      # [25] counterfactual capture if I send now
         ], axis=2).at[:, 0, :].set(0.0)  # [MAX_SRC, K, 26]; no-op slot = zeros

@@ -65,24 +65,23 @@ CAND_FEATURE_NAMES = [
     "tgt_orbit_r",           # 10
     "tgt_is_rotating",       # 11
     "my_inbound_5",          # 12
-    "opp_inbound_5",         # 13
-    "my_inbound_10",         # 14
-    "opp_inbound_10",        # 15
-    "my_inbound_15",         # 16
-    "opp_inbound_15",        # 17
-    "my_inbound_30",         # 18
-    "opp_inbound_30",        # 19
-    "my_nearby_5",           # 20
-    "enemy_nearby_5",        # 21
-    "my_nearby_10",          # 22
-    "enemy_nearby_10",       # 23
-    "my_nearby_15",          # 24
-    "enemy_nearby_15",       # 25
-    "would_be_mine_5",       # 26
-    "would_be_mine_10",      # 27
-    "would_be_mine_15",      # 28
-    "would_be_mine_final",   # 29
+    "my_inbound_10",         # 13
+    "my_inbound_20",         # 14
+    "my_inbound_45",         # 15  (MAX_TICKS_IN horizon)
+    "enemy_nearby_5",        # 16
+    "my_nearby_10",          # 17
+    "enemy_nearby_10",       # 18
+    "my_nearby_20",          # 19
+    "enemy_nearby_20",       # 20
+    "would_be_mine_5",       # 21
+    "would_be_mine_10",      # 22
+    "would_be_mine_20",      # 23
+    "would_be_mine_final",   # 24
+    "will_be_mine",          # 25
 ]
+# NB: checkpoints from before commit f1f406b used a 30/31-dim candidate layout
+# (opp_inbound_{5,10,15,30} at 13/15/17/19, my_nearby_5 at 20, 15-tick horizons);
+# for those, substitute the old name table from git history.
 
 # Global feature names (mirror src_jax/features.py global_feat stack order).
 # The june_h128 ckpt is 12-dim (no [12] n_total_planets); newer 13-dim ckpts add it.
