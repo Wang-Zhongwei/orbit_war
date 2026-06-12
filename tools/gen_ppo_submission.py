@@ -120,9 +120,18 @@ import zipfile
 # --- unpack bundled src_jax modules -----------------------------------------
 _SRC_DIR = os.path.join(tempfile.gettempdir(), "owars_ppo_src_" + _SRC_TAG)
 if not os.path.isdir(os.path.join(_SRC_DIR, "src_jax")):
-    os.makedirs(_SRC_DIR, exist_ok=True)
+    # Concurrent imports (e.g. 32 eval_mp workers) race inside extractall —
+    # zipfile's makedirs has no exist_ok. Extract to a per-process dir and
+    # atomically rename into place; losers discard their copy and use the
+    # winner's (rename only fails once a complete tree is already there).
+    _tmp_dir = _SRC_DIR + "." + str(os.getpid())
     with zipfile.ZipFile(io.BytesIO(base64.b64decode(_SRC_ZIP_B64))) as _zf:
-        _zf.extractall(_SRC_DIR)
+        _zf.extractall(_tmp_dir)
+    try:
+        os.rename(_tmp_dir, _SRC_DIR)
+    except OSError:
+        import shutil
+        shutil.rmtree(_tmp_dir, ignore_errors=True)
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
