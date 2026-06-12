@@ -38,8 +38,13 @@ BUNDLE = [
 ]
 
 
+# Repo to bundle src_jax FROM — must be the code the checkpoint was trained
+# with (param shapes follow its feature dims), not necessarily this repo.
+SRC_REPO = REPO
+
+
 def patched_source(rel: str) -> bytes:
-    src = (REPO / rel).read_text()
+    src = (SRC_REPO / rel).read_text()
     if rel == "src_jax/jax_agent.py":
         # The only line that drags in the training stack (rollout->ppo->optax).
         # GLOB_DIM is just global_feature_dim(); compute it directly.
@@ -172,14 +177,17 @@ def agent(obs):
 def main() -> None:
     import argparse
     import hashlib
-    global CKPT, OUT
+    global CKPT, OUT, SRC_REPO
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ckpt", type=Path, default=CKPT,
                         help="Path to the source PPO .pkl checkpoint.")
     parser.add_argument("--out", type=Path, default=OUT,
                         help="Path to the generated single-file submission .py.")
+    parser.add_argument("--src-repo", type=Path, default=SRC_REPO,
+                        help="Repo/worktree to bundle src_jax from; must match "
+                             "the code the checkpoint was trained with.")
     a = parser.parse_args()
-    CKPT, OUT = a.ckpt, a.out
+    CKPT, OUT, SRC_REPO = a.ckpt, a.out, a.src_repo
 
     zip_b64 = build_zip_b64()
     ckpt_b64 = build_ckpt_b64()

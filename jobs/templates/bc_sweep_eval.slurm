@@ -32,7 +32,7 @@ echo "Running from: ${REPO_ROOT}"
 
 : "${RUN_NAME:?Set RUN_NAME (must match the training run)}"
 OUT_DIR="${OUT_DIR:-artifacts/bc}"
-ROUNDS="${ROUNDS:-32}"
+ROUNDS="${ROUNDS:-64}"
 SHARD_STRIDE="${SHARD_STRIDE:-100}"
 MAX_SHARD="${MAX_SHARD:-2000}"
 RESULTS_DIR="${RESULTS_DIR:-results/sweep/${RUN_NAME}}"
