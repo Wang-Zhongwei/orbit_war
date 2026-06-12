@@ -951,6 +951,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate_count", type=int, default=None,
                         help="Override env.candidate_count K (re-sliced from the POOL_K=24 shard pool; "
                              "must be <= POOL_K). For a candidate-count sweep.")
+    parser.add_argument("--shard_tag", default=None,
+                        help="Read shards from .../shards_<tag>/ instead of .../shards/ "
+                             "(must match the tag used at encode time). Overrides cfg.bc.shard_tag.")
     parser.add_argument("--augment", default=None, action="store_true")
     parser.add_argument("--no_augment", dest="augment", action="store_false")
     # Runtime flags — accepted in both modes
@@ -994,6 +997,7 @@ def main() -> None:
     if args.run_name       is not None: bc.run_name       = args.run_name
     if args.hidden_size    is not None: cfg.model.hidden_size = args.hidden_size
     if args.candidate_count is not None: cfg.env.candidate_count = args.candidate_count
+    if args.shard_tag      is not None: bc.shard_tag      = args.shard_tag
     if args.augment        is not None: bc.augment        = args.augment
     if args.use_shard      is not None: bc.use_shard      = args.use_shard
     if args.encode_workers is not None: bc.encode_workers = args.encode_workers

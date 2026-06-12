@@ -25,6 +25,9 @@ fi
 if [[ -n "${CONFIG:-}" ]]; then
   args+=(--config "${CONFIG}")
 fi
+if [[ -n "${SHARD_TAG:-}" ]]; then
+  args+=(--shard_tag "${SHARD_TAG}")
+fi
 if [[ -n "${EPISODES_PER_SHARD:-}" ]]; then
   args+=(--episodes_per_shard "${EPISODES_PER_SHARD}")
 fi

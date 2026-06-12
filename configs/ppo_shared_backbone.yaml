@@ -11,10 +11,10 @@
 # other ppo_*.yaml configs.
 
 seed: 42
-run_name: ppo_shared_backbone
+run_name: ppo_shared_backbone_aug
 device: auto
 save_dir: ./artifacts/ppo
-checkpoint_every: 80
+checkpoint_every: 25
 log_every: 1
 
 # Warm-start params (and the frozen KL reference) come from this checkpoint.
@@ -23,13 +23,13 @@ resume: ./artifacts/bc/sweep_loser_0_0/ckpt_000001_shard1700.pkl
 
 opponents:
   - self
-self_play_update_interval: 80
+self_play_update_interval: 200
 self_play_deterministic: false
 alternate_player_sides: true
 eval_opponents:
   - sub_v52
-eval_rounds: 32
-eval_update_interval: 80
+eval_rounds: 64
+eval_update_interval: 25
 eval_workers: 32  # match --cpus-per-task in the slurm to avoid CPU oversubscription
 
 env:
@@ -54,13 +54,13 @@ ppo:
   clip_coef: 0.2
   ent_coef: 0.05
   vf_coef: 0.5
-  kl_coef: 0.1          # KL penalty toward the frozen BC policy. Main knob to tune:
+  kl_coef: 0.5          # KL penalty toward the frozen BC policy. Main knob to tune:
 
                         # raise to stay closer to BC, lower to let RL explore more.
   # Split learning rates: the policy/target head is BC-pretrained -> small lr to
   # preserve the prior; the value head is randomly initialized (BC has no value
   # loss) -> larger lr so the critic catches up before its advantages drive the
   # actor. value_lr=0 would fall back to a single optimizer at `lr`.
-  lr: 2e-4              # policy branch (policy_encoder/xsrc, score*)
+  lr: 1e-4              # policy branch (policy_encoder/xsrc, score*)
   max_grad_norm: 0.5
-  augment: false
+  augment: true

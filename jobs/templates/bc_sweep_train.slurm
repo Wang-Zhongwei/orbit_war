@@ -26,6 +26,7 @@ set -euo pipefail
 #   SKILL_CLIP_RATIO   bc.skill_clip_ratio     (config default 1.0)
 #   RECENCY_HALF_LIFE  bc.recency_half_life    (config default 14.0)
 #   LOSER_WEIGHT       bc.loser_weight         (config default 0.1)
+#   SHARD_TAG          bc.shard_tag            (read shards_<tag>/ dirs; default "" = shards/)
 #   CONFIG             base config             (default configs/bc_entity_policy_12.yaml)
 #   OUT_DIR            checkpoint root         (default artifacts/bc)
 #   EPISODE_DIRS       space-separated dirs    (default: all 2026-05-* and 2026-06-* date dirs)
@@ -71,6 +72,7 @@ args+=(--run_name "${RUN_NAME}")
 [[ -n "${SKILL_CLIP_RATIO:-}"  ]] && args+=(--skill_clip_ratio  "${SKILL_CLIP_RATIO}")
 [[ -n "${RECENCY_HALF_LIFE:-}" ]] && args+=(--recency_half_life "${RECENCY_HALF_LIFE}")
 [[ -n "${LOSER_WEIGHT:-}"      ]] && args+=(--loser_weight      "${LOSER_WEIGHT}")
+[[ -n "${SHARD_TAG:-}"         ]] && args+=(--shard_tag         "${SHARD_TAG}")
 
 echo "Running command: uv run python -m src_jax.bc_train ${args[*]}"
 uv run python -m src_jax.bc_train "${args[@]}"
