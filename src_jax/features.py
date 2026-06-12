@@ -65,7 +65,7 @@ def self_feature_dim() -> int:
 
 
 def candidate_feature_dim() -> int:
-    return 31
+    return 26
 
 
 def global_feature_dim() -> int:
@@ -1021,29 +1021,26 @@ def _make_env_encoder(K: int, env_cfg):
             state.p_production[safe_slots] / max_production,                  # [9]  production rate
             tgt_orbit_r,                                                       # [10] orbit radius
             tgt_rot_flag,                                                      # [11] is rotating
-            # ── inbound fleets ──────────────────────────────────────────────
+            # ── inbound fleets (friendly only; enemy inbound dropped) ───────
+            # opp_inbound_{5,10,15,30} removed: permutation-importance + ablation
+            # A/B showed ~zero target-acc/win-rate effect (redundant w/ would_be_mine).
             my_inbound_5_ships,                                                # [12] friendly inbound (5-tick)
-            opp_inbound_5_ships,                                               # [13] enemy inbound (5-tick)
-            my_inbound_10_ships,                                               # [14] friendly inbound (10-tick)
-            opp_inbound_10_ships,                                              # [15] enemy inbound (10-tick)
-            my_inbound_15_ships,                                               # [16] friendly inbound (15-tick)
-            opp_inbound_15_ships,                                              # [17] enemy inbound (15-tick)
-            my_inbound_ships,                                                  # [18] friendly inbound (MAX_TICKS_IN-tick)
-            opp_inbound_ships,                                                 # [19] enemy inbound (MAX_TICKS_IN-tick)
-            # ── nearby planets ──────────────────────────────────────────────
-            my_nearby_5_ships,                                                 # [20] my garrison reachable in 5 ticks
-            enemy_nearby_5_ships,                                              # [21] enemy garrison reachable in 5 ticks
-            my_nearby_10_ships,                                                # [22] my garrison reachable in 10 ticks
-            enemy_nearby_10_ships,                                             # [23] enemy garrison reachable in 10 ticks
-            my_nearby_15_ships,                                                # [24] my garrison reachable in 15 ticks
-            enemy_nearby_15_ships,                                             # [25] enemy garrison reachable in 15 ticks
+            my_inbound_10_ships,                                               # [13] friendly inbound (10-tick)
+            my_inbound_15_ships,                                               # [14] friendly inbound (15-tick)
+            my_inbound_ships,                                                  # [15] friendly inbound (MAX_TICKS_IN-tick)
+            # ── nearby planets (my_nearby_5 dropped — near-zero importance) ─
+            enemy_nearby_5_ships,                                              # [16] enemy garrison reachable in 5 ticks
+            my_nearby_10_ships,                                                # [17] my garrison reachable in 10 ticks
+            enemy_nearby_10_ships,                                             # [18] enemy garrison reachable in 10 ticks
+            my_nearby_15_ships,                                                # [19] my garrison reachable in 15 ticks
+            enemy_nearby_15_ships,                                             # [20] enemy garrison reachable in 15 ticks
             # ── prediction ──────────────────────────────────────────────────
-            would_be_mine_5,                                                   # [26] will be mine after 5-tick sim
-            would_be_mine_10,                                                  # [27] will be mine after 10-tick sim
-            would_be_mine_15,                                                  # [28] will be mine after 15-tick sim
-            would_be_mine_final,                                                  # [29] will be mine after MAX_TICKS_IN
-            will_be_mine,                                                      # [30] counterfactual capture if I send now
-        ], axis=2).at[:, 0, :].set(0.0)  # [MAX_SRC, K, 31]; no-op slot = zeros
+            would_be_mine_5,                                                   # [21] will be mine after 5-tick sim
+            would_be_mine_10,                                                  # [22] will be mine after 10-tick sim
+            would_be_mine_15,                                                  # [23] will be mine after 15-tick sim
+            would_be_mine_final,                                               # [24] will be mine after MAX_TICKS_IN
+            will_be_mine,                                                      # [25] counterfactual capture if I send now
+        ], axis=2).at[:, 0, :].set(0.0)  # [MAX_SRC, K, 26]; no-op slot = zeros
 
         return _EncodedTurn(
             src_valid       = src_valid,

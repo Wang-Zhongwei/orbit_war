@@ -1,4 +1,4 @@
-"""Correctness test for the will_be_mine candidate feature (plane 30).
+"""Correctness test for the will_be_mine candidate feature (plane 25).
 
 will_be_mine is the exact counterfactual: if the source launches its full
 garrison now (landing at ceil(eta)), is the target mine at the end of the
@@ -10,9 +10,9 @@ production, combat resolution — and the per-pair counterfactual injection.
 Validation is two-staged:
 
   1. The numpy baseline replay (no injection) must agree with the encoder's
-     own would_be_mine_final plane [29] — this proves the reference itself
+     own would_be_mine_final plane [24] — this proves the reference itself
      mirrors the sim before we trust it for the counterfactual.
-  2. The numpy counterfactual must agree with the will_be_mine plane [30].
+  2. The numpy counterfactual must agree with the will_be_mine plane [25].
 
 The arrival tick is recovered from the normalized ETA feature (plane 7), which
 roundtrips through float32 — when eta sits within EPS of an integer (always
@@ -108,7 +108,7 @@ def main() -> int:
     ap.add_argument("--n_states", type=int, default=24)
     args = ap.parse_args()
 
-    assert candidate_feature_dim() == 31
+    assert candidate_feature_dim() == 26
 
     cfg = TrainConfig()
     K = cfg.env.candidate_count
@@ -130,7 +130,7 @@ def main() -> int:
     batched = jax.tree_util.tree_map(lambda *xs: jnp.asarray(np.stack(xs)), *states)
     enc = enc_fn(batched, jnp.array(players, dtype=jnp.int32))
 
-    cf         = np.asarray(enc.cand_feats)            # [N, MAX_SRC, K, 31]
+    cf         = np.asarray(enc.cand_feats)            # [N, MAX_SRC, K, 26]
     cand_mask  = np.asarray(enc.cand_mask)
     src_valid  = np.asarray(enc.src_valid).astype(bool)
     src_slots  = np.asarray(enc.src_slots)
@@ -146,7 +146,7 @@ def main() -> int:
         p_prod  = np.asarray(s.p_production, dtype=np.float64)
         src_g   = np.round(p_ships[src_slots[n]])
 
-        # stage 1: baseline replay vs would_be_mine_final (plane 29)
+        # stage 1: baseline replay vs would_be_mine_final (plane 24)
         base_owner = {}
         for p in np.unique(cand_slots[n][src_valid[n]]):
             g0 = p_ships[p] if p_alive[p] else 0.0
@@ -158,9 +158,9 @@ def main() -> int:
                 p = cand_slots[n, i, k]
                 ref = float(base_owner[p] == player)
                 n_base += 1
-                base_mism += int(ref != cf[n, i, k, 29])
+                base_mism += int(ref != cf[n, i, k, 24])
 
-        # stage 2: counterfactual vs will_be_mine (plane 30)
+        # stage 2: counterfactual vs will_be_mine (plane 25)
         for i in np.where(src_valid[n])[0]:
             for k in range(1, K):
                 if not cand_mask[n, i, k]:
@@ -180,10 +180,10 @@ def main() -> int:
                 }
                 n_wbm += 1
                 n_skip += int(ambiguous)
-                wbm_mism += int(cf[n, i, k, 30] not in refs)
+                wbm_mism += int(cf[n, i, k, 25] not in refs)
 
-    print(f"baseline replay vs plane29: {base_mism}/{n_base} mismatches")
-    print(f"will_be_mine  vs plane30:  {wbm_mism}/{n_wbm} mismatches ({n_skip} eta-boundary, either-tick accepted)")
+    print(f"baseline replay vs plane24: {base_mism}/{n_base} mismatches")
+    print(f"will_be_mine  vs plane25:  {wbm_mism}/{n_wbm} mismatches ({n_skip} eta-boundary, either-tick accepted)")
     assert n_base > 200 and n_wbm > 200, "too few checked cells"
     assert base_mism / n_base < 0.005, "numpy reference disagrees with sim baseline"
     assert wbm_mism / n_wbm < 0.005, "will_be_mine disagrees with reference counterfactual"
