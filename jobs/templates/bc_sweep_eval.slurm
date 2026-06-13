@@ -5,7 +5,7 @@
 #SBATCH --time=04:00:00
 #SBATCH --partition=cpuqs
 #SBATCH --nodes=1
-#SBATCH --ntasks=16
+#SBATCH --ntasks=32
 #SBATCH --cpus-per-task=1
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=wang.15032@osu.edu
@@ -25,6 +25,9 @@ set -euo pipefail
 #   SHARD_STRIDE   eval every N shards     (default 100)
 #   MAX_SHARD      highest shard index to look for (default 2000)
 #   RESULTS_DIR    where match CSVs go     (default results/sweep/<RUN_NAME>)
+#   SRC_ROOT       dir whose src_jax/ matches the ckpt arch (default: REPO_ROOT).
+#                  Set to a .claude/worktrees/<wt> path if the ckpt was trained
+#                  from a worktree whose arch differs from the working repo.
 
 REPO_ROOT="/home/018270239/orbit_war"
 cd "${REPO_ROOT}"
@@ -32,6 +35,7 @@ echo "Running from: ${REPO_ROOT}"
 
 : "${RUN_NAME:?Set RUN_NAME (must match the training run)}"
 OUT_DIR="${OUT_DIR:-artifacts/bc}"
+SRC_ROOT="${SRC_ROOT:-${REPO_ROOT}}"
 ROUNDS="${ROUNDS:-64}"
 SHARD_STRIDE="${SHARD_STRIDE:-100}"
 MAX_SHARD="${MAX_SHARD:-2000}"
@@ -64,6 +68,7 @@ for ckpt in "${ckpts[@]}"; do
   uv run python arena.py tournament \
     --agents jax sub_v52 \
     --jax-checkpoint "${ckpt}" \
+    --jax-src-root "${SRC_ROOT}" \
     --rounds "${ROUNDS}" \
     --base-seed 1000 \
     --workers "${SLURM_NTASKS:-1}" \
