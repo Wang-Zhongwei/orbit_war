@@ -66,6 +66,7 @@ args+=(--config "${CONFIG}")
 [[ -n "${RUN_NAME:-}"      ]] && args+=(--run_name      "${RUN_NAME}")
 [[ -n "${TOTAL_UPDATES:-}" ]] && args+=(--total_updates "${TOTAL_UPDATES}")
 [[ -n "${REF_POLICY:-}"    ]] && args+=(--ref_policy    "${REF_POLICY}")
+[[ -n "${RESUME:-}"        ]] && args+=(--resume        "${RESUME}")
 
 echo "Running command: uv run python -m src_jax.train ${args[*]}"
 uv run python -m src_jax.train "${args[@]}"

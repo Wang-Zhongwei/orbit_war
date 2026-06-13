@@ -19,7 +19,8 @@ log_every: 1
 
 # Warm-start params (and the frozen KL reference) come from this checkpoint.
 # CLI --resume overrides this; kept here so the config is self-documenting.
-resume: ./artifacts/bc/sweep_loser_0_0/ckpt_000001_shard1700.pkl
+# resume: ./artifacts/bc/sweep_loser_0_0/ckpt_000001_shard1700.pkl
+resume: ./artifacts/bc/bc_train_v9/ckpt_000001_shard1500.pkl
 
 opponents:
   - self
@@ -43,7 +44,7 @@ model:
 ppo:
   rollout_steps: 64
   num_envs: 1024
-  total_updates: 320
+  total_updates: 200
   epochs: 4
   minibatch_size: 1024
   # bf16 matmuls in fwd/bwd (params/optimizer stay fp32). Big H100 speedup; if
@@ -52,7 +53,7 @@ ppo:
   gamma: 0.99
   gae_lambda: 1
   clip_coef: 0.2
-  ent_coef: 0.05
+  ent_coef: 0.02
   vf_coef: 0.5
   kl_coef: 0.5          # KL penalty toward the frozen BC policy. Main knob to tune:
 
