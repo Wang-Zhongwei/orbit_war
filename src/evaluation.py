@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import os
 import sys
 import time
+import warnings
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -54,15 +57,105 @@ def _load_submission(name: str):
     return mod
 
 
+# Rule-based submissions — pure-Python heuristics with no src_jax dependency, so
+# these always load and are safe to import eagerly. sub_v52 (the default PPO eval
+# opponent) lives here.
 _v2_mod = _load_submission("stateful_v2")
 _v3_mod = _load_submission("stateful_v3")
 _v5_mod = _load_submission("stateful_v5")
 _v51_mod = _load_submission("stateful_v5.1")
 _v52_mod = _load_submission("stateful_v5.2")
-_v6_mod = _load_submission("ppo_from_bc_loser0")
-_v7_mod = _load_submission("ppo_low_kl_v7")
-_v8_mod = _load_submission("sub_v8")
-_v81_mod = _load_submission("sub_v8.1")
+
+
+# ---------------------------------------------------------------------------
+# JAX/PPO submission opponents — load against a pinned worktree's src_jax
+# ---------------------------------------------------------------------------
+# Each of these submissions base64-embeds its OWN src_jax tree (v7 architecture:
+# MAX_TICKS_OUT=60 / MAX_TICKS_IN=45, 30-dim cand_proj) and at import time does
+#   importlib.import_module("src_jax.jax_agent").build_agent(...)
+# to warm-compile its agent. The catch: `import_module` returns whatever is
+# already cached in sys.modules["src_jax"]. Inside a PPO trainer's eval workers,
+# the LIVE src_jax (current 26-dim tree) is imported first (eval_mp._init_worker
+# builds the trainee agent before this module is ever imported), so the
+# submission's own `sys.path.insert(0, _SRC_DIR)` is a no-op and it builds its
+# 30-dim checkpoint against the live 26-dim encoder → flax.ScopeParamShapeError.
+# Eagerly loading them at module scope therefore used to crash the ENTIRE
+# src.evaluation import, killing every eval worker and failing the whole PPO job.
+#
+# Fix: load these opponents with the v7arch worktree pinned as the src_jax
+# resolution root — evict any live src_jax* from sys.modules, prime v7arch's
+# tree, exec the submission (its import_module now resolves to v7arch's matching
+# 30-dim tree), then restore the live tree. The built agents keep direct refs to
+# v7arch's module objects, so restoring is safe (same invariant arena.py relies
+# on). Loading is also TOLERANT: a submission that still fails (missing worktree,
+# unexpected arch) is skipped with a warning so the rule-based opponents — incl.
+# sub_v52 — always stay available and the eval never hard-crashes again.
+_V7ARCH_ROOT = Path(__file__).resolve().parent.parent / ".claude" / "worktrees" / "v7arch"
+
+_PPO_SUBMISSIONS = {
+    "sub_v6":  "ppo_from_bc_loser0",
+    "sub_v7":  "ppo_low_kl_v7",
+    "sub_v8":  "sub_v8",
+    "sub_v81": "sub_v8.1",
+}
+
+
+@contextmanager
+def _pinned_src_jax(root: Path):
+    """Temporarily make ``root``'s ``src_jax`` the only importable one.
+
+    Evicts any live ``src_jax*`` from ``sys.modules`` and prepends ``root`` to
+    ``sys.path`` so a fresh ``import src_jax`` resolves against ``root``; restores
+    the previous module objects and path on exit. Already-built agent closures
+    keep direct references to ``root``'s modules, so the restore is harmless.
+    """
+    def _srcjax_keys():
+        return [m for m in list(sys.modules) if m == "src_jax" or m.startswith("src_jax.")]
+
+    saved_mods = {m: sys.modules[m] for m in _srcjax_keys()}
+    saved_path = list(sys.path)
+    for m in saved_mods:
+        del sys.modules[m]
+    sys.path.insert(0, str(root))
+    try:
+        # Prime the pinned tree so submissions' import_module("src_jax.*") hits it.
+        importlib.import_module("src_jax.jax_agent")
+        yield
+    finally:
+        sys.path[:] = saved_path
+        for m in _srcjax_keys():
+            del sys.modules[m]
+        sys.modules.update(saved_mods)
+
+
+_ppo_sub_mods: dict[str, Any] = {}
+if _V7ARCH_ROOT.is_dir():
+    try:
+        with _pinned_src_jax(_V7ARCH_ROOT):
+            for _agent_key, _sub_file in _PPO_SUBMISSIONS.items():
+                try:
+                    _ppo_sub_mods[_agent_key] = _load_submission(_sub_file)
+                except Exception as _exc:  # ScopeParamShapeError, missing ckpt, …
+                    warnings.warn(
+                        f"src.evaluation: skipping JAX opponent {_agent_key!r} "
+                        f"({_sub_file!r}) — failed to load against the pinned "
+                        f"v7arch src_jax: {type(_exc).__name__}: {_exc}",
+                        stacklevel=2,
+                    )
+    except Exception as _exc:  # priming v7arch's src_jax failed
+        warnings.warn(
+            f"src.evaluation: could not pin v7arch src_jax at {_V7ARCH_ROOT} "
+            f"({type(_exc).__name__}: {_exc}); JAX opponents sub_v6/v7/v8/v81 "
+            f"are unavailable. Rule-based opponents (incl. sub_v52) still work.",
+            stacklevel=2,
+        )
+else:
+    warnings.warn(
+        f"src.evaluation: v7arch worktree not found at {_V7ARCH_ROOT}; JAX "
+        f"opponents sub_v6/v7/v8/v81 are unavailable. Rule-based opponents "
+        f"(incl. sub_v52) still work.",
+        stacklevel=2,
+    )
 
 
 def sub_stateful_v2(obs) -> list:
@@ -85,20 +178,10 @@ def sub_stateful_v52(obs) -> list:
     return _v52_mod.agent(obs)
 
 
-def sub_ppo_from_bc_loser0(obs) -> list:
-    return _v6_mod.agent(obs)
-
-
-def sub_ppo_low_kl_v7(obs) -> list:
-    return _v7_mod.agent(obs)
-
-
-def sub_v8_agent(obs) -> list:
-    return _v8_mod.agent(obs)
-
-
-def sub_v81_agent(obs) -> list:
-    return _v81_mod.agent(obs)
+def _make_ppo_opponent(agent_key: str):
+    """Wrap a (successfully loaded) JAX submission module as an opponent fn."""
+    mod = _ppo_sub_mods[agent_key]
+    return lambda obs: mod.agent(obs)
 
 
 # ---------------------------------------------------------------------------
@@ -126,13 +209,15 @@ AGENTS: dict[str, object] = {
     "sub_v5":     sub_stateful_v5,
     "sub_v51":    sub_stateful_v51,
     "sub_v52":    sub_stateful_v52,
-    "sub_v6":     sub_ppo_from_bc_loser0,
-    "sub_v7":     sub_ppo_low_kl_v7,
-    "sub_v8":     sub_v8_agent,
-    "sub_v81":    sub_v81_agent,
     "exp30":      exp30_agent,
     "random":     _make_random_opponent(),
 }
+
+# Register only the JAX opponents that actually loaded against the pinned v7arch
+# tree; ones that were skipped above are simply absent (callers that name them
+# get a clear KeyError instead of an import-time crash).
+for _agent_key in _ppo_sub_mods:
+    AGENTS[_agent_key] = _make_ppo_opponent(_agent_key)
 
 
 
