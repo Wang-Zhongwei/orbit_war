@@ -889,8 +889,8 @@ def _make_env_encoder(K: int, env_cfg):
         self_opp_inb_10 = ((inbound_10_src & f_alive_s & is_opp_fs).astype(jnp.float32) * f_ships_s).sum(axis=1) / max_ships
         self_my_inb_15  = ((inbound_15_src & f_alive_s & is_my_fs).astype(jnp.float32)  * f_ships_s).sum(axis=1) / max_ships
         self_opp_inb_15 = ((inbound_15_src & f_alive_s & is_opp_fs).astype(jnp.float32) * f_ships_s).sum(axis=1) / max_ships
-        self_my_inb_30  = ((inbound_src    & f_alive_s & is_my_fs).astype(jnp.float32)  * f_ships_s).sum(axis=1) / max_ships
-        self_opp_inb_30 = ((inbound_src    & f_alive_s & is_opp_fs).astype(jnp.float32) * f_ships_s).sum(axis=1) / max_ships
+        self_my_inb  = ((inbound_src    & f_alive_s & is_my_fs).astype(jnp.float32)  * f_ships_s).sum(axis=1) / max_ships
+        self_opp_inb = ((inbound_src    & f_alive_s & is_opp_fs).astype(jnp.float32) * f_ships_s).sum(axis=1) / max_ships
 
         # Nearby planets for each source planet.
         dist_p2src  = jnp.hypot(
@@ -928,8 +928,8 @@ def _make_env_encoder(K: int, env_cfg):
             self_opp_inb_10,                                                   # [10] enemy inbound (10-tick)
             self_my_inb_15,                                                    # [11] friendly inbound (15-tick)
             self_opp_inb_15,                                                   # [12] enemy inbound (15-tick)
-            self_my_inb_30,                                                    # [13] friendly inbound (30-tick)
-            self_opp_inb_30,                                                   # [14] enemy inbound (30-tick)
+            self_my_inb,                                                  # [13] friendly inbound (MAX_TICKS_IN-tick)
+            self_opp_inb,                                                 # [14] enemy inbound (MAX_TICKS_IN-tick)
             # ── nearby planets ──────────────────────────────────────────────
             self_my_near5,                                                     # [15] my garrison reachable in 5 ticks
             self_enemy_near5,                                                  # [16] enemy garrison reachable in 5 ticks
@@ -941,7 +941,7 @@ def _make_env_encoder(K: int, env_cfg):
             (owner_5_all[src_slots]  == player).astype(jnp.float32),          # [21] will still be mine after 5 ticks
             (owner_10_all[src_slots] == player).astype(jnp.float32),          # [22] will still be mine after 10 ticks
             (owner_15_all[src_slots] == player).astype(jnp.float32),          # [23] will still be mine after 15 ticks
-            (owner_final[src_slots]  == player).astype(jnp.float32),          # [24] will still be mine after 30 ticks
+            (owner_final[src_slots]  == player).astype(jnp.float32),          # [24] will still be mine after MAX_TICKS_IN ticks
         ], axis=1)  # [MAX_SRC, 25]
 
         # ── Candidate features  [MAX_SRC, K, 30] ────────────────────────
