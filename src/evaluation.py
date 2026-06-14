@@ -129,31 +129,41 @@ def _pinned_src_jax(root: Path):
 
 
 _ppo_sub_mods: dict[str, Any] = {}
+# Resolve which src_jax tree to load the 30-dim JAX opponents against. The v7arch
+# worktree is the canonical 30-dim tree when the LIVE tree differs (e.g. on main,
+# where live is 26-dim). On v7_arch the live tree is itself 30-dim, and eval
+# frequently runs from *inside* the v7arch worktree — so the nested _V7ARCH_ROOT
+# path won't exist. In that case pin to the live repo root, which is the matching
+# 30-dim tree; the eviction/priming mechanism is identical, only the root differs.
 if _V7ARCH_ROOT.is_dir():
-    try:
-        with _pinned_src_jax(_V7ARCH_ROOT):
-            for _agent_key, _sub_file in _PPO_SUBMISSIONS.items():
-                try:
-                    _ppo_sub_mods[_agent_key] = _load_submission(_sub_file)
-                except Exception as _exc:  # ScopeParamShapeError, missing ckpt, …
-                    warnings.warn(
-                        f"src.evaluation: skipping JAX opponent {_agent_key!r} "
-                        f"({_sub_file!r}) — failed to load against the pinned "
-                        f"v7arch src_jax: {type(_exc).__name__}: {_exc}",
-                        stacklevel=2,
-                    )
-    except Exception as _exc:  # priming v7arch's src_jax failed
-        warnings.warn(
-            f"src.evaluation: could not pin v7arch src_jax at {_V7ARCH_ROOT} "
-            f"({type(_exc).__name__}: {_exc}); JAX opponents sub_v6/v7/v8/v81 "
-            f"are unavailable. Rule-based opponents (incl. sub_v52) still work.",
-            stacklevel=2,
-        )
+    _pin_root = _V7ARCH_ROOT
+    _pin_desc = f"pinned v7arch src_jax at {_V7ARCH_ROOT}"
 else:
+    _pin_root = Path(__file__).resolve().parent.parent  # live repo root
+    _pin_desc = f"live src_jax at {_pin_root}"
     warnings.warn(
-        f"src.evaluation: v7arch worktree not found at {_V7ARCH_ROOT}; JAX "
-        f"opponents sub_v6/v7/v8/v81 are unavailable. Rule-based opponents "
-        f"(incl. sub_v52) still work.",
+        f"src.evaluation: v7arch worktree not found at {_V7ARCH_ROOT}; loading "
+        f"JAX opponents sub_v6/v7/v8/v81 against the {_pin_desc} instead "
+        f"(correct when the live tree is the matching 30-dim arch).",
+        stacklevel=2,
+    )
+try:
+    with _pinned_src_jax(_pin_root):
+        for _agent_key, _sub_file in _PPO_SUBMISSIONS.items():
+            try:
+                _ppo_sub_mods[_agent_key] = _load_submission(_sub_file)
+            except Exception as _exc:  # ScopeParamShapeError, missing ckpt, …
+                warnings.warn(
+                    f"src.evaluation: skipping JAX opponent {_agent_key!r} "
+                    f"({_sub_file!r}) — failed to load against the {_pin_desc}: "
+                    f"{type(_exc).__name__}: {_exc}",
+                    stacklevel=2,
+                )
+except Exception as _exc:  # priming the chosen src_jax root failed
+    warnings.warn(
+        f"src.evaluation: could not pin src_jax ({_pin_desc}) "
+        f"({type(_exc).__name__}: {_exc}); JAX opponents sub_v6/v7/v8/v81 "
+        f"are unavailable. Rule-based opponents (incl. sub_v52) still work.",
         stacklevel=2,
     )
 
