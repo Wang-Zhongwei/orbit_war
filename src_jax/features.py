@@ -39,6 +39,95 @@ MIN_SOURCE_SHIPS: int = 10
 MAX_TICKS_OUT: int = 60
 MAX_TICKS_IN: int = 45
 
+# Tick SCHEDULE for the inbound/outcome sim (the IN=45 _sim_tick scan that dominates
+# encoder cost). The sim is a sequential per-tick recurrence; cost is set by the NUMBER
+# of simulated ticks. Default = every tick 1..MAX_TICKS_IN (EXACT). A coarser schedule
+# is an APPROXIMATION: combat/arrivals inside a gap are lumped and production accrues in
+# gap-sized chunks, so inbound_* / would_be_mine_* / will_be_mine shift. A/B (BC
+# win-rate) before adopting. Each step scales production + planet-rotation by its own
+# gap dt, so NON-UNIFORM schedules are exact between the ticks they include.
+#
+# Control via env (first match wins):
+#   ORBIT_SIM_TICKS="1-20,25-45:5"   explicit: comma segments "a", "a-b", or "a-b:step"
+#   ORBIT_SIM_TICKS="anchored"       preset: exact 1..20 then 25,30,35,40,45 (thresholds
+#                                    5/10/20/45 EXACT; only the quiet tail is coarsened)
+#   ORBIT_SIM_TICK_STRIDE="2"        uniform stride (shorthand for "1-45:2")
+#   (unset)                          exact, bit-identical to the original per-tick sim
+import os as _os
+
+# Capture-outcome snapshot thresholds the policy reads (would_be_mine_{5,10,20}); the
+# scheduler force-includes these + MAX_TICKS_IN so those features are sampled exactly.
+_CRITICAL_TICKS = (5, 10, 20)
+
+
+def _parse_ticks(spec: str) -> list[int]:
+    out: list[int] = []
+    for seg in spec.split(","):
+        seg = seg.strip()
+        if not seg:
+            continue
+        step = 1
+        if ":" in seg:
+            seg, st = seg.split(":"); step = int(st)
+        if "-" in seg:
+            a, b = seg.split("-"); out += list(range(int(a), int(b) + 1, step))
+        else:
+            out.append(int(seg))
+    return out
+
+
+def schedule_from_spec(spec: str) -> tuple[int, ...]:
+    """Build a tick schedule from a spec string. "" / "exact" → every tick. "anchored"
+    → exact 1..20 then 25,30,35,40,45. Otherwise a comma spec ("1-20,25-45:5"). The
+    critical snapshot ticks (5/10/20) and the full horizon are always force-included so
+    those features are sampled at the exact tick."""
+    spec = (spec or "").strip().lower()
+    if not spec or spec in ("exact", "full", "1"):
+        return tuple(range(1, MAX_TICKS_IN + 1))          # every tick, EXACT
+    ticks = (list(range(1, 21)) + [25, 30, 35, 40, 45]) if spec == "anchored" else _parse_ticks(spec)
+    ticks += [t for t in _CRITICAL_TICKS if t <= MAX_TICKS_IN]
+    ticks.append(MAX_TICKS_IN)
+    return tuple(sorted({t for t in ticks if 1 <= t <= MAX_TICKS_IN}))
+
+
+def _build_tick_schedule() -> tuple[int, ...]:
+    spec = _os.environ.get("ORBIT_SIM_TICKS", "").strip()
+    stride = _os.environ.get("ORBIT_SIM_TICK_STRIDE", "").strip()
+    if not spec and stride and stride != "1":
+        spec = f"1-{MAX_TICKS_IN}:{stride}"
+    return schedule_from_spec(spec)
+
+
+def _dts_from_schedule(sched: tuple[int, ...]) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """dt_prod[i] = gap from the previous tick (production accrued by step i);
+    dt_rot[i] = gap to the next tick (planet-rotation advance; last entry unused)."""
+    prev = (0,) + sched[:-1]
+    dt_prod = tuple(t - p for t, p in zip(sched, prev))
+    dt_rot = tuple(sched[i + 1] - sched[i] if i + 1 < len(sched) else 0 for i in range(len(sched)))
+    return dt_prod, dt_rot
+
+
+SIM_TICK_SCHEDULE: tuple[int, ...] = _build_tick_schedule()
+SIM_TICK_DT_PROD: tuple[int, ...]
+SIM_TICK_DT_ROT: tuple[int, ...]
+SIM_TICK_DT_PROD, SIM_TICK_DT_ROT = _dts_from_schedule(SIM_TICK_SCHEDULE)
+
+
+def set_tick_schedule(ticks) -> None:
+    """Override the active schedule (for tests/probes). Patch BEFORE building the
+    encoder — _make_env_encoder reads these module globals when it traces."""
+    global SIM_TICK_SCHEDULE, SIM_TICK_DT_PROD, SIM_TICK_DT_ROT
+    SIM_TICK_SCHEDULE = tuple(ticks)
+    SIM_TICK_DT_PROD, SIM_TICK_DT_ROT = _dts_from_schedule(SIM_TICK_SCHEDULE)
+
+
+def _snap_to_sched(x: int) -> int:
+    """First scheduled tick >= x (exact when x is in the schedule, e.g. the criticals)."""
+    for t in SIM_TICK_SCHEDULE:
+        if t >= x:
+            return t
+    return SIM_TICK_SCHEDULE[-1]
+
 # ---------------------------------------------------------------------------
 # Time-varying per-owner candidate quota (fractions of the K-1 real candidate
 # slots). Linearly interpolated across a short transition window of game ticks
@@ -732,11 +821,21 @@ def _make_env_encoder(K: int, env_cfg):
         # garrison == 0 so a battle-draw planet still produces for its last owner.
         _prev_owner_init = state.p_owner.astype(jnp.int32)
 
-        tick_rot_c = jnp.cos(state.angular_velocity)
-        tick_rot_s = jnp.sin(state.angular_velocity)
+        # Tick schedule (default = every tick, exact). Each step advances by its own
+        # gap: production ×dt_prod (gap from the previous tick), planet rotation ×dt_rot
+        # (gap to the next tick). Snapshot thresholds snap onto the schedule (exact when
+        # present, which _build_tick_schedule enforces for 5/10/20/MAX_TICKS_IN).
+        _sched_t = jnp.asarray(SIM_TICK_SCHEDULE, dtype=jnp.int32)          # [T]
+        _dt_prod = jnp.asarray(SIM_TICK_DT_PROD, dtype=jnp.float32)         # [T]
+        _dt_rot  = jnp.asarray(SIM_TICK_DT_ROT, dtype=jnp.float32)          # [T]
+        _t0_av     = jnp.float32(SIM_TICK_SCHEDULE[0]) * state.angular_velocity
+        tick_rot_c = jnp.cos(_t0_av)   # rotation at the first scheduled tick
+        tick_rot_s = jnp.sin(_t0_av)
+        _T5, _T10, _T20 = _snap_to_sched(5), _snap_to_sched(10), _snap_to_sched(20)
 
-        def _sim_tick(carry, t):
+        def _sim_tick(carry, xs):
             acc, acc_5, acc_10, acc_20, garrison, owner, prev_owner, owner_5, owner_10, owner_20, c_t, s_t = carry
+            t, dt_p, dt_r = xs              # absolute tick, production gap, rotation gap
             t_f  = t.astype(jnp.float32)
             fx_t = state.f_x + t_f * f_vx_1d                              # [MAX_FLEETS]
             fy_t = state.f_y + t_f * f_vy_1d
@@ -750,7 +849,7 @@ def _make_env_encoder(K: int, env_cfg):
             # Production: any owned planet produces. When garrison == 0 (draw),
             # fall back to prev_owner so the planet keeps producing.
             prod_owner = jnp.where(garrison > 0, owner, prev_owner)
-            garrison   = garrison + state.p_production * (prod_owner != -1).astype(jnp.float32)
+            garrison   = garrison + state.p_production * dt_p * (prod_owner != -1).astype(jnp.float32)
             # Mirror _phase_resolve_combat exactly:
             #   1. Sum arriving ships grouped by player → combat_ships [MAX_P, 4]
             #   2. top player = argmax; survivor = top − second_largest
@@ -778,8 +877,11 @@ def _make_env_encoder(K: int, env_cfg):
             garrison = jnp.abs(garrison)
             owner    = jnp.where(flipped, top_idx, owner)
             prev_owner = jnp.where(garrison > 0, owner, prev_owner)
-            next_c_t = tick_rot_c * c_t - tick_rot_s * s_t
-            next_s_t = tick_rot_s * c_t + tick_rot_c * s_t
+            # Advance planet rotation by this step's outgoing gap (dt_r ticks).
+            _rs_c = jnp.cos(dt_r * state.angular_velocity)
+            _rs_s = jnp.sin(dt_r * state.angular_velocity)
+            next_c_t = _rs_c * c_t - _rs_s * s_t
+            next_s_t = _rs_s * c_t + _rs_c * s_t
             return (
                 new_acc,
                 jnp.where(t <= 5,  new_acc, acc_5),
@@ -788,9 +890,9 @@ def _make_env_encoder(K: int, env_cfg):
                 garrison,
                 owner,
                 prev_owner,
-                jnp.where(t == 5,  owner, owner_5),
-                jnp.where(t == 10, owner, owner_10),
-                jnp.where(t == 20, owner, owner_20),
+                jnp.where(t == _T5,  owner, owner_5),
+                jnp.where(t == _T10, owner, owner_10),
+                jnp.where(t == _T20, owner, owner_20),
                 next_c_t,
                 next_s_t,
             ), combat_ships  # ys: per-tick arrival totals by player [MAX_PLANETS, 4]
@@ -812,7 +914,7 @@ def _make_env_encoder(K: int, env_cfg):
                 tick_rot_c,
                 tick_rot_s,
             ),
-            jnp.arange(1, MAX_TICKS_IN + 1, dtype=jnp.int32),
+            (_sched_t, _dt_prod, _dt_rot),
         )  # [MAX_PLANETS, MAX_FLEETS] / [MAX_PLANETS]
 
         inbound_sim    = inbound_all[safe_slots]                           # [MAX_SRC, K, MAX_FLEETS]
@@ -854,6 +956,14 @@ def _make_env_encoder(K: int, env_cfg):
         src_ships_f = src_ships.astype(jnp.float32)                           # [MAX_SRC]
         eta_safe  = jnp.where(jnp.isfinite(eta_ticks), eta_ticks, jnp.float32(MAX_TICKS_IN))
         arrival_t = jnp.clip(jnp.ceil(eta_safe), 1.0, jnp.float32(MAX_TICKS_IN))  # [MAX_SRC, K]
+        # Snap the injection tick onto the schedule (first scheduled tick >= arrival),
+        # so the hypothetical fleet lands on a simulated tick. Identity for the exact
+        # schedule. _sched_t is sorted, so searchsorted(left) gives that first index.
+        _ai = jnp.clip(
+            jnp.searchsorted(_sched_t, jnp.ceil(arrival_t).astype(jnp.int32), side="left"),
+            0, _sched_t.shape[0] - 1,
+        )
+        arrival_t = _sched_t[_ai].astype(jnp.float32)
         tgt_prod  = state.p_production[safe_slots]                            # [MAX_SRC, K]
         player_oh = (jnp.arange(4, dtype=jnp.int32) == player).astype(jnp.float32)  # [4]
         # Hoist the per-pair gather out of the scan: one gather over the whole
@@ -863,12 +973,12 @@ def _make_env_encoder(K: int, env_cfg):
 
         def _cf_tick(carry, xs):
             g, o, po = carry                                                  # each [MAX_SRC, K]
-            t, cs = xs                                                        # cs [MAX_SRC, K, 4]
+            t, dt_p, cs = xs                                                  # cs [MAX_SRC, K, 4]
             inject = (t.astype(jnp.float32) == arrival_t)
             cs = cs + jnp.where(inject, src_ships_f[:, None], 0.0)[..., None] * player_oh
-            # Mirror _sim_tick: production, then combat resolution.
+            # Mirror _sim_tick: production (scaled by this step's gap), then combat.
             prod_owner = jnp.where(g > 0, o, po)
-            g = g + tgt_prod * (prod_owner != -1).astype(jnp.float32)
+            g = g + tgt_prod * dt_p * (prod_owner != -1).astype(jnp.float32)
             has_combat = jnp.any(cs > 0, axis=-1)
             top_idx    = jnp.argmax(cs, axis=-1).astype(jnp.int32)
             top_ships  = jnp.max(cs, axis=-1)
@@ -894,7 +1004,7 @@ def _make_env_encoder(K: int, env_cfg):
                 _owner_init[safe_slots],
                 _prev_owner_init[safe_slots],
             ),
-            (jnp.arange(1, MAX_TICKS_IN + 1, dtype=jnp.int32), combat_pairs),
+            (_sched_t, _dt_prod, combat_pairs),
             unroll=5,  # tiny body — partial unroll (full unroll explodes XLA compile time)
         )
         will_be_mine = (owner_cf == player).astype(jnp.float32)               # [MAX_SRC, K]
