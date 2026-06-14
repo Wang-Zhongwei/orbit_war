@@ -55,9 +55,10 @@ MAX_TICKS_IN: int = 45
 #   (unset)                          exact, bit-identical to the original per-tick sim
 import os as _os
 
-# Capture-outcome snapshot thresholds the policy reads (would_be_mine_{5,10,20}); the
-# scheduler force-includes these + MAX_TICKS_IN so those features are sampled exactly.
-_CRITICAL_TICKS = (5, 10, 20)
+# Capture-outcome snapshot thresholds the policy reads (would_be_mine_{5,10,15} — this
+# branch's third horizon is 15, not 20); the scheduler force-includes these +
+# MAX_TICKS_IN so those features are sampled at the exact tick in every mode.
+_CRITICAL_TICKS = (5, 10, 15)
 
 
 def _parse_ticks(spec: str) -> list[int]:
@@ -79,7 +80,7 @@ def _parse_ticks(spec: str) -> list[int]:
 def schedule_from_spec(spec: str) -> tuple[int, ...]:
     """Build a tick schedule from a spec string. "" / "exact" → every tick. "anchored"
     → exact 1..20 then 25,30,35,40,45. Otherwise a comma spec ("1-20,25-45:5"). The
-    critical snapshot ticks (5/10/20) and the full horizon are always force-included so
+    critical snapshot ticks (5/10/15) and the full horizon are always force-included so
     those features are sampled at the exact tick."""
     spec = (spec or "").strip().lower()
     if not spec or spec in ("exact", "full", "1"):
