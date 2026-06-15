@@ -244,6 +244,11 @@ def round_robin_pairs(agents: Sequence[str]) -> list[tuple[str, str]]:
     return list(itertools.combinations(agents, 2))
 
 
+def round_robin_groups(agents: Sequence[str], group_size: int) -> list[tuple[str, ...]]:
+    """All unordered ``group_size``-agent groupings of distinct agents (FFA tables)."""
+    return list(itertools.combinations(agents, group_size))
+
+
 def tournament(
     agents: Sequence[str],
     rounds: int,
@@ -258,12 +263,17 @@ def tournament(
     jax_name: str = "jax",
     jax_deterministic: bool = True,
     jax_src_root: str | None = None,
+    ffa: bool = False,
 ) -> None:
-    """Round-robin 1v1 with randomized slot ordering.
+    """Round-robin tournament with randomized slot ordering.
 
-    For each round we pick one seed and play every pair once. Slot ordering is
-    randomized per pair because the game is symmetric. Prints a head-to-head
-    win matrix when done.
+    Default is 1v1: for each round we pick one seed and play every distinct pair
+    once. With ``ffa=True`` each "table" is a group of 4 distinct agents instead
+    (every 4-agent combination), played as a 4-player free-for-all. Slot ordering
+    is randomized per table because the game is symmetric.
+
+    Prints a head-to-head win matrix for 1v1, or per-agent FFA standings (win
+    rate + average rank) for FFA.
 
     ``flush_period`` controls how many matches are completed before buffered
     CSV rows are written to disk (default 10). A final flush always runs at
@@ -272,14 +282,16 @@ def tournament(
     ``workers`` sets the number of parallel worker processes (default 1 =
     sequential). Pass ``workers=-1`` to use all logical CPU cores.
     """
-    pairs = round_robin_pairs(agents)
-    if not pairs:
-        raise ValueError("Need at least 2 distinct agents.")
+    group_size = 4 if ffa else 2
+    tables = round_robin_groups(agents, group_size)
+    if not tables:
+        raise ValueError(f"Need at least {group_size} distinct agents for "
+                         f"{'FFA' if ffa else '1v1'} tournament.")
 
     if workers == -1:
         workers = os.cpu_count() or 1
 
-    total = rounds * len(pairs)
+    total = rounds * len(tables)
     done = 0
     t_start = time.perf_counter()
     match_records: list[dict] = []
@@ -289,8 +301,8 @@ def tournament(
     for r in range(rounds):
         seed = base_seed + r
         rng = random.Random(seed)
-        for a, b in pairs:
-            slot_order = (a, b) if rng.randrange(2) == 0 else (b, a)
+        for table in tables:
+            slot_order = tuple(rng.sample(table, len(table)))  # shuffle seats
             tasks.append({"slot_order": slot_order, "seed": seed, "episode_steps": episode_steps})
 
     def _handle_result(result: dict) -> None:
@@ -307,11 +319,10 @@ def tournament(
             winner = top[0] if len(top) == 1 else "draw"
             elapsed = time.perf_counter() - t_start
             eta = elapsed / done * (total - done)
-            slot_order = result["agents"]
+            table = " vs ".join(result["agents"])
             print(
                 f"[{done:>4}/{total}] seed={result['seed']:<6} "
-                f"{slot_order[0]:>11} vs {slot_order[1]:<11} "
-                f"-> winner={winner:<11} "
+                f"{table} -> winner={winner:<11} "
                 f"steps={result['num_steps']:<4} "
                 f"({result['wall_time_s']:.2f}s, ETA {eta/60:.1f}m)"
             )
@@ -332,7 +343,38 @@ def tournament(
     _flush_rows(pending_rows, csv_path)
 
     print()
-    print(format_head_to_head_matrix(match_records, list(agents)))
+    if ffa:
+        print(format_ffa_standings(match_records, list(agents)))
+    else:
+        print(format_head_to_head_matrix(match_records, list(agents)))
+
+
+def format_ffa_standings(match_records: Sequence[dict], agents: Sequence[str]) -> str:
+    """Per-agent FFA standings: games, win rate (rank-1; ties split), avg rank."""
+    games = {a: 0 for a in agents}
+    wins = {a: 0.0 for a in agents}
+    rank_sum = {a: 0.0 for a in agents}
+    for rec in match_records:
+        grp, ranks = rec["agents"], rec["ranks"]
+        best = min(ranks)
+        winners = [grp[i] for i, rk in enumerate(ranks) if rk == best]
+        for i, a in enumerate(grp):
+            if a not in games:
+                continue
+            games[a] += 1
+            rank_sum[a] += ranks[i]
+            if a in winners:
+                wins[a] += 1.0 / len(winners)  # split credit on ties
+    order = sorted(agents, key=lambda a: (-(wins[a] / games[a]) if games[a] else 0,
+                                          rank_sum[a] / games[a] if games[a] else 9))
+    lines = ["FFA standings (by win rate):",
+             f"  {'agent':>12}  {'games':>6}  {'win_rate':>8}  {'avg_rank':>8}"]
+    for a in order:
+        g = games[a]
+        wr = wins[a] / g if g else float("nan")
+        ar = rank_sum[a] / g if g else float("nan")
+        lines.append(f"  {a:>12}  {g:>6}  {wr:>8.3f}  {ar:>8.2f}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -383,10 +425,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     real_agents = [a for a in AGENTS if a != "random"]
     real_agents.append('jax')
-    p_tour = sub.add_parser("tournament", help="Round-robin 1v1 with randomized slots.")
+    p_tour = sub.add_parser("tournament", help="Round-robin 1v1 (or 4-player FFA) with randomized slots.")
     p_tour.add_argument(
         "--agents", nargs="+", default=real_agents,
         help=f"Agents to include (default: {real_agents}).",
+    )
+    p_tour.add_argument(
+        "--ffa", action="store_true",
+        help="4-player free-for-all round-robin: play every 4-agent combination "
+             "(needs >=4 agents), seats shuffled. Reports per-agent win rate + "
+             "avg rank instead of the 1v1 head-to-head matrix.",
     )
     p_tour.add_argument("--rounds", type=int, default=20,
                         help="Number of seed rounds. Each round = #pairs matches.")
@@ -457,8 +505,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 0
 
     if args._handler == "tournament":
-        if len(set(args.agents)) < 2:
-            print("Need at least 2 distinct agents.", file=sys.stderr)
+        min_agents = 4 if args.ffa else 2
+        if len(set(args.agents)) < min_agents:
+            print(f"Need at least {min_agents} distinct agents for "
+                  f"{'FFA' if args.ffa else '1v1'} tournament.", file=sys.stderr)
             return 2
         tournament(
             list(dict.fromkeys(args.agents)),
@@ -473,6 +523,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             jax_name=getattr(args, "jax_name", "jax"),
             jax_deterministic=not getattr(args, "jax_stochastic", False),
             jax_src_root=getattr(args, "jax_src_root", None),
+            ffa=args.ffa,
         )
         return 0
 
