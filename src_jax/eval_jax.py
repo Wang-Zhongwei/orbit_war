@@ -224,29 +224,32 @@ def _submission_spec(name):
     """(module, encode_fn, params, deterministic) for a JAX submission opponent.
 
     A submission's policy lives in a specific src_jax tree (e.g. the v7arch
-    worktree: 30-dim cand_proj, horizons 60/45), recorded in
-    ``src.evaluation._PPO_SUBMISSIONS`` as a root label. We rebuild its module +
-    encoder from *that* tree (pinned the same way src.evaluation loads it) so the
-    param tree matches, then run them on the *shared* (byte-identical) EnvState
-    inside the eval scan. The only requirement is that the chosen tree's
-    physics/EnvState match this tree's — which holds for every registered root.
+    worktree: 30-dim cand_proj, horizons 60/45). We rebuild its module + encoder
+    from *that* tree (pinned the same way src.evaluation loads it) so the param
+    tree matches, then run them on the *shared* (byte-identical) EnvState inside
+    the eval scan. The only requirement is that the chosen tree's physics/EnvState
+    match this tree's — which holds for every registered root.
+
+    Works with both src.evaluation API shapes: the per-root one on main
+    (``_SRC_JAX_ROOTS`` + ``_PPO_SUBMISSIONS[name] = (file, root_label)``) and the
+    older single-root one on v7_arch (``_V7ARCH_ROOT``).
     """
     import importlib
 
-    from src.evaluation import (
-        _pinned_src_jax, _SRC_JAX_ROOTS, _PPO_SUBMISSIONS, _ppo_sub_mods,
-    )
+    from src import evaluation as E
 
-    if name not in _ppo_sub_mods:
+    if name not in E._ppo_sub_mods:
         raise KeyError(
             f"JAX submission opponent {name!r} did not load (see src.evaluation "
             f"warnings); cannot run on the JAX eval fast-path."
         )
-    root_label = _PPO_SUBMISSIONS[name][1]
-    root       = _SRC_JAX_ROOTS[root_label]
-    ckpt       = _ppo_sub_mods[name]._ckpt   # {"params": ..., "config": TrainConfig}
+    ckpt = E._ppo_sub_mods[name]._ckpt   # {"params": ..., "config": TrainConfig}
+    if hasattr(E, "_SRC_JAX_ROOTS"):                       # per-root API (main)
+        root = E._SRC_JAX_ROOTS[E._PPO_SUBMISSIONS[name][1]]
+    else:                                                  # single-root API (v7_arch)
+        root = E._V7ARCH_ROOT
 
-    with _pinned_src_jax(root):
+    with E._pinned_src_jax(root):
         pinned_policies = importlib.import_module("src_jax.policies")
         pinned_features = importlib.import_module("src_jax.features")
         cfg       = ckpt["config"]
