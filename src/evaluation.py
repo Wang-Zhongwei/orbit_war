@@ -90,14 +90,27 @@ _v52_mod = _load_submission("stateful_v5.2")
 # on). Loading is also TOLERANT: a submission that still fails (missing worktree,
 # unexpected arch) is skipped with a warning so the rule-based opponents — incl.
 # sub_v52 — always stay available and the eval never hard-crashes again.
-_V7ARCH_ROOT = Path(__file__).resolve().parent.parent / ".claude" / "worktrees" / "v7arch"
+# src_jax resolution roots, keyed by a short label. Each PPO submission embeds a
+# src_jax tree built against a specific encoder architecture; it must be loaded
+# with the matching tree pinned (see _pinned_src_jax below). Most submissions
+# target the v7 architecture, which lives in the v7arch worktree. The "main" root
+# is the primary repo checkout itself — it is NOT a registered git worktree under
+# .claude/worktrees, just the live working tree — and exists so submissions built
+# against the current main src_jax can be assigned to it.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_SRC_JAX_ROOTS = {
+    "v7arch": _REPO_ROOT / ".claude" / "worktrees" / "v7arch",
+    "main":   _REPO_ROOT,
+}
 
+# Map each PPO submission opponent to (submission_file, src_jax_root_label). The
+# root label selects which tree in _SRC_JAX_ROOTS to pin while loading it.
 _PPO_SUBMISSIONS = {
-    "sub_v6":  "ppo_from_bc_loser0",
-    "sub_v7":  "ppo_low_kl_v7",
-    "sub_v8":  "sub_v8",
-    "sub_v81": "sub_v8.1",
-    "sub_v82": "sub_v8.2",
+    "sub_v6":  ("ppo_from_bc_loser0", "v7arch"),
+    "sub_v7":  ("ppo_low_kl_v7",      "v7arch"),
+    "sub_v8":  ("sub_v8",             "v7arch"),
+    "sub_v81": ("sub_v8.1",           "v7arch"),
+    "sub_v82": ("sub_v8.2",           "v7arch"),
 }
 
 
@@ -129,34 +142,52 @@ def _pinned_src_jax(root: Path):
         sys.modules.update(saved_mods)
 
 
+# Group submissions by their src_jax root so each tree is primed once, then load
+# every submission in that group under it. A missing root or a single failing
+# submission is skipped with a warning — the rule-based opponents (incl. sub_v52)
+# always stay available and the eval never hard-crashes.
 _ppo_sub_mods: dict[str, Any] = {}
-if _V7ARCH_ROOT.is_dir():
+_by_root: dict[str, list[tuple[str, str]]] = defaultdict(list)
+for _agent_key, (_sub_file, _root_label) in _PPO_SUBMISSIONS.items():
+    _by_root[_root_label].append((_agent_key, _sub_file))
+
+for _root_label, _group in _by_root.items():
+    _root = _SRC_JAX_ROOTS.get(_root_label)
+    _names = ", ".join(k for k, _ in _group)
+    if _root is None:
+        warnings.warn(
+            f"src.evaluation: unknown src_jax root {_root_label!r}; JAX opponents "
+            f"{_names} are unavailable. Rule-based opponents (incl. sub_v52) still work.",
+            stacklevel=2,
+        )
+        continue
+    if not _root.is_dir():
+        warnings.warn(
+            f"src.evaluation: {_root_label!r} src_jax root not found at {_root}; "
+            f"JAX opponents {_names} are unavailable. Rule-based opponents "
+            f"(incl. sub_v52) still work.",
+            stacklevel=2,
+        )
+        continue
     try:
-        with _pinned_src_jax(_V7ARCH_ROOT):
-            for _agent_key, _sub_file in _PPO_SUBMISSIONS.items():
+        with _pinned_src_jax(_root):
+            for _agent_key, _sub_file in _group:
                 try:
                     _ppo_sub_mods[_agent_key] = _load_submission(_sub_file)
                 except Exception as _exc:  # ScopeParamShapeError, missing ckpt, …
                     warnings.warn(
                         f"src.evaluation: skipping JAX opponent {_agent_key!r} "
                         f"({_sub_file!r}) — failed to load against the pinned "
-                        f"v7arch src_jax: {type(_exc).__name__}: {_exc}",
+                        f"{_root_label!r} src_jax: {type(_exc).__name__}: {_exc}",
                         stacklevel=2,
                     )
-    except Exception as _exc:  # priming v7arch's src_jax failed
+    except Exception as _exc:  # priming this root's src_jax failed
         warnings.warn(
-            f"src.evaluation: could not pin v7arch src_jax at {_V7ARCH_ROOT} "
-            f"({type(_exc).__name__}: {_exc}); JAX opponents sub_v6/v7/v8/v81 "
-            f"are unavailable. Rule-based opponents (incl. sub_v52) still work.",
+            f"src.evaluation: could not pin {_root_label!r} src_jax at {_root} "
+            f"({type(_exc).__name__}: {_exc}); JAX opponents {_names} are "
+            f"unavailable. Rule-based opponents (incl. sub_v52) still work.",
             stacklevel=2,
         )
-else:
-    warnings.warn(
-        f"src.evaluation: v7arch worktree not found at {_V7ARCH_ROOT}; JAX "
-        f"opponents sub_v6/v7/v8/v81 are unavailable. Rule-based opponents "
-        f"(incl. sub_v52) still work.",
-        stacklevel=2,
-    )
 
 
 def sub_stateful_v2(obs) -> list:
