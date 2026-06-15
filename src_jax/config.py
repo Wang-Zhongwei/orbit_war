@@ -199,6 +199,11 @@ class TrainConfig:
     eval_update_interval: int = 50
     eval_rounds: int = 10
     eval_workers: int = -1  # CPU processes for eval matches; -1 = all cores
+    # Run all-JAX opponents (self / ckpt: / sub_vN) in one batched on-device scan
+    # (eval_jax) instead of the CPU env.run worker pool. Much faster; shifts the
+    # board distribution (JAX board-gen vs kaggle make()), so absolute win-rate
+    # numbers differ from the mp path. Set False to keep every opponent on env.run.
+    eval_jax_fastpath: bool = True
     self_play_deterministic: bool = False
     alternate_player_sides: bool = True
     env: EnvConfig = field(default_factory=EnvConfig)

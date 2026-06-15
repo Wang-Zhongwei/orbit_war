@@ -89,13 +89,18 @@ def run_eval_mp(
     *,
     workers: int = -1,
     deterministic: bool = True,
+    opponents=None,
 ) -> dict[str, float]:
-    """Win rate of ``params`` vs each ``cfg.eval_opponents`` entry, matches run
-    in parallel across worker processes.
+    """Win rate of ``params`` vs each opponent, matches run in parallel across
+    worker processes.
+
+    ``opponents`` defaults to ``cfg.eval_opponents``; pass an explicit subset to
+    evaluate only some of them (e.g. the rule-based ones, when the JAX-arch
+    opponents are handled by the on-device ``eval_jax`` fast-path).
 
     ``workers=-1`` uses all logical CPU cores (capped at the number of matches).
     """
-    eval_opponents = list(cfg.eval_opponents)
+    eval_opponents = list(cfg.eval_opponents if opponents is None else opponents)
     if not eval_opponents:
         return {}
 
