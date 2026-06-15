@@ -30,11 +30,42 @@ N_BOARDS = 2048
 _EVAL_BASE_SEED = 1000
 
 def run_eval(params, cfg, base_seed: int = _EVAL_BASE_SEED) -> dict[str, float]:
-    # Matches are fanned out across CPU worker processes (see eval_mp); the
-    # trainer keeps the accelerator (GPU/TPU) to itself.
-    from .eval_mp import run_eval_mp
+    # All-JAX opponents (self / ckpt: / sub_vN networks) play on-device in one
+    # batched, jitted scan (eval_jax) — orders of magnitude faster than looping
+    # kaggle env.run per match. Rule-based opponents (sub_v52, sniper, …) have no
+    # JAX policy, so they stay on the CPU worker-pool path (eval_mp), which keeps
+    # the accelerator free for the trainer between rollouts.
+    from .eval_jax import is_jax_arch_opponent
 
-    return run_eval_mp(params, cfg, base_seed, workers=cfg.eval_workers)
+    results: dict[str, float] = {}
+
+    if getattr(cfg, "eval_jax_fastpath", True):
+        jax_opps = [o for o in cfg.eval_opponents if is_jax_arch_opponent(o)]
+        cpu_opps = [o for o in cfg.eval_opponents if o not in jax_opps]
+    else:
+        jax_opps, cpu_opps = [], list(cfg.eval_opponents)
+
+    if jax_opps:
+        from .eval_jax import run_eval_jax
+
+        try:
+            results.update(run_eval_jax(params, cfg, jax_opps, base_seed))
+        except Exception as exc:  # never let a fast-path failure abort the run
+            print(
+                f"[eval] JAX fast-path failed ({type(exc).__name__}: {exc}); "
+                f"falling back to env.run for {jax_opps}",
+                flush=True,
+            )
+            cpu_opps = list(cfg.eval_opponents)
+
+    if cpu_opps:
+        from .eval_mp import run_eval_mp
+
+        results.update(
+            run_eval_mp(params, cfg, base_seed, workers=cfg.eval_workers, opponents=cpu_opps)
+        )
+
+    return results
 
 
 def parse_args() -> argparse.Namespace:

@@ -37,7 +37,15 @@ import uuid
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 
-from src.evaluation import AGENTS, run_match_raw, format_head_to_head_matrix
+from src.evaluation import (
+    AGENTS, run_match_raw, format_head_to_head_matrix,
+    _ranks_from_rewards, _outcomes_from_ranks,
+)
+
+# Import the batched-eval module NOW, while src_jax resolves to the live tree, and
+# hold the reference. Later --jax-checkpoint loading evicts/pins src_jax (possibly
+# to a worktree without eval_jax.py), but this held module object survives that.
+import src_jax.eval_jax as _eval_jax
 
 
 CSV_HEADER: list[str] = [
@@ -378,6 +386,179 @@ def format_ffa_standings(match_records: Sequence[dict], agents: Sequence[str]) -
 
 
 # ---------------------------------------------------------------------------
+# Panel evaluation: one agent vs a list of opponents (1v1 or 1-vs-3 FFA),
+# batched on-device when every seat is a JAX policy.
+# ---------------------------------------------------------------------------
+
+def _jax_spec_for(name, *, jax_checkpoint, jax_name, jax_src_root, deterministic):
+    """Return an eval_jax EvalSpec for ``name`` if it's a JAX-arch agent, else None.
+
+    Recognizes the loaded ``--jax-checkpoint`` agent (registered under jax_name)
+    and the JAX submission opponents (sub_vN). Anything else (rule-based) → None,
+    signaling the caller to fall back to env.run.
+    """
+    ej = _eval_jax
+
+    if jax_checkpoint is not None and name == jax_name:
+        return ej.spec_from_checkpoint(jax_checkpoint, jax_src_root, deterministic)
+    if name in ej._JAX_SUBMISSION_KEYS:
+        return ej.spec_from_submission(name)
+    return None
+
+
+def _rows_for_game(match_id, seed, fmt, num_steps, slot_names, rewards):
+    """Build per-slot CSV rows + a head-to-head record for one finished game."""
+    rewards = [float(r) for r in rewards]
+    ranks    = _ranks_from_rewards(rewards)
+    outcomes = _outcomes_from_ranks(ranks)
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    rows = [
+        [match_id, timestamp, seed, fmt, num_steps, slot, name, r, "DONE", rk, f"{oc:.3f}"]
+        for slot, (name, r, rk, oc) in enumerate(zip(slot_names, rewards, ranks, outcomes))
+    ]
+    return rows, {"agents": list(slot_names), "ranks": ranks}, outcomes
+
+
+def _eval_win_score(ranks, eval_seat) -> float:
+    """Win credit for the evaluated agent in one game.
+
+    1.0 if it holds the sole rank-1 seat (won), 0.5 if tied for rank-1 with an
+    opponent, else 0.0. "Win" = controlling the top seat — so against ``P`` equal
+    players the expected score is 1/P (0.5 for 1v1, 0.25 for 4-player FFA).
+    """
+    eval_won   = ranks[eval_seat] == 1
+    others_won = any(rk == 1 for s, rk in enumerate(ranks) if s != eval_seat)
+    if eval_won and not others_won:
+        return 1.0
+    if eval_won and others_won:
+        return 0.5
+    return 0.0
+
+
+def panel(
+    eval_agent: str,
+    opponents: Sequence[str],
+    rounds: int,
+    base_seed: int,
+    *,
+    num_players: int = 2,
+    csv_path: Path = DEFAULT_CSV,
+    episode_steps: int = 500,
+    verbose: bool = True,
+    jax_checkpoint: str | None = None,
+    jax_name: str = "jax",
+    jax_deterministic: bool = True,
+    jax_src_root: str | None = None,
+) -> dict[str, float]:
+    """Evaluate ``eval_agent`` vs each opponent over ``rounds`` games.
+
+    ``num_players=2``: 1v1, eval vs opponent.
+    ``num_players=4``: 1-vs-3 FFA — eval against 3 copies of the opponent.
+
+    The evaluated agent's seat is shuffled across rounds (balanced: each of the
+    ``num_players`` positions used as equally as possible, then shuffled with a
+    ``base_seed``-seeded RNG for reproducibility) so the config each round looks
+    like e.g. ``[a,b,b,b]`` or ``[b,b,a,b]`` and positional bias averages out. The
+    same seat schedule + boards are reused for every opponent, so per-opponent
+    numbers stay comparable.
+
+    Win rate = fraction of rounds the evaluated agent holds the rank-1 seat (ties
+    split 0.5); the even baseline is ``1/num_players``. Each opponent copy's
+    implied win rate is ``(1 - eval_win_rate)/(num_players-1)``.
+
+    For an opponent where eval AND opponent are both JAX-arch, all ``rounds`` games
+    play in ONE on-device jitted scan (eval_jax.play_match_batched). Otherwise the
+    opponent falls back to the kaggle env.run path (one game per round). Returns
+    {opponent: eval_win_rate in [0,1]} and writes the usual CSV rows.
+    """
+    if num_players not in (2, 4):
+        raise ValueError(f"num_players must be 2 or 4, got {num_players}")
+    n_seats = num_players
+    fmt = "1v1" if num_players == 2 else f"ffa{num_players}"
+
+    eval_spec = _jax_spec_for(
+        eval_agent, jax_checkpoint=jax_checkpoint, jax_name=jax_name,
+        jax_src_root=jax_src_root, deterministic=jax_deterministic,
+    )
+
+    # Balanced + shuffled seat for the evaluated agent, one per round. spec 0 =
+    # eval, spec 1 = opponent; seat_assign[e][s] is the spec index at seat s.
+    eval_seats = [i % n_seats for i in range(rounds)]
+    random.Random(base_seed).shuffle(eval_seats)
+    seat_assign = [[0 if s == eval_seats[e] else 1 for s in range(n_seats)]
+                   for e in range(rounds)]
+
+    all_rows: list[list] = []
+    match_records: list[dict] = []
+    win_rates: dict[str, float] = {}
+
+    for opp in opponents:
+        opp_spec = _jax_spec_for(
+            opp, jax_checkpoint=jax_checkpoint, jax_name=jax_name,
+            jax_src_root=jax_src_root, deterministic=jax_deterministic,
+        )
+        batched = eval_spec is not None and opp_spec is not None
+
+        wins = draws = 0
+        t0 = time.perf_counter()
+
+        if batched:
+            ej = _eval_jax
+            rewards, steps = ej.play_match_batched(
+                [eval_spec, opp_spec], seat_assign, rounds, base_seed, episode_steps,
+            )
+            for e in range(rounds):
+                slot_names = [eval_agent if j == 0 else opp for j in seat_assign[e]]
+                rows, rec, outcomes = _rows_for_game(
+                    uuid.uuid4().hex[:12], base_seed + e, fmt, int(steps[e]),
+                    slot_names, rewards[e],
+                )
+                all_rows.extend(rows)
+                match_records.append(rec)
+                sc = _eval_win_score(rec["ranks"], eval_seats[e])
+                wins  += int(sc == 1.0)
+                draws += int(sc == 0.5)
+        else:
+            for e in range(rounds):
+                seed = base_seed + e
+                slot_names = [eval_agent if j == 0 else opp for j in seat_assign[e]]
+                raw = run_match_raw(list(slot_names), seed, episode_steps=episode_steps)
+                rows, rec, _ = _rows_for_game(
+                    uuid.uuid4().hex[:12], seed, fmt, raw["num_steps"],
+                    slot_names, raw["rewards"],
+                )
+                all_rows.extend(rows)
+                match_records.append(rec)
+                sc = _eval_win_score(rec["ranks"], eval_seats[e])
+                wins  += int(sc == 1.0)
+                draws += int(sc == 0.5)
+
+        wr = (wins + 0.5 * draws) / rounds if rounds else 0.0
+        win_rates[opp] = wr
+        if verbose:
+            mode = "batched" if batched else "env.run"
+            opp_wr = (1.0 - wr) / (num_players - 1)
+            print(f"  {eval_agent} vs {opp:<11} [{mode:>7}]: "
+                  f"win_rate={wr:.3f} ({wins}W {draws}D {rounds - wins - draws}L)"
+                  f"  each {opp}~{opp_wr:.3f}  ({time.perf_counter() - t0:.1f}s)",
+                  flush=True)
+
+    _flush_rows(all_rows, csv_path)
+
+    mode_label = "1v1" if num_players == 2 else f"1-vs-{num_players - 1} FFA"
+    print()
+    print(format_head_to_head_matrix(match_records, [eval_agent, *opponents]))
+    print()
+    print(f"{eval_agent} win rates ({mode_label}, {rounds} rounds each; "
+          f"even baseline = {1.0 / num_players:.3f}):")
+    for opp, wr in win_rates.items():
+        opp_wr = (1.0 - wr) / (num_players - 1)
+        print(f"  vs {opp:<12} {eval_agent}={wr * 100:5.1f}%   "
+              f"(each {opp} ~{opp_wr * 100:4.1f}%)")
+    return win_rates
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -448,6 +629,27 @@ def _build_parser() -> argparse.ArgumentParser:
     p_tour.add_argument("--quiet", action="store_true")
     _add_jax_args(p_tour)
     p_tour.set_defaults(_handler="tournament")
+
+    p_panel = sub.add_parser(
+        "panel",
+        help="Evaluate one agent vs a panel of opponents (1v1 or 1-vs-3 FFA), "
+             "batched on-device when both sides are JAX policies.",
+    )
+    p_panel.add_argument("--eval", dest="eval_agent", required=True,
+                         help="Agent to evaluate (e.g. 'jax' for --jax-checkpoint, or sub_vN).")
+    p_panel.add_argument("--opponents", nargs="+", required=True,
+                         help="Opponent agent names to evaluate against.")
+    p_panel.add_argument("--rounds", type=int, default=64,
+                         help="Games per opponent (default 64).")
+    p_panel.add_argument("--num-players", type=int, choices=[2, 4], default=2,
+                         help="2 = 1v1; 4 = 1-vs-3 FFA (eval vs 3 copies of each "
+                              "opponent). The eval agent's seat is shuffled each round.")
+    p_panel.add_argument("--base-seed", type=int, default=1000)
+    p_panel.add_argument("--out", type=Path, default=DEFAULT_CSV)
+    p_panel.add_argument("--episode-steps", type=int, default=500)
+    p_panel.add_argument("--quiet", action="store_true")
+    _add_jax_args(p_panel)
+    p_panel.set_defaults(_handler="panel")
 
     return p
 
@@ -534,6 +736,23 @@ def main(argv: Iterable[str] | None = None) -> int:
             jax_deterministic=not getattr(args, "jax_stochastic", False),
             jax_src_root=getattr(args, "jax_src_root", None),
             ffa=is_4p,
+        )
+        return 0
+
+    if args._handler == "panel":
+        panel(
+            args.eval_agent,
+            list(dict.fromkeys(args.opponents)),
+            rounds=args.rounds,
+            base_seed=args.base_seed,
+            num_players=args.num_players,
+            csv_path=args.out,
+            episode_steps=args.episode_steps,
+            verbose=not args.quiet,
+            jax_checkpoint=getattr(args, "jax_checkpoint", None),
+            jax_name=getattr(args, "jax_name", "jax"),
+            jax_deterministic=not getattr(args, "jax_stochastic", False),
+            jax_src_root=getattr(args, "jax_src_root", None),
         )
         return 0
 
