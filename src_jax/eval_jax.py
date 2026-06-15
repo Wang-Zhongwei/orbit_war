@@ -371,9 +371,80 @@ def run_eval_jax(
     return results
 
 
+def run_eval_jax_4p(
+    learner_params,
+    cfg,
+    opponents,
+    base_seed: int = 1000,
+    *,
+    deterministic_learner: bool = True,
+) -> dict[str, float]:
+    """1-vs-3 FFA win rate of ``learner_params`` vs 3 copies of each JAX-arch opponent.
+
+    The in-training counterpart to the 2-player ``run_eval_jax``: it plays a
+    4-seat free-for-all where the learner holds ONE seat and the opponent policy
+    fills the other three. The scoring is byte-for-byte the same scheme as
+    ``arena.panel(num_players=4)`` so in-training and post-training 4p numbers are
+    directly comparable:
+
+      * learner = spec 0, opponent = spec 1;
+      * the learner's seat is balanced (``i % 4``) then shuffled with a
+        ``base_seed``-seeded RNG, one assignment per round, reused across opponents;
+      * win credit per game = 1.0 if the learner holds the sole rank-1 (top-reward)
+        seat, 0.5 if tied for rank-1, else 0.0 — so the even baseline is 1/4.
+
+    Returns ``{opponent_name: win_rate in [0, 1]}``. Reuses the shared K-player
+    batched match (``play_match_batched``); all four seats play on-device in one
+    jitted scan per opponent.
+    """
+    import random as _random
+
+    import numpy as np
+
+    opponents = list(opponents)
+    if not opponents:
+        return {}
+
+    rounds        = int(cfg.eval_rounds)
+    episode_steps = int(cfg.env.episode_steps)
+    n_seats       = 4
+
+    learner_spec = EvalSpec(
+        build_policy(cfg),
+        _make_env_encoder(cfg.env.candidate_count, cfg.env),
+        learner_params,
+        deterministic_learner,
+    )
+
+    # Balanced + shuffled learner seat per round (identical scheme to arena.panel),
+    # so positional bias averages out and per-opponent numbers stay comparable.
+    eval_seats = [i % n_seats for i in range(rounds)]
+    _random.Random(base_seed).shuffle(eval_seats)
+    seat_assign = [[0 if s == eval_seats[e] else 1 for s in range(n_seats)]
+                   for e in range(rounds)]
+    eval_seats_arr = np.asarray(eval_seats)
+    env_idx = np.arange(rounds)
+
+    results: dict[str, float] = {}
+    for name in opponents:
+        module, encode_fn, o_params, det = _resolve_opp_spec(name, cfg, learner_params)
+        opp_spec = EvalSpec(module, encode_fn, o_params, det)
+        rewards, _ = play_match_batched(
+            [learner_spec, opp_spec], seat_assign, rounds, base_seed, episode_steps,
+        )  # rewards[rounds, n_seats] terminal per-seat (+1 win / -1 lose / 0 draw)
+        learner_r = rewards[env_idx, eval_seats_arr]
+        max_r     = rewards.max(axis=1)
+        n_at_max  = (rewards == max_r[:, None]).sum(axis=1)
+        won       = learner_r == max_r                       # learner holds a top seat
+        score     = np.where(won, np.where(n_at_max == 1, 1.0, 0.5), 0.0)
+        results[name] = float(score.mean())
+
+    return results
+
+
 # ===========================================================================
 # General K-player batched match (2 OR 4 seats) — used by arena post-training
-# evaluation. The train path above stays 2-player and untouched.
+# evaluation AND the in-training 4p eval above (run_eval_jax_4p).
 # ===========================================================================
 
 # Cache K-player board sets, keyed by (n_envs, base_seed, num_agents).

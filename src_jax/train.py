@@ -58,6 +58,24 @@ def run_eval(params, cfg, base_seed: int = _EVAL_BASE_SEED) -> dict[str, float]:
             )
             cpu_opps = list(cfg.eval_opponents)
 
+        # When training 4-player (FFA), also report a 1-vs-3 win rate vs each JAX
+        # opponent — the 2-player run above is only a 1v1 sanity signal. Logged
+        # under a "4p_<opp>" key so it shows as eval/win_rate_4p_<opp> alongside
+        # the 1v1 number. Same scoring scheme as arena.panel(num_players=4), so the
+        # in-training and post-training 4p numbers are comparable.
+        if getattr(cfg.env, "num_agents", 2) == 4:
+            from .eval_jax import run_eval_jax_4p
+
+            try:
+                wr4 = run_eval_jax_4p(params, cfg, jax_opps, base_seed)
+                results.update({f"4p_{opp}": wr for opp, wr in wr4.items()})
+            except Exception as exc:  # 4p eval is additive — never abort the run
+                print(
+                    f"[eval] 4-player JAX eval failed "
+                    f"({type(exc).__name__}: {exc}); skipping 4p metrics",
+                    flush=True,
+                )
+
     if cpu_opps:
         from .eval_mp import run_eval_mp
 
