@@ -52,7 +52,8 @@ MAX_TICKS_IN: int = 45
 #   ORBIT_SIM_TICKS="anchored"       preset: exact 1..20 then 25,30,35,40,45 (thresholds
 #                                    5/10/20/45 EXACT; only the quiet tail is coarsened)
 #   ORBIT_SIM_TICK_STRIDE="2"        uniform stride (shorthand for "1-45:2")
-#   (unset)                          exact, bit-identical to the original per-tick sim
+#   (unset)                          anchored (DEFAULT) — set ORBIT_SIM_TICKS=exact
+#                                    for the original bit-identical per-tick sim
 import os as _os
 
 # Capture-outcome snapshot thresholds the policy reads (would_be_mine_{5,10,20}); the
@@ -95,6 +96,9 @@ def _build_tick_schedule() -> tuple[int, ...]:
     stride = _os.environ.get("ORBIT_SIM_TICK_STRIDE", "").strip()
     if not spec and stride and stride != "1":
         spec = f"1-{MAX_TICKS_IN}:{stride}"
+    if not spec:
+        spec = "anchored"   # DEFAULT: coarse anchored schedule (collect speedup).
+                            # Set ORBIT_SIM_TICKS=exact for the original per-tick sim.
     return schedule_from_spec(spec)
 
 
