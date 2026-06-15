@@ -335,10 +335,12 @@ def make_rollout_fn(
         def maybe_reset(env_done, env_state, new_board, lp):
             ns  = jax.lax.cond(env_done, lambda: new_board, lambda: env_state)
             # Rotate the learner's seat on reset so every seat is trained equally.
-            # For num_agents=2 this is the original 0<->1 swap.
+            # Use the NEW board's own num_agents so a mixed 2p/4p pool always lands
+            # on a valid (non-phantom) seat. For uniform num_agents=2 this is the
+            # original 0<->1 swap.
             nlp = jax.lax.cond(
                 env_done & alternate_sides,
-                lambda: (lp + 1) % jnp.int32(num_agents),
+                lambda: (lp + 1) % new_board.num_agents,
                 lambda: lp,
             )
             return ns, nlp

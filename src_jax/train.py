@@ -160,7 +160,10 @@ def main() -> None:
     print(f"Using {N} parallel environments, board pool size {N_BOARDS}")
 
     # ── Board pool ────────────────────────────────────────────────────────────
-    board_pool = make_board_pool(N_BOARDS, cfg.seed, num_agents=cfg.env.num_agents)
+    board_pool = make_board_pool(
+        N_BOARDS, cfg.seed, num_agents=cfg.env.num_agents,
+        mix_4player_frac=cfg.env.mix_4player_frac,
+    )
 
     # ── Encoder (shared between rollout and bootstrap value) ──────────────────
     encode_batch = _make_env_encoder(K, cfg.env)

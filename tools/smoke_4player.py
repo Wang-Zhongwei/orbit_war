@@ -55,6 +55,82 @@ def _board_owner_check(num_agents: int, seed: int) -> None:
     print(f"  [ok] board owners == {set(range(num_agents))} for num_agents={num_agents}", flush=True)
 
 
+def _seat_counts_check() -> None:
+    from src_jax.env import _board_seat_counts
+
+    assert _board_seat_counts(10, 2, 1.0) == [2] * 10, "num_agents=2 must be all 2p"
+    assert _board_seat_counts(10, 4, 1.0) == [4] * 10, "frac=1 must be all 4p"
+    assert _board_seat_counts(10, 4, 0.0) == [2] * 10, "frac=0 must be all 2p"
+    half = _board_seat_counts(10, 4, 0.5)
+    assert half.count(4) == 5 and half.count(2) == 5, f"frac=0.5 -> {half}"
+    print(f"  [ok] _board_seat_counts: half-mix={half}", flush=True)
+
+
+def _phantom_encode_check(cfg, seed: int) -> None:
+    """The new path: encoding a phantom opponent (a seat that doesn't exist on a
+    2-player board) must yield no valid sources (-> no-op actions) and stay finite."""
+    from src_jax.features import _make_env_encoder
+    from src_jax.env import make_board_pool
+
+    pool = make_board_pool(2, seed, num_agents=2, mix_4player_frac=1.0)  # 2-player boards
+    encode_batch = _make_env_encoder(cfg.env.candidate_count, cfg.env)
+    # Encode each board from the viewpoint of phantom seat 2 (does not exist on a 2p board).
+    phantom_players = jnp.full((2,), 2, dtype=jnp.int32)
+    enc = encode_batch(pool, phantom_players)
+    sv = np.asarray(enc.src_valid)
+    assert not sv.any(), f"phantom seat must have NO valid sources, got {int(sv.sum())}"
+    for name, arr in [("self_feats", enc.self_feats), ("cand_feats", enc.cand_feats),
+                      ("global_feat", enc.global_feat)]:
+        assert np.all(np.isfinite(np.asarray(arr))), f"phantom {name} non-finite"
+    print("  [ok] phantom-seat encode: 0 valid sources, features finite", flush=True)
+
+
+def _mixed_collect_check(cfg, frac: float, seed: int) -> None:
+    from src_jax.policies import build_policy
+    from src_jax.ppo import build_train_state
+    from src_jax.rollout import make_rollout_fn, RolloutCarry
+    from src_jax.env import make_board_pool, make_initial_carry_state
+
+    cfg.env.num_agents = 4
+    cfg.env.mix_4player_frac = frac
+    N_ENVS = cfg.ppo.num_envs
+    T = cfg.ppo.rollout_steps
+    N_BOARDS = 8
+
+    policy = build_policy(cfg)
+    train_state = build_train_state(cfg, seed=seed)
+    key = jax.random.PRNGKey(seed)
+
+    board_pool = make_board_pool(N_BOARDS, seed, num_agents=4, mix_4player_frac=frac)
+    na = np.asarray(board_pool.num_agents)
+    assert set(na.tolist()) == {2, 4}, f"mixed pool should have both 2 and 4, got {set(na.tolist())}"
+
+    collect = make_rollout_fn(
+        board_pool=board_pool, n_boards=N_BOARDS, cfg=cfg, module=policy,
+        rollout_steps=T, n_opponents=1, heuristic_opp_mask=(False,),
+        augment=cfg.ppo.augment,
+    )
+    batched_state, board_idx, ep_reward, learner_players = make_initial_carry_state(
+        board_pool, N_BOARDS, N_ENVS, seed, cfg.alternate_player_sides, num_agents=4,
+    )
+    # Learner must never sit in a phantom seat: learner_player < that env's num_agents.
+    lp = np.asarray(learner_players)
+    env_na = np.asarray(batched_state.num_agents)
+    assert np.all(lp < env_na), f"learner seat >= num_agents somewhere: lp={lp} na={env_na}"
+
+    carry = RolloutCarry(batched_state, board_idx, ep_reward, learner_players, key)
+    stacked_opp = jax.tree_util.tree_map(lambda x: x[None], train_state.params)
+    final_carry, steps = collect(train_state.params, stacked_opp, carry)
+    jax.block_until_ready(steps)
+
+    assert np.all(np.isfinite(np.asarray(steps.reward))), "mixed reward non-finite"
+    # is_4player global flag (feature [1]) must vary across envs in a mixed pool.
+    flags = set(np.asarray(steps.global_features)[0, :, 1].tolist())
+    assert flags == {0.0, 1.0}, f"mixed pool should show both is_4player flags, got {flags}"
+    print(f"  [ok] mixed collect (frac={frac}): pool 2&4, seats valid, "
+          f"is_4player flags={flags}, rewards finite", flush=True)
+
+
 def _collect_check(cfg, num_agents: int, seed: int) -> None:
     from src_jax.policies import build_policy
     from src_jax.ppo import build_train_state
@@ -127,6 +203,13 @@ def main() -> int:
     _board_owner_check(2, args.seed)
     _board_owner_check(4, args.seed)
 
+    print("== board seat-count mixing ==", flush=True)
+    _seat_counts_check()
+
+    print("== phantom-seat encode (mixed-pool new path) ==", flush=True)
+    cfg = load_train_config(args.config)
+    _phantom_encode_check(cfg, args.seed)
+
     print("== full collect() (tiny) ==", flush=True)
     for na in (2, 4):
         cfg = load_train_config(args.config)
@@ -135,6 +218,13 @@ def main() -> int:
         cfg.ppo.rollout_steps = 2
         cfg.ppo.augment = False
         _collect_check(cfg, na, args.seed)
+
+    print("== mixed 2p/4p collect() (tiny) ==", flush=True)
+    cfg = load_train_config(args.config)
+    cfg.ppo.num_envs = 8
+    cfg.ppo.rollout_steps = 2
+    cfg.ppo.augment = False
+    _mixed_collect_check(cfg, 0.5, args.seed)
 
     print("\nALL SMOKE CHECKS PASSED", flush=True)
     return 0

@@ -25,18 +25,20 @@ checkpoint_every: 25
 log_every: 1
 
 # Warm-start params (and the frozen KL reference). CLI --resume overrides this.
-resume: ./artifacts/ppo/ppo_low_kl/ckpt_000275.pkl
+resume: ./artifacts/ppo/ppo_low_kl_0614_2/ckpt_000375.pkl
+ref_policy: ./artifacts/ppo/ppo_low_kl_0614_2/ckpt_000375.pkl
 
 # FFA self-play: the three opposing seats share the current policy snapshot.
 # Swap to `ckpt:PATH` to fix a frozen opponent for all three seats instead.
 opponents:
   - self
-self_play_update_interval: 50
+self_play_update_interval: 200
 self_play_deterministic: false
 alternate_player_sides: true   # rotate the learner's seat 0->1->2->3 on reset
 eval_opponents:
   - sub_v52
   - sub_v7
+  - sub_v8
 eval_rounds: 64
 eval_update_interval: 25
 eval_workers: 32  # match --cpus-per-task in the slurm to avoid CPU oversubscription
@@ -44,6 +46,11 @@ eval_workers: 32  # match --cpus-per-task in the slurm to avoid CPU oversubscrip
 env:
   candidate_count: 12   # must match warm-start checkpoint (K12)
   num_agents: 4         # <-- free-for-all: 4 seats per game
+  # Fraction of board-pool games that are 4-player (rest are 2-player). 1.0 = pure
+  # FFA; set e.g. 0.5 for a mixed 1v1/FFA curriculum that keeps 1v1 (the scored
+  # format) sharp while learning FFA. Does not reduce compute. Only used when
+  # num_agents == 4.
+  mix_4player_frac: 1.0
 
 model:
   hidden_size: 256      # must match warm-start checkpoint (h256)
@@ -53,16 +60,16 @@ model:
 ppo:
   rollout_steps: 64
   num_envs: 1024
-  total_updates: 600
+  total_updates: 500
   epochs: 3
   minibatch_size: 1024
   matmul_precision: default
   gamma: 0.997
   gae_lambda: 0.95
   clip_coef: 0.2
-  ent_coef: 0.05
+  ent_coef: 0.02
   vf_coef: 0.5
-  kl_coef: 0.2
+  kl_coef: 0.1
   lr: 1e-4
-  max_grad_norm: 0.5
+  max_grad_norm: 1.0
   augment: true
