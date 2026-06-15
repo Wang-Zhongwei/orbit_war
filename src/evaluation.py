@@ -93,24 +93,26 @@ _v52_mod = _load_submission("stateful_v5.2")
 # src_jax resolution roots, keyed by a short label. Each PPO submission embeds a
 # src_jax tree built against a specific encoder architecture; it must be loaded
 # with the matching tree pinned (see _pinned_src_jax below). Most submissions
-# target the v7 architecture, which lives in the v7arch worktree. The "main" root
-# is the primary repo checkout itself — it is NOT a registered git worktree under
-# .claude/worktrees, just the live working tree — and exists so submissions built
-# against the current main src_jax can be assigned to it.
+# target the v7 architecture. After the v7_arch -> main merge the v7 arch IS the
+# live tree, so the "main" root loads them natively (byte-identical to the old
+# v7arch worktree). The "v9arch" root points at the parked previous architecture
+# (now living in the v9arch worktree) so a future v9-arch submission can be pinned
+# against it. The "main" root is the primary repo checkout itself.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SRC_JAX_ROOTS = {
-    "v7arch": _REPO_ROOT / ".claude" / "worktrees" / "v7arch",
     "main":   _REPO_ROOT,
+    "v9arch": _REPO_ROOT / ".claude" / "worktrees" / "v9arch",
 }
 
 # Map each PPO submission opponent to (submission_file, src_jax_root_label). The
-# root label selects which tree in _SRC_JAX_ROOTS to pin while loading it.
+# root label selects which tree in _SRC_JAX_ROOTS to pin while loading it. The
+# sub_vN below are v7-arch submissions, loaded against the live (now v7) tree.
 _PPO_SUBMISSIONS = {
-    "sub_v6":  ("ppo_from_bc_loser0", "v7arch"),
-    "sub_v7":  ("ppo_low_kl_v7",      "v7arch"),
-    "sub_v8":  ("sub_v8",             "v7arch"),
-    "sub_v81": ("sub_v8.1",           "v7arch"),
-    "sub_v82": ("sub_v8.2",           "v7arch"),
+    "sub_v6":  ("ppo_from_bc_loser0", "main"),
+    "sub_v7":  ("ppo_low_kl_v7",      "main"),
+    "sub_v8":  ("sub_v8",             "main"),
+    "sub_v81": ("sub_v8.1",           "main"),
+    "sub_v82": ("sub_v8.2",           "main"),
 }
 
 

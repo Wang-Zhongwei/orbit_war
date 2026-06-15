@@ -32,8 +32,8 @@ set -euo pipefail
 #   TOTAL_UPDATES  override ppo.total_updates
 #   REF_POLICY     explicit KL reference ckpt (default: the RESUME checkpoint, via train.py)
 #   JAX_SRC_ROOT   pin the trained arch to a worktree's src_jax (default: live tree).
-#                  e.g. JAX_SRC_ROOT=$PWD/.claude/worktrees/v7arch to train the
-#                  v7 arch while the repo is checked out on a different-arch branch.
+#                  e.g. JAX_SRC_ROOT=$PWD/.claude/worktrees/v9arch to train the previous
+#                  (v9) arch now that the live tree is the v7 arch.
 #                  train.py re-execs via tools/train_pinned.py to pin it.
 
 export WANDB_MODE=offline

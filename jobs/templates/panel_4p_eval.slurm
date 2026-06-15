@@ -17,7 +17,7 @@ REPO_ROOT="/home/018270239/orbit_war"
 cd "${REPO_ROOT}"
 echo "Running from: ${REPO_ROOT} on $(hostname)"
 
-WT=".claude/worktrees/v7arch"
+WT="${REPO_ROOT}"
 ROUNDS="${ROUNDS:-64}"
 
 echo "=================== ppo_4player ckpt_000425 vs sub_v8 (1-vs-3 FFA, ${ROUNDS}r) ==================="

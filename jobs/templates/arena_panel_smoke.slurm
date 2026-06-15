@@ -18,7 +18,7 @@ cd "${REPO_ROOT}"
 echo "Running from: ${REPO_ROOT} on $(hostname)"
 
 CKPT="artifacts/ppo/ppo_low_kl_0615/ckpt_last.pkl"
-WT=".claude/worktrees/v7arch"
+WT="${REPO_ROOT}"
 ROUNDS="${ROUNDS:-16}"
 # Default: batched opponent only (fast). Set OPPS to include rule-based fallbacks.
 OPPS="${OPPS:-sub_v8}"
