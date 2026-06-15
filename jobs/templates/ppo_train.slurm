@@ -31,6 +31,10 @@ set -euo pipefail
 #   RUN_NAME   run/ckpt name     (default from config: ppo_from_bc_loser0)
 #   TOTAL_UPDATES  override ppo.total_updates
 #   REF_POLICY     explicit KL reference ckpt (default: the RESUME checkpoint, via train.py)
+#   JAX_SRC_ROOT   pin the trained arch to a worktree's src_jax (default: live tree).
+#                  e.g. JAX_SRC_ROOT=$PWD/.claude/worktrees/v7arch to train the
+#                  v7 arch while the repo is checked out on a different-arch branch.
+#                  train.py re-execs via tools/train_pinned.py to pin it.
 
 export WANDB_MODE=offline
 # Allocate GPU memory on demand rather than JAX's default ~75% up-front grab.
@@ -67,6 +71,7 @@ args+=(--config "${CONFIG}")
 [[ -n "${TOTAL_UPDATES:-}" ]] && args+=(--total_updates "${TOTAL_UPDATES}")
 [[ -n "${REF_POLICY:-}"    ]] && args+=(--ref_policy    "${REF_POLICY}")
 [[ -n "${RESUME:-}"        ]] && args+=(--resume        "${RESUME}")
+[[ -n "${JAX_SRC_ROOT:-}"  ]] && args+=(--jax-src-root  "${JAX_SRC_ROOT}")
 
 echo "Running command: uv run python -m src_jax.train ${args[*]}"
 uv run python -m src_jax.train "${args[@]}"

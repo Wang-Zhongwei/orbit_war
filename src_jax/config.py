@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -272,3 +274,62 @@ def _coerce(value: Any, default: Any) -> Any:
     if isinstance(default, float):
         return float(value)
     return value
+
+
+# ── jax_src_root: pin the trained arch to a worktree ───────────────────────────
+# Env var the launcher sets so a re-execed (already-pinned) process never loops.
+PIN_ENV = "ORBIT_JAX_PINNED"
+
+
+def _yaml_jax_src_root(config_path: str | None) -> str | None:
+    """Read the top-level ``jax_src_root`` key from a config yaml, cheaply and
+    without importing the rest of src_jax (so it is safe to call before the pin)."""
+    if not config_path:
+        return None
+    try:
+        data = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
+    except OSError:
+        return None
+    root = data.get("jax_src_root") if isinstance(data, dict) else None
+    return str(root) if root else None
+
+
+def resolve_jax_src_root(argv: list[str] | None = None) -> str | None:
+    """Resolve the requested src_jax root from ``--jax-src-root`` on the command
+    line (highest priority) or the ``jax_src_root`` key of the ``--config`` yaml.
+    Returns an absolute path string, or None when no pin was requested."""
+    import argparse
+
+    argv = list(sys.argv[1:] if argv is None else argv)
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--config", default=None)
+    p.add_argument("--jax-src-root", "--jax_src_root", dest="jax_src_root", default=None)
+    known, _ = p.parse_known_args(argv)
+    root = known.jax_src_root or _yaml_jax_src_root(known.config)
+    return str(Path(root).resolve()) if root else None
+
+
+def maybe_reexec_for_pin(target: str) -> None:
+    """If a src_jax pin is requested and this process is not already pinned,
+    re-exec through ``tools/train_pinned.py`` so the pinned tree's src_jax is on
+    sys.path *before* the trainer's relative imports resolve. A no-op when no pin
+    is requested, when already running under the launcher (``PIN_ENV`` set), or
+    when the requested root is the live tree. ``target`` is the trainer module
+    suffix: "train" or "bc_train"."""
+    if os.environ.get(PIN_ENV) is not None:
+        return
+    root = resolve_jax_src_root()
+    if not root:
+        return
+    repo_root = Path(__file__).resolve().parents[1]
+    if Path(root) == repo_root:
+        return  # pin points at the live tree — nothing to switch
+    launcher = repo_root / "tools" / "train_pinned.py"
+    if not launcher.is_file():
+        raise FileNotFoundError(
+            f"jax_src_root={root!r} requested but launcher {launcher} is missing"
+        )
+    os.execv(
+        sys.executable,
+        [sys.executable, str(launcher), "--target", target, *sys.argv[1:]],
+    )

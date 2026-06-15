@@ -78,6 +78,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--total_updates", type=int, default=None)
     parser.add_argument("--augment", action="store_true", default=False)
+    parser.add_argument("--jax-src-root", "--jax_src_root", dest="jax_src_root", default=None,
+                        help="Pin the src_jax arch this run trains (e.g. a worktree path) "
+                             "regardless of the checked-out branch; overrides cfg.jax_src_root. "
+                             "Handled by re-exec before src_jax is imported — see config.py.")
     parser.add_argument("--no_wandb", action="store_true")
     return parser.parse_args()
 
@@ -145,6 +149,12 @@ def _enable_compile_cache() -> None:
 
 
 def main() -> None:
+    # If --jax-src-root pins a different src_jax arch than the live tree, re-exec
+    # through tools/train_pinned.py FIRST — before any src_jax submodule (or JAX)
+    # is touched — so the pinned tree's relative imports resolve. No-op otherwise.
+    from .config import maybe_reexec_for_pin
+    maybe_reexec_for_pin("train")
+
     from .accel import setup_accelerator
     setup_accelerator()  # CPU / GPU / TPU — pins matmul precision for backend parity
     _enable_compile_cache()
