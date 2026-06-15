@@ -45,6 +45,23 @@ class EnvConfig:
     candidate_count: int = 12
     max_planets: int = 48
     max_ships: float = 400.0
+    # Number of players seated per game. 2 = classic 1v1 self-play; 4 = free-for-all
+    # where the learner holds one seat and a single shared opponent policy controls
+    # the other (num_agents - 1) seats. Must be 2 or 4 (matches the board generator's
+    # home-planet assignment and the physics N_AGENTS=4 array capacity).
+    #
+    # This also sets the rollout's seat capacity (n_opp = num_agents - 1 opponent
+    # seats encoded per env), so it must be 4 to allow any 4-player boards — see
+    # mix_4player_frac.
+    num_agents: int = 2
+    # Fraction of board-pool games that are 4-player when num_agents == 4. 1.0 = all
+    # 4-player (pure FFA); 0.0 = all 2-player; 0.5 = half/half mixed curriculum. The
+    # non-4-player boards are generated as 2-player; their seats 2-3 stay phantom and
+    # the rollout's opponent policy emits no-ops for them, so a 2-player game runs
+    # correctly inside the 4-player machinery. Ignored when num_agents == 2 (always
+    # all 2-player). Mixing keeps the policy sharp at 1v1 (the scored format) while
+    # also learning FFA; it does NOT reduce compute (every env pays the 4-seat encode).
+    mix_4player_frac: float = 1.0
     # K-candidate selection strategy used by the feature encoder:
     #   "category" (default) — per-owner quotas (enemy/neutral/friendly) filled by
     #                          nearest-of-type, with nearest-of-any overflow backfill.

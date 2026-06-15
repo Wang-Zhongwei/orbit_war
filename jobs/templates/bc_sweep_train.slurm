@@ -39,7 +39,7 @@ export WANDB_MODE=offline
 # H100 OOM; this is just a safety net if anyone raises LANES.
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-REPO_ROOT="/home/018270239/orbit_war"
+REPO_ROOT="/home/018270239/orbit_war/.claude/worktrees/ppo4p"
 cd "${REPO_ROOT}"
 echo "Running from: ${REPO_ROOT}"
 echo "Host: $(hostname) | GPU: ${CUDA_VISIBLE_DEVICES:-?}"
