@@ -3,7 +3,7 @@ Behavior-cloning pretraining: imitate top players by minimizing cross-entropy.
 
 Usage:
     # Formal training — config file + optional CLI overrides (CLI wins):
-    python -m src_jax.bc_train --config configs/bc_default.yaml \\
+    python -m src_jax.bc_train --config configs/templates/bc_default.yaml \\
                                 --episode_dirs episodes/2026-05-24 \\
                                 --top_k_episodes 200 --out_dir ./artifacts/bc/run1
 

@@ -243,7 +243,7 @@ class TrainConfig:
 
 
 def default_train_config_path() -> Path:
-    return Path(__file__).resolve().parent.parent / "configs" / "ppo_default.yaml"
+    return Path(__file__).resolve().parent.parent / "configs" / "templates" / "ppo_default.yaml"
 
 
 def load_train_config(path: str | Path) -> TrainConfig:

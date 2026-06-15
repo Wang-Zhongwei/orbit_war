@@ -26,7 +26,7 @@ set -euo pipefail
 #   sbatch --export=ALL,RUN_NAME=...,TOTAL_UPDATES=... <this script>
 #
 # Optional env vars (all have defaults):
-#   CONFIG     PPO config yaml   (default configs/ppo_4player.yaml)
+#   CONFIG     PPO config yaml   (default configs/templates/ppo_4player.yaml)
 #   RESUME     warm-start ckpt   (default: from config's `resume:`)
 #   RUN_NAME / TOTAL_UPDATES / REF_POLICY — override config values
 #
@@ -52,7 +52,7 @@ echo "branch: $(git rev-parse --abbrev-ref HEAD)"
 echo "Host: $(hostname) | GPU: ${CUDA_VISIBLE_DEVICES:-?}"
 nvidia-smi -L || true
 
-CONFIG="${CONFIG:-configs/ppo_4player.yaml}"
+CONFIG="${CONFIG:-configs/templates/ppo_4player.yaml}"
 
 args=()
 args+=(--config "${CONFIG}")

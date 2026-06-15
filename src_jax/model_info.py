@@ -1,6 +1,6 @@
 """
 Usage:
-    python -m src_jax.model_info --config configs/ppo_default.yaml
+    python -m src_jax.model_info --config configs/templates/ppo_default.yaml
 """
 from __future__ import annotations
 

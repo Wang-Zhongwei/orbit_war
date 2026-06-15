@@ -11,5 +11,8 @@ wandb/*
 jobs/*
 !jobs/templates/
 !jobs/templates/**
+configs/*
+!configs/templates/
+!configs/templates/**
 analysis/*
 .jax_cache/
