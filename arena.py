@@ -377,13 +377,29 @@ def _rows_for_game(match_id, seed, fmt, num_steps, slot_names, rewards):
     return rows, {"agents": list(slot_names), "ranks": ranks}, outcomes
 
 
+def _eval_win_score(ranks, eval_seat) -> float:
+    """Win credit for the evaluated agent in one game.
+
+    1.0 if it holds the sole rank-1 seat (won), 0.5 if tied for rank-1 with an
+    opponent, else 0.0. "Win" = controlling the top seat — so against ``P`` equal
+    players the expected score is 1/P (0.5 for 1v1, 0.25 for 4-player FFA).
+    """
+    eval_won   = ranks[eval_seat] == 1
+    others_won = any(rk == 1 for s, rk in enumerate(ranks) if s != eval_seat)
+    if eval_won and not others_won:
+        return 1.0
+    if eval_won and others_won:
+        return 0.5
+    return 0.0
+
+
 def panel(
     eval_agent: str,
     opponents: Sequence[str],
     rounds: int,
     base_seed: int,
     *,
-    ffa: bool = False,
+    num_players: int = 2,
     csv_path: Path = DEFAULT_CSV,
     episode_steps: int = 500,
     verbose: bool = True,
@@ -392,23 +408,43 @@ def panel(
     jax_deterministic: bool = True,
     jax_src_root: str | None = None,
 ) -> dict[str, float]:
-    """Evaluate ``eval_agent`` vs each opponent over ``rounds`` seeds.
+    """Evaluate ``eval_agent`` vs each opponent over ``rounds`` games.
 
-    1v1 (default): eval vs opponent, side alternated across rounds.
-    ``ffa=True``: 1-vs-3 — eval at seat 0 against 3 copies of the opponent.
+    ``num_players=2``: 1v1, eval vs opponent.
+    ``num_players=4``: 1-vs-3 FFA — eval against 3 copies of the opponent.
+
+    The evaluated agent's seat is shuffled across rounds (balanced: each of the
+    ``num_players`` positions used as equally as possible, then shuffled with a
+    ``base_seed``-seeded RNG for reproducibility) so the config each round looks
+    like e.g. ``[a,b,b,b]`` or ``[b,b,a,b]`` and positional bias averages out. The
+    same seat schedule + boards are reused for every opponent, so per-opponent
+    numbers stay comparable.
+
+    Win rate = fraction of rounds the evaluated agent holds the rank-1 seat (ties
+    split 0.5); the even baseline is ``1/num_players``. Each opponent copy's
+    implied win rate is ``(1 - eval_win_rate)/(num_players-1)``.
 
     For an opponent where eval AND opponent are both JAX-arch, all ``rounds`` games
     play in ONE on-device jitted scan (eval_jax.play_match_batched). Otherwise the
     opponent falls back to the kaggle env.run path (one game per round). Returns
-    {opponent: win_rate in [0,1]} (draws = 0.5) and writes the usual CSV rows.
+    {opponent: eval_win_rate in [0,1]} and writes the usual CSV rows.
     """
-    n_seats = 4 if ffa else 2
-    fmt = f"ffa{n_seats}" if ffa else "1v1"
+    if num_players not in (2, 4):
+        raise ValueError(f"num_players must be 2 or 4, got {num_players}")
+    n_seats = num_players
+    fmt = "1v1" if num_players == 2 else f"ffa{num_players}"
 
     eval_spec = _jax_spec_for(
         eval_agent, jax_checkpoint=jax_checkpoint, jax_name=jax_name,
         jax_src_root=jax_src_root, deterministic=jax_deterministic,
     )
+
+    # Balanced + shuffled seat for the evaluated agent, one per round. spec 0 =
+    # eval, spec 1 = opponent; seat_assign[e][s] is the spec index at seat s.
+    eval_seats = [i % n_seats for i in range(rounds)]
+    random.Random(base_seed).shuffle(eval_seats)
+    seat_assign = [[0 if s == eval_seats[e] else 1 for s in range(n_seats)]
+                   for e in range(rounds)]
 
     all_rows: list[list] = []
     match_records: list[dict] = []
@@ -426,34 +462,24 @@ def panel(
 
         if batched:
             ej = _eval_jax
-            # spec 0 = eval, spec 1 = opponent.
-            if ffa:
-                seat_assign = [[0, 1, 1, 1] for _ in range(rounds)]
-            else:
-                seat_assign = [[0, 1] if e % 2 == 0 else [1, 0] for e in range(rounds)]
             rewards, steps = ej.play_match_batched(
                 [eval_spec, opp_spec], seat_assign, rounds, base_seed, episode_steps,
             )
             for e in range(rounds):
-                sa = seat_assign[e]
-                slot_names = [eval_agent if j == 0 else opp for j in sa]
+                slot_names = [eval_agent if j == 0 else opp for j in seat_assign[e]]
                 rows, rec, outcomes = _rows_for_game(
                     uuid.uuid4().hex[:12], base_seed + e, fmt, int(steps[e]),
                     slot_names, rewards[e],
                 )
                 all_rows.extend(rows)
                 match_records.append(rec)
-                eval_seat = sa.index(0)
-                oc = outcomes[eval_seat]
-                wins  += int(oc == 1.0)
-                draws += int(oc == 0.5)
+                sc = _eval_win_score(rec["ranks"], eval_seats[e])
+                wins  += int(sc == 1.0)
+                draws += int(sc == 0.5)
         else:
             for e in range(rounds):
                 seed = base_seed + e
-                if ffa:
-                    slot_names = [eval_agent, opp, opp, opp]
-                else:
-                    slot_names = [eval_agent, opp] if e % 2 == 0 else [opp, eval_agent]
+                slot_names = [eval_agent if j == 0 else opp for j in seat_assign[e]]
                 raw = run_match_raw(list(slot_names), seed, episode_steps=episode_steps)
                 rows, rec, _ = _rows_for_game(
                     uuid.uuid4().hex[:12], seed, fmt, raw["num_steps"],
@@ -461,28 +487,32 @@ def panel(
                 )
                 all_rows.extend(rows)
                 match_records.append(rec)
-                eval_seat = slot_names.index(eval_agent)
-                oc = raw["outcomes"][eval_seat]
-                wins  += int(oc == 1.0)
-                draws += int(oc == 0.5)
+                sc = _eval_win_score(rec["ranks"], eval_seats[e])
+                wins  += int(sc == 1.0)
+                draws += int(sc == 0.5)
 
         wr = (wins + 0.5 * draws) / rounds if rounds else 0.0
         win_rates[opp] = wr
         if verbose:
             mode = "batched" if batched else "env.run"
+            opp_wr = (1.0 - wr) / (num_players - 1)
             print(f"  {eval_agent} vs {opp:<11} [{mode:>7}]: "
-                  f"win_rate={wr:.3f} ({wins}W {draws}D {rounds - wins - draws}L) "
-                  f"({time.perf_counter() - t0:.1f}s)", flush=True)
+                  f"win_rate={wr:.3f} ({wins}W {draws}D {rounds - wins - draws}L)"
+                  f"  each {opp}~{opp_wr:.3f}  ({time.perf_counter() - t0:.1f}s)",
+                  flush=True)
 
     _flush_rows(all_rows, csv_path)
 
+    mode_label = "1v1" if num_players == 2 else f"1-vs-{num_players - 1} FFA"
     print()
     print(format_head_to_head_matrix(match_records, [eval_agent, *opponents]))
     print()
-    print(f"{eval_agent} win rates ({'1-vs-3 FFA' if ffa else '1v1'}, "
-          f"{rounds} rounds each):")
+    print(f"{eval_agent} win rates ({mode_label}, {rounds} rounds each; "
+          f"even baseline = {1.0 / num_players:.3f}):")
     for opp, wr in win_rates.items():
-        print(f"  vs {opp:<12} {wr * 100:5.1f}%")
+        opp_wr = (1.0 - wr) / (num_players - 1)
+        print(f"  vs {opp:<12} {eval_agent}={wr * 100:5.1f}%   "
+              f"(each {opp} ~{opp_wr * 100:4.1f}%)")
     return win_rates
 
 
@@ -563,8 +593,9 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="Opponent agent names to evaluate against.")
     p_panel.add_argument("--rounds", type=int, default=64,
                          help="Games per opponent (default 64).")
-    p_panel.add_argument("--ffa", action="store_true",
-                         help="1-vs-3 FFA: eval at seat 0 vs 3 copies of each opponent.")
+    p_panel.add_argument("--num-players", type=int, choices=[2, 4], default=2,
+                         help="2 = 1v1; 4 = 1-vs-3 FFA (eval vs 3 copies of each "
+                              "opponent). The eval agent's seat is shuffled each round.")
     p_panel.add_argument("--base-seed", type=int, default=1000)
     p_panel.add_argument("--out", type=Path, default=DEFAULT_CSV)
     p_panel.add_argument("--episode-steps", type=int, default=500)
@@ -653,7 +684,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             list(dict.fromkeys(args.opponents)),
             rounds=args.rounds,
             base_seed=args.base_seed,
-            ffa=args.ffa,
+            num_players=args.num_players,
             csv_path=args.out,
             episode_steps=args.episode_steps,
             verbose=not args.quiet,
