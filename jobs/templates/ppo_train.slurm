@@ -53,7 +53,7 @@ export OMP_NUM_THREADS="${_NCPU}"
 export OPENBLAS_NUM_THREADS="${_NCPU}"
 export MKL_NUM_THREADS="${_NCPU}"
 
-REPO_ROOT="/home/018270239/orbit_war_v7arch"
+REPO_ROOT="/home/018270239/orbit_war/.claude/worktrees/v7arch"
 cd "${REPO_ROOT}"
 echo "Running from: ${REPO_ROOT}"
 echo "Host: $(hostname) | GPU: ${CUDA_VISIBLE_DEVICES:-?}"
