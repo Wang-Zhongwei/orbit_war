@@ -38,12 +38,16 @@ from __future__ import annotations
 
 import functools
 import pickle
+from pathlib import Path
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 
 from .physics import (
     jax_step,
+    jax_step_jit,
+    init_jax_state,
     MAX_BASE_PLANETS,
     MAX_ACTIONS_PA,
     N_AGENTS,
@@ -53,7 +57,22 @@ from .policies import build_policy
 from .rollout import _build_actions_single
 from .env import make_board_pool, select_boards
 
-MAX_SRC = MAX_BASE_PLANETS
+MAX_SRC   = MAX_BASE_PLANETS
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+class EvalSpec(NamedTuple):
+    """Everything needed to run one JAX policy in the batched eval scan.
+
+    ``module``/``encode_fn`` may come from this tree OR a pinned worktree — they
+    only ever touch the shared (byte-identical) EnvState and emit standard
+    ``[planet_id, angle, ships]`` action rows, so specs from different trees mix
+    freely in one scan.
+    """
+    module: object
+    encode_fn: object
+    params: object
+    deterministic: bool
 
 # Opponent names whose policy is a JAX network this module can run on-device.
 # (The submission keys mirror ``src.evaluation._PPO_SUBMISSIONS``.)
@@ -347,3 +366,162 @@ def run_eval_jax(
         results[name] = float(jnp.mean(outcome))
 
     return results
+
+
+# ===========================================================================
+# General K-player batched match (2 OR 4 seats) — used by arena post-training
+# evaluation. The train path above stays 2-player and untouched.
+# ===========================================================================
+
+# Cache K-player board sets, keyed by (n_envs, base_seed, num_agents).
+_KBOARDS_CACHE: dict = {}
+
+
+def _get_kplayer_boards(n_envs, base_seed, num_agents):
+    """Stacked EnvState[n_envs] of fresh ``num_agents``-player boards (init-tick
+    applied, exactly like env._init_one but with a player count)."""
+    cache_key = (n_envs, base_seed, num_agents)
+    cached = _KBOARDS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    empty = jnp.full((N_AGENTS, MAX_ACTIONS_PA, 3), -1.0, dtype=jnp.float32)
+    states = []
+    for i in range(n_envs):
+        s = init_jax_state(base_seed + i, num_agents=num_agents)
+        s, _, _ = jax_step_jit(s, empty)   # kaggle init-tick
+        states.append(s)
+    boards = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *states)
+    _KBOARDS_CACHE[cache_key] = boards
+    return boards
+
+
+def _make_match_run_fn(act_fns, needed_pairs, n_specs, n_seats, n_envs, episode_steps):
+    """Build a jitted scan that plays one full ``n_seats``-player game per env.
+
+    ``act_fns``      : list[n_specs] of ``act(params, state, players, key)`` (from
+                       _make_act_fn) — one per distinct policy.
+    ``needed_pairs`` : iterable of (spec_idx, seat) that actually occur in
+                       ``seat_assign`` — only those (policy, seat) actions are traced.
+    Returns ``run(params_tuple, seat_assign, init_state, key) -> (rewards[N,S], steps[N])``
+    where rewards/steps are latched at each env's terminal tick.
+    """
+    batched_step = jax.vmap(functools.partial(jax_step, episode_steps=episode_steps))
+    env_ar  = jnp.arange(n_envs, dtype=jnp.int32)
+    seat_ar = jnp.broadcast_to(jnp.arange(n_seats, dtype=jnp.int32)[None, :], (n_envs, n_seats))
+    env_grid = jnp.broadcast_to(env_ar[:, None], (n_envs, n_seats))
+    needed_pairs = list(needed_pairs)
+
+    def step(params_tuple, seat_assign, carry, _):
+        state, key, finished, latched_r, latched_steps = carry
+
+        # Each distinct (policy, seat) computes its action across all envs; the
+        # policy occupying a seat encodes egocentrically as that seat's player.
+        acts = jnp.zeros((n_specs, n_seats, n_envs, MAX_ACTIONS_PA, 3), dtype=jnp.float32)
+        for (j, s) in needed_pairs:
+            players = jnp.full((n_envs,), s, dtype=jnp.int32)
+            rows, key = act_fns[j](params_tuple[j], state, players, key)
+            acts = acts.at[j, s].set(rows)
+
+        # joint[e, seat] = action of the policy assigned to that seat in env e.
+        joint_seats = acts[seat_assign, seat_ar, env_grid]      # [N, S, A, 3]
+        if n_seats < N_AGENTS:
+            dummy = jnp.full((n_envs, N_AGENTS - n_seats, MAX_ACTIONS_PA, 3), -1.0)
+            joint = jnp.concatenate([joint_seats, dummy], axis=1)
+        else:
+            joint = joint_seats
+
+        new_state, statuses, rewards = batched_step(state, joint)
+
+        done  = statuses[:, 0].astype(jnp.bool_)               # seat 0 always active
+        newly = done & (~finished)
+        latched_r     = jnp.where(newly[:, None], rewards[:, :n_seats], latched_r)
+        latched_steps = jnp.where(newly, new_state.step, latched_steps)
+        finished = finished | done
+        return (new_state, key, finished, latched_r, latched_steps), None
+
+    @jax.jit
+    def run(params_tuple, seat_assign, init_state, key):
+        init = (
+            init_state,
+            key,
+            jnp.zeros(n_envs, dtype=jnp.bool_),
+            jnp.zeros((n_envs, n_seats), dtype=jnp.float32),
+            jnp.zeros(n_envs, dtype=jnp.int32),
+        )
+        scan_step = functools.partial(step, params_tuple, seat_assign)
+        (_, _, _, latched_r, latched_steps), _ = jax.lax.scan(
+            scan_step, init, None, length=episode_steps
+        )
+        return latched_r, latched_steps
+
+    return run
+
+
+def play_match_batched(specs, seat_assign, n_envs, base_seed, episode_steps):
+    """Play ``n_envs`` full games of an ``n_seats``-player match in one scan.
+
+    ``specs``       : list[n_specs] of EvalSpec (distinct policies).
+    ``seat_assign`` : int array/list [n_envs, n_seats] — spec index occupying each
+                      seat per env (e.g. 1-vs-3 FFA = [[0,1,1,1]]*n_envs; 1v1 with
+                      side alternation = [[0,1],[1,0],...]).
+    Returns (rewards [n_envs, n_seats] float, steps [n_envs] int) as host arrays.
+    rewards are the terminal per-seat rewards (+1 win / -1 lose / 0 draw).
+    """
+    import numpy as np
+
+    seat_assign = jnp.asarray(seat_assign, dtype=jnp.int32)
+    n_seats     = int(seat_assign.shape[1])
+    n_specs     = len(specs)
+
+    boards = _get_kplayer_boards(n_envs, base_seed, n_seats)
+
+    act_fns = [
+        _make_act_fn(sp.module, sp.encode_fn, deterministic=sp.deterministic)
+        for sp in specs
+    ]
+    params_tuple = tuple(jax.tree_util.tree_map(jnp.asarray, sp.params) for sp in specs)
+
+    sa_host = np.asarray(seat_assign)
+    needed_pairs = sorted({(int(sa_host[e, s]), s)
+                           for e in range(sa_host.shape[0])
+                           for s in range(n_seats)})
+
+    run = _make_match_run_fn(act_fns, needed_pairs, n_specs, n_seats, n_envs, episode_steps)
+    key = jax.random.PRNGKey(base_seed)
+    rewards, steps = run(params_tuple, seat_assign, boards, key)
+    return np.asarray(rewards), np.asarray(steps)
+
+
+# ---------------------------------------------------------------------------
+# Spec builders for arena agents
+# ---------------------------------------------------------------------------
+
+def spec_from_checkpoint(ckpt_path, src_root=None, deterministic=True) -> EvalSpec:
+    """Build an EvalSpec from a JAX checkpoint .pkl.
+
+    ``src_root`` is the tree whose ``src_jax`` matches the checkpoint's arch
+    (default: this repo). Loaded under a pinned import so a hijacked
+    ``sys.modules['src_jax']`` (from submission opponents) can't mismatch shapes —
+    same robustness as ``arena._register_jax_agent``.
+    """
+    import importlib
+
+    from src.evaluation import _pinned_src_jax
+
+    root = Path(src_root) if src_root else _REPO_ROOT
+    with open(ckpt_path, "rb") as f:
+        ckpt = pickle.load(f)
+    cfg = ckpt["config"]
+    with _pinned_src_jax(root):
+        pol = importlib.import_module("src_jax.policies")
+        fea = importlib.import_module("src_jax.features")
+        params    = jax.tree_util.tree_map(jnp.asarray, ckpt["params"])
+        module    = pol.build_policy(cfg)
+        encode_fn = fea._make_env_encoder(cfg.env.candidate_count, cfg.env)
+    return EvalSpec(module, encode_fn, params, deterministic)
+
+
+def spec_from_submission(name) -> EvalSpec:
+    """EvalSpec for a registered JAX submission opponent (sub_vN)."""
+    module, encode_fn, params, det = _submission_spec(name)
+    return EvalSpec(module, encode_fn, params, det)
