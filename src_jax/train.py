@@ -160,7 +160,7 @@ def main() -> None:
     print(f"Using {N} parallel environments, board pool size {N_BOARDS}")
 
     # ── Board pool ────────────────────────────────────────────────────────────
-    board_pool = make_board_pool(N_BOARDS, cfg.seed)
+    board_pool = make_board_pool(N_BOARDS, cfg.seed, num_agents=cfg.env.num_agents)
 
     # ── Encoder (shared between rollout and bootstrap value) ──────────────────
     encode_batch = _make_env_encoder(K, cfg.env)
@@ -240,7 +240,8 @@ def main() -> None:
 
     # ── Initial carry ─────────────────────────────────────────────────────────
     batched_state, board_idx, ep_reward, learner_players = make_initial_carry_state(
-        board_pool, N_BOARDS, N, cfg.seed, cfg.alternate_player_sides
+        board_pool, N_BOARDS, N, cfg.seed, cfg.alternate_player_sides,
+        num_agents=cfg.env.num_agents,
     )
     carry = RolloutCarry(batched_state, board_idx, ep_reward, learner_players, key)
 

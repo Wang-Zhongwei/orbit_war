@@ -45,6 +45,11 @@ class EnvConfig:
     candidate_count: int = 12
     max_planets: int = 48
     max_ships: float = 400.0
+    # Number of players seated per game. 2 = classic 1v1 self-play; 4 = free-for-all
+    # where the learner holds one seat and a single shared opponent policy controls
+    # the other (num_agents - 1) seats. Must be 2 or 4 (matches the board generator's
+    # home-planet assignment and the physics N_AGENTS=4 array capacity).
+    num_agents: int = 2
     # K-candidate selection strategy used by the feature encoder:
     #   "category" (default) — per-owner quotas (enemy/neutral/friendly) filled by
     #                          nearest-of-type, with nearest-of-any overflow backfill.

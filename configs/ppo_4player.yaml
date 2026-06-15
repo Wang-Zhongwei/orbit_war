@@ -1,0 +1,68 @@
+# 4-player (free-for-all) PPO fine-tuning.
+#
+# The learner holds ONE seat; a single shared opponent policy controls the other
+# three seats (each encoded from its own egocentric viewpoint). With `opponents:
+# [self]` this is true FFA self-play — the three opponents all use the current
+# policy snapshot, refreshed every self_play_update_interval updates.
+#
+# Warm-start: starts from the best 2-player PPO checkpoint. The feature encoder is
+# identical for 2- and 4-player (the only difference is the global `is_4player`
+# flag, feature [1], flipping 0 -> 1), so param shapes load unchanged — no
+# retraining of the encoder needed. kl_coef anchors to that same checkpoint.
+#
+# NOTE: eval (eval_opponents below) still runs 1v1 benchmark matches — it is a
+# sanity signal on the policy's 1v1 strength, NOT a 4-player evaluation. A proper
+# FFA eval would need a separate harness.
+#
+# IMPORTANT: model.hidden_size / env.candidate_count MUST match the warm-start
+# checkpoint (h256 / K12) or param shapes won't load.
+
+seed: 42
+run_name: ppo_4player
+device: auto
+save_dir: ./artifacts/ppo
+checkpoint_every: 25
+log_every: 1
+
+# Warm-start params (and the frozen KL reference). CLI --resume overrides this.
+resume: ./artifacts/ppo/ppo_low_kl/ckpt_000275.pkl
+
+# FFA self-play: the three opposing seats share the current policy snapshot.
+# Swap to `ckpt:PATH` to fix a frozen opponent for all three seats instead.
+opponents:
+  - self
+self_play_update_interval: 50
+self_play_deterministic: false
+alternate_player_sides: true   # rotate the learner's seat 0->1->2->3 on reset
+eval_opponents:
+  - sub_v52
+  - sub_v7
+eval_rounds: 64
+eval_update_interval: 25
+eval_workers: 32  # match --cpus-per-task in the slurm to avoid CPU oversubscription
+
+env:
+  candidate_count: 12   # must match warm-start checkpoint (K12)
+  num_agents: 4         # <-- free-for-all: 4 seats per game
+
+model:
+  hidden_size: 256      # must match warm-start checkpoint (h256)
+  shared_backbone: true
+  value_stop_grad: true
+
+ppo:
+  rollout_steps: 64
+  num_envs: 1024
+  total_updates: 600
+  epochs: 3
+  minibatch_size: 1024
+  matmul_precision: default
+  gamma: 0.997
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  ent_coef: 0.05
+  vf_coef: 0.5
+  kl_coef: 0.2
+  lr: 1e-4
+  max_grad_norm: 0.5
+  augment: true

@@ -136,6 +136,15 @@ def make_rollout_fn(
     capture_bonus      = jnp.float32(cfg.ppo.capture_bonus)
     capture_time_weight = jnp.float32(cfg.ppo.capture_time_weight)
 
+    # Players seated per game (2 = 1v1, 4 = FFA). The learner holds one seat and a
+    # single shared opponent policy controls the other n_opp = num_agents - 1 seats.
+    # num_agents is static (python int) so the opponent-slot loop and joint-action
+    # scatter unroll at JIT time; N_AGENTS (=4) stays the physical array width.
+    num_agents = int(cfg.env.num_agents)
+    n_opp      = num_agents - 1
+    assert num_agents in (2, 4), f"num_agents must be 2 or 4, got {num_agents}"
+    assert num_agents <= N_AGENTS, f"num_agents {num_agents} exceeds physics N_AGENTS {N_AGENTS}"
+
     if not heuristic_opp_mask:
         heuristic_opp_mask = (False,) * n_opponents
     _any_heuristic = any(heuristic_opp_mask)
@@ -201,23 +210,36 @@ def make_rollout_fn(
             enc.src_ids, enc.src_ships, enc.cand_mask, enc.angles, enc.src_valid, ti,
         )  # [N, MAX_ACTIONS_PA, 3]
 
+    def _opp_player_ids(lp):
+        """Ordered ids of the n_opp seats that aren't the learner's, for one env.
+
+        j in [0, n_opp) maps to player id ``j + (j >= lp)`` — i.e. arange(num_agents)
+        with the learner's seat removed. e.g. num_agents=4, lp=2 -> [0, 1, 3].
+        """
+        j = jnp.arange(n_opp, dtype=jnp.int32)
+        return j + (j >= lp).astype(jnp.int32)
+
     def _joint_actions(learner_players, l_acts, o_acts):
-        dummy = jnp.full((N_ENVS, N_AGENTS - 2, MAX_ACTIONS_PA, 3), -1.0)
-
-        def one_env(lp_idx, l_act, o_act):
-            p0 = jax.lax.cond(lp_idx == 0, lambda: l_act, lambda: o_act)
-            p1 = jax.lax.cond(lp_idx == 0, lambda: o_act, lambda: l_act)
-            return jnp.stack([p0, p1], axis=0)  # [2, MAX_ACTIONS_PA, 3]
-
-        two = jax.vmap(one_env)(learner_players, l_acts, o_acts)  # [N, 2, ...]
-        return jnp.concatenate([two, dummy], axis=1)               # [N, N_AGENTS, ...]
+        # l_acts: [N, MAX_ACTIONS_PA, 3]; o_acts: [N, n_opp, MAX_ACTIONS_PA, 3]
+        # Scatter the learner action into its seat and each opponent action into its
+        # seat, leaving phantom seats (>= num_agents) as no-ops (-1).
+        def one_env(lp, l_act, o_act):
+            full = jnp.full((N_AGENTS, MAX_ACTIONS_PA, 3), -1.0, jnp.float32)
+            full = full.at[lp].set(l_act)
+            full = full.at[_opp_player_ids(lp)].set(o_act)
+            return full  # [N_AGENTS, MAX_ACTIONS_PA, 3]
+        return jax.vmap(one_env)(learner_players, l_acts, o_acts)  # [N, N_AGENTS, ...]
 
     def _reward_and_done(learner_players, statuses, rewards):
+        # FFA-general: physics gives +1 to every co-winner. Mirror the 1v1 "a shared
+        # win is a draw → 0 reward" rule by zeroing the learner's reward whenever it
+        # is one of multiple winners. For num_agents=2 this is exactly the old
+        # "both win → 0" behaviour (n_winners == 2).
         def one_env(lp_idx, sts, rws):
-            done_ = sts[lp_idx].astype(jnp.bool_)
-            my_r  = rws[lp_idx]
-            opp_r = rws[1 - lp_idx]
-            r = jnp.where((my_r > 0.0) & (opp_r > 0.0), 0.0, my_r)
+            done_     = sts[lp_idx].astype(jnp.bool_)
+            my_r      = rws[lp_idx]
+            n_winners = (rws > 0.0).sum()
+            r = jnp.where((my_r > 0.0) & (n_winners > 1), 0.0, my_r)
             return done_, jnp.where(done_, r, 0.0)
         return jax.vmap(one_env)(learner_players, statuses, rewards)
 
@@ -238,31 +260,45 @@ def make_rollout_fn(
         ti, lp, val, key = _run_policy(params, l_enc, key, deterministic=False)
         l_acts = _enc_to_actions(l_enc, ti)
 
-        # Opponent actions — heuristic and/or neural branches resolved at JIT time.
-        opp_players = 1 - learner_players
+        # Opponent actions. Per env there are n_opp = num_agents - 1 opposing seats,
+        # each controlled by the same (shared) opponent policy but encoded from its
+        # own egocentric viewpoint. We unroll over the seats (n_opp is static) so the
+        # heuristic/neural branch selection is resolved once at JIT time. Each seat j
+        # of every env holds player id `j + (j >= learner_player)`.
+        # opp_player_ids: [N, n_opp]
+        opp_player_ids = jax.vmap(_opp_player_ids)(learner_players)
 
-        if _any_heuristic:
-            h_acts = _vmap_heuristic(state, opp_players)  # [N, MAX_ACTIONS_PA, 3]
+        def _opp_actions(opp_players_j, key):
+            """Actions [N, MAX_ACTIONS_PA, 3] for one opponent seat across all envs."""
+            if _any_heuristic:
+                h_acts = _vmap_heuristic(state, opp_players_j)
 
-        if _any_neural:
-            o_enc = encode_batch(state, opp_players)
-            if n_opponents == 1:
-                # All envs share the same params — use the efficient batched forward.
-                single_opp = jax.tree_util.tree_map(lambda p: p[0], opp_params)
-                oti, _, _, key = _run_policy(single_opp, o_enc, key, deterministic=opp_deterministic)
+            if _any_neural:
+                o_enc = encode_batch(state, opp_players_j)
+                if n_opponents == 1:
+                    # All envs share the same params — use the efficient batched forward.
+                    single_opp = jax.tree_util.tree_map(lambda p: p[0], opp_params)
+                    oti, _, _, key = _run_policy(single_opp, o_enc, key, deterministic=opp_deterministic)
+                else:
+                    oti, key = _run_opp_policy(opp_params, o_enc, key, deterministic=opp_deterministic)
+                n_acts = _enc_to_actions(o_enc, oti)
+
+            if _any_heuristic and _any_neural:
+                # Mixed pool: select per-env based on which opponent slot is assigned.
+                opp_slot = jnp.arange(N_ENVS, dtype=jnp.int32) % n_opponents
+                env_is_heuristic = _heuristic_arr[opp_slot]   # [N]
+                acts = jnp.where(env_is_heuristic[:, None, None], h_acts, n_acts)
+            elif _any_heuristic:
+                acts = h_acts
             else:
-                oti, key = _run_opp_policy(opp_params, o_enc, key, deterministic=opp_deterministic)
-            n_acts = _enc_to_actions(o_enc, oti)
+                acts = n_acts
+            return acts, key
 
-        if _any_heuristic and _any_neural:
-            # Mixed pool: select per-env based on which opponent slot is assigned.
-            opp_slot = jnp.arange(N_ENVS, dtype=jnp.int32) % n_opponents
-            env_is_heuristic = _heuristic_arr[opp_slot]   # [N]
-            o_acts = jnp.where(env_is_heuristic[:, None, None], h_acts, n_acts)
-        elif _any_heuristic:
-            o_acts = h_acts
-        else:
-            o_acts = n_acts
+        o_acts_slots = []
+        for j in range(n_opp):
+            acts_j, key = _opp_actions(opp_player_ids[:, j], key)
+            o_acts_slots.append(acts_j)
+        o_acts = jnp.stack(o_acts_slots, axis=1)  # [N, n_opp, MAX_ACTIONS_PA, 3]
 
         # Physics step
         joint = _joint_actions(learner_players, l_acts, o_acts)
@@ -298,9 +334,11 @@ def make_rollout_fn(
 
         def maybe_reset(env_done, env_state, new_board, lp):
             ns  = jax.lax.cond(env_done, lambda: new_board, lambda: env_state)
+            # Rotate the learner's seat on reset so every seat is trained equally.
+            # For num_agents=2 this is the original 0<->1 swap.
             nlp = jax.lax.cond(
                 env_done & alternate_sides,
-                lambda: jnp.int32(1) - lp,
+                lambda: (lp + 1) % jnp.int32(num_agents),
                 lambda: lp,
             )
             return ns, nlp
