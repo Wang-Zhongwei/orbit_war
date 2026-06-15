@@ -367,6 +367,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--agents", nargs="+", required=True,
         help="Agent names in slot order (length 2 or 4).",
     )
+    p_match.add_argument(
+        "--ffa", action="store_true",
+        help="1-vs-3 free-for-all: play agents[0] against 3 copies of agents[1] "
+             "(a 4-player game). Requires exactly 2 --agents; slot 0 is the "
+             "evaluated agent, slots 1-3 are the opponent.",
+    )
     p_match.add_argument("--seed", type=int, default=0)
     p_match.add_argument("--out", type=Path, default=DEFAULT_CSV)
     p_match.add_argument("--episode-steps", type=int, default=500)
@@ -417,14 +423,23 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
 
     if args._handler == "match":
-        if len(args.agents) not in (2, 4):
+        agents = list(args.agents)
+        if args.ffa:
+            # 1-vs-3: agents[0] against 3 copies of agents[1] (4-player FFA).
+            if len(agents) != 2:
+                print("--ffa needs exactly 2 --agents (evaluated opponent); it "
+                      "expands to [agent0, agent1, agent1, agent1].", file=sys.stderr)
+                return 2
+            agents = [agents[0], agents[1], agents[1], agents[1]]
+        elif len(agents) not in (2, 4):
             print("Orbit Wars supports 2 or 4 player matches.", file=sys.stderr)
             return 2
-        if len(set(args.agents)) != len(args.agents):
-            print("Duplicate agents in slot list — pass distinct names.", file=sys.stderr)
+        elif len(set(agents)) != len(agents):
+            print("Duplicate agents in slot list — pass distinct names "
+                  "(or use --ffa for 1-vs-3 copies).", file=sys.stderr)
             return 2
         res = play_match(
-            args.agents,
+            agents,
             seed=args.seed,
             episode_steps=args.episode_steps,
             csv_path=args.out,
@@ -432,7 +447,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
         print(
             f"match_id={res['match_id']}  seed={res['seed']}  "
-            f"steps={res['num_steps']}  rewards={res['rewards']}  "
+            f"{'ffa(1v3) ' if args.ffa else ''}steps={res['num_steps']}  "
+            f"rewards={res['rewards']}  "
             f"ranks={res['ranks']}  outcomes={[round(o, 2) for o in res['outcomes']]}  "
             f"wall={res['wall_time_s']:.2f}s"
         )
