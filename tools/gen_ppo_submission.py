@@ -75,14 +75,76 @@ def build_ckpt_b64() -> str:
     return base64.b64encode(blob).decode()
 
 
-WARM_OBS = Path("/home/018270239/.claude/jobs/46538ad6/tmp/warm_obs.pkl")
+# Persistent (git-trackable) cache of captured warm observations. Replaces the
+# old per-job tmp path that got cleaned up between runs.
+WARM_OBS = REPO / "submission/warm_obs.pkl"
+EPISODES_DIR = REPO / "episodes"
+
+
+def _capture_warm_obs(n_max: int = 8) -> dict[int, dict]:
+    """Capture a small, dtype-diverse set of real observations from the most
+    recent episode replay.
+
+    Returns {step_idx: obs_dict} covering the empty initial board AND populated
+    boards with/without fleets, so every distinct shape/dtype path through
+    obs_to_env_state gets compiled at submission import time.
+    """
+    import json
+
+    date_dirs = sorted(d for d in EPISODES_DIR.glob("*") if d.is_dir())
+    if not date_dirs:
+        raise FileNotFoundError(f"no episode date dirs under {EPISODES_DIR}")
+
+    episode = None
+    for date_dir in reversed(date_dirs):  # newest first
+        zips = sorted(date_dir.glob("*.zip"))
+        if zips:
+            with zipfile.ZipFile(zips[0]) as zf:
+                names = sorted(n for n in zf.namelist() if n.endswith(".json"))
+                if names:
+                    with zf.open(names[0]) as f:
+                        episode = json.load(f)
+        else:
+            jsons = sorted(date_dir.glob("*.json"))
+            if jsons:
+                episode = json.loads(jsons[0].read_text())
+        if episode is not None:
+            break
+    if episode is None:
+        raise FileNotFoundError(f"no episode JSONs found under {EPISODES_DIR}")
+
+    # Pick one obs per distinct (n_planets, has_fleets) signature so we cover the
+    # empty-board and populated/with-fleet variants without bloating the bundle.
+    steps = episode["steps"]
+    out: dict[int, dict] = {}
+    seen: set[tuple[int, bool]] = set()
+    for i, step in enumerate(steps):
+        obs = step[0]["observation"]  # primary agent: includes 'step'
+        sig = (len(obs.get("planets", [])), bool(obs.get("fleets")))
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out[i] = obs
+        if len(out) >= n_max:
+            break
+    if not out:
+        raise ValueError("captured no observations from episode")
+    return out
 
 
 def build_warm_b64() -> str:
     # dict {step_idx: obs_dict} captured from a real game: covers the empty
     # initial board AND populated boards (with/without fleets) so every distinct
     # dtype/shape variant the real obs path produces is compiled at import time.
-    blob = WARM_OBS.read_bytes()
+    # Use the persistent cache if present; otherwise capture fresh and cache it.
+    if WARM_OBS.exists():
+        blob = WARM_OBS.read_bytes()
+    else:
+        warm = _capture_warm_obs()
+        blob = pickle.dumps(warm, protocol=4)
+        WARM_OBS.parent.mkdir(parents=True, exist_ok=True)
+        WARM_OBS.write_bytes(blob)
+        print(f"captured + cached {len(warm)} warm obs -> {WARM_OBS}")
     return base64.b64encode(blob).decode()
 
 

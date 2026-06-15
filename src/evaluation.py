@@ -97,6 +97,7 @@ _PPO_SUBMISSIONS = {
     "sub_v7":  "ppo_low_kl_v7",
     "sub_v8":  "sub_v8",
     "sub_v81": "sub_v8.1",
+    "sub_v82": "sub_v8.2",
 }
 
 
