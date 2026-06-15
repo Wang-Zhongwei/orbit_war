@@ -17,19 +17,20 @@ REPO_ROOT="/home/018270239/orbit_war"
 cd "${REPO_ROOT}"
 echo "Running from: ${REPO_ROOT} on $(hostname)"
 
-WT="${REPO_ROOT}"
 ROUNDS="${ROUNDS:-64}"
+CKPT="${CKPT:-artifacts/ppo/ppo_4player/ckpt_000425.pkl}"
+OPPONENTS="${OPPONENTS:-sub_v8}"
+OUT_CSV="${OUT_CSV:-results/panel_4p_${CKPT_NAME}_vs_${OPPONENTS}.csv}"
+JAX_SRC_ROOT="${JAX_SRC_ROOT:-${REPO_ROOT}}"
 
-echo "=================== ppo_4player ckpt_000425 vs sub_v8 (1-vs-3 FFA, ${ROUNDS}r) ==================="
-uv run python arena.py panel \
-  --eval jax --opponents sub_v8 --rounds "${ROUNDS}" --num-players 4 \
-  --jax-checkpoint artifacts/ppo/ppo_4player/ckpt_000425.pkl --jax-src-root "${WT}" \
-  --out results/panel_4p_ppo4player425_vs_sub_v8.csv
+CKPT_DIR="$(dirname "${CKPT}")"
+CKPT_BASE="$(basename "${CKPT}" .pkl)"
+CKPT_NAME="${CKPT_DIR}_${CKPT_BASE}"
 
-echo "=================== ppo_mixed ckpt_000450 vs sub_v8 (1-vs-3 FFA, ${ROUNDS}r) ==================="
+echo "=================== ${CKPT_NAME} vs ${OPPONENTS} (1-vs-3, ${ROUNDS}r) ==================="
 uv run python arena.py panel \
-  --eval jax --opponents sub_v8 --rounds "${ROUNDS}" --num-players 4 \
-  --jax-checkpoint artifacts/ppo/ppo_mixed/ckpt_000450.pkl --jax-src-root "${WT}" \
-  --out results/panel_4p_ppomixed450_vs_sub_v8.csv
+  --eval jax --opponents "${OPPONENTS}" --rounds "${ROUNDS}" --num-players 4 \
+  --jax-checkpoint "${CKPT}" --jax-src-root "${JAX_SRC_ROOT}" \
+  --out "${OUT_CSV}"
 
 echo "=================== panel 4p eval finished ==================="
