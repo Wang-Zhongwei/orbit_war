@@ -29,8 +29,8 @@ mkdir -p "$(dirname "${OUT_CSV}")"
 
 match_args=(--agents "${A}" "${B}" --seed "${SEED}" --out "${OUT_CSV}")
 if [[ -n "${FFA}" && "${FFA}" != "0" ]]; then
-  match_args+=(--ffa)
-  echo "Match (1-vs-3 FFA): ${A} vs 3x ${B} (seed ${SEED})"
+  match_args+=(--players 4)
+  echo "Match (4-player 1-vs-3): ${A} vs 3x ${B} (seed ${SEED})"
 else
   echo "Match: ${A} vs ${B} (seed ${SEED})"
 fi

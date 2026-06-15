@@ -410,10 +410,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Agent names in slot order (length 2 or 4).",
     )
     p_match.add_argument(
-        "--ffa", action="store_true",
-        help="1-vs-3 free-for-all: play agents[0] against 3 copies of agents[1] "
-             "(a 4-player game). Requires exactly 2 --agents; slot 0 is the "
-             "evaluated agent, slots 1-3 are the opponent.",
+        "--players", type=int, default=2, choices=(2, 4),
+        help="Player count. 2 = 1v1 (default). 4 with exactly 2 --agents = 1-vs-3: "
+             "play agents[0] against 3 copies of agents[1] (slot 0 is the evaluated "
+             "agent). 4 with 4 --agents = a plain 4-player game.",
     )
     p_match.add_argument("--seed", type=int, default=0)
     p_match.add_argument("--out", type=Path, default=DEFAULT_CSV)
@@ -431,10 +431,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"Agents to include (default: {real_agents}).",
     )
     p_tour.add_argument(
-        "--ffa", action="store_true",
-        help="4-player free-for-all round-robin: play every 4-agent combination "
-             "(needs >=4 agents), seats shuffled. Reports per-agent win rate + "
-             "avg rank instead of the 1v1 head-to-head matrix.",
+        "--players", type=int, default=2, choices=(2, 4),
+        help="Player count per table. 2 = 1v1 round-robin (default). 4 = 4-player "
+             "free-for-all round-robin: every 4-agent combination (needs >=4 agents), "
+             "seats shuffled; reports per-agent win rate + avg rank.",
     )
     p_tour.add_argument("--rounds", type=int, default=20,
                         help="Number of seed rounds. Each round = #pairs matches.")
@@ -472,20 +472,28 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     if args._handler == "match":
         agents = list(args.agents)
-        if args.ffa:
-            # 1-vs-3: agents[0] against 3 copies of agents[1] (4-player FFA).
-            if len(agents) != 2:
-                print("--ffa needs exactly 2 --agents (evaluated opponent); it "
-                      "expands to [agent0, agent1, agent1, agent1].", file=sys.stderr)
+        one_v_three = False
+        if args.players == 4:
+            if len(agents) == 2:
+                # 1-vs-3: agents[0] against 3 copies of agents[1] (4-player).
+                agents = [agents[0], agents[1], agents[1], agents[1]]
+                one_v_three = True
+            elif len(agents) == 4:
+                if len(set(agents)) != len(agents):
+                    print("4 distinct --agents required for a plain 4-player match "
+                          "(or pass 2 --agents for 1-vs-3 copies).", file=sys.stderr)
+                    return 2
+            else:
+                print("--players 4 needs 2 --agents (1-vs-3) or 4 --agents (4-player).",
+                      file=sys.stderr)
                 return 2
-            agents = [agents[0], agents[1], agents[1], agents[1]]
-        elif len(agents) not in (2, 4):
-            print("Orbit Wars supports 2 or 4 player matches.", file=sys.stderr)
-            return 2
-        elif len(set(agents)) != len(agents):
-            print("Duplicate agents in slot list — pass distinct names "
-                  "(or use --ffa for 1-vs-3 copies).", file=sys.stderr)
-            return 2
+        else:  # --players 2
+            if len(agents) != 2:
+                print("--players 2 needs exactly 2 --agents.", file=sys.stderr)
+                return 2
+            if len(set(agents)) != len(agents):
+                print("Duplicate agents — pass distinct names.", file=sys.stderr)
+                return 2
         res = play_match(
             agents,
             seed=args.seed,
@@ -495,7 +503,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
         print(
             f"match_id={res['match_id']}  seed={res['seed']}  "
-            f"{'ffa(1v3) ' if args.ffa else ''}steps={res['num_steps']}  "
+            f"{'4p(1v3) ' if one_v_three else ('4p ' if args.players == 4 else '')}"
+            f"steps={res['num_steps']}  "
             f"rewards={res['rewards']}  "
             f"ranks={res['ranks']}  outcomes={[round(o, 2) for o in res['outcomes']]}  "
             f"wall={res['wall_time_s']:.2f}s"
@@ -505,10 +514,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 0
 
     if args._handler == "tournament":
-        min_agents = 4 if args.ffa else 2
+        is_4p = args.players == 4
+        min_agents = 4 if is_4p else 2
         if len(set(args.agents)) < min_agents:
-            print(f"Need at least {min_agents} distinct agents for "
-                  f"{'FFA' if args.ffa else '1v1'} tournament.", file=sys.stderr)
+            print(f"Need at least {min_agents} distinct agents for a "
+                  f"{args.players}-player tournament.", file=sys.stderr)
             return 2
         tournament(
             list(dict.fromkeys(args.agents)),
@@ -523,7 +533,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             jax_name=getattr(args, "jax_name", "jax"),
             jax_deterministic=not getattr(args, "jax_stochastic", False),
             jax_src_root=getattr(args, "jax_src_root", None),
-            ffa=args.ffa,
+            ffa=is_4p,
         )
         return 0
 

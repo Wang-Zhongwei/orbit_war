@@ -27,23 +27,31 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 # every run (warmup is N_workers x 2 agents otherwise).
 export JAX_COMPILATION_CACHE_DIR="${REPO_ROOT}/.jax_cache"
 
-CKPT_A="${CKPT_A:-artifacts/ppo/ppo_4player/ckpt_000500.pkl}"
-CKPT_B="${CKPT_B:-artifacts/ppo/ppo_mixed/ckpt_000500.pkl}"
-NAME_A="${NAME_A:-ffa}"
-NAME_B="${NAME_B:-mixed}"
+# Side A is a checkpoint. Side B is EITHER a checkpoint (CKPT_B) or a pre-registered
+# agent name (AGENT_B, e.g. sub_v8) — set one.
+CKPT_A="${CKPT_A:-artifacts/ppo/ppo_mixed/ckpt_000450.pkl}"
+NAME_A="${NAME_A:-A}"
+CKPT_B="${CKPT_B:-}"
+AGENT_B="${AGENT_B:-}"
+NAME_B="${NAME_B:-}"
 ROUNDS="${ROUNDS:-256}"
 WORKERS="${WORKERS:-${SLURM_CPUS_PER_TASK:-8}}"
 PROB_A="${PROB_A:-0.5}"
-OUT="${OUT:-results/ffa_h2h_${NAME_A}_vs_${NAME_B}.csv}"
+OUT="${OUT:-results/ffa_h2h_${NAME_A}_vs_${NAME_B:-${AGENT_B}}.csv}"
+
+args=(--ckpt-a "${CKPT_A}" --name-a "${NAME_A}"
+      --rounds "${ROUNDS}" --workers "${WORKERS}"
+      --prob-a-singleton "${PROB_A}" --out "${OUT}")
+if [[ -n "${AGENT_B}" ]]; then
+  args+=(--agent-b "${AGENT_B}")
+else
+  args+=(--ckpt-b "${CKPT_B}")
+fi
+[[ -n "${NAME_B}" ]] && args+=(--name-b "${NAME_B}")
 
 echo "Running from: ${REPO_ROOT} ($(git rev-parse --abbrev-ref HEAD))"
-echo "A=${NAME_A}:${CKPT_A}  B=${NAME_B}:${CKPT_B}  rounds=${ROUNDS} workers=${WORKERS}"
+echo "A=${NAME_A}:${CKPT_A}  B=${AGENT_B:-${CKPT_B}}  rounds=${ROUNDS} workers=${WORKERS}"
 
-uv run python -m tools.ffa_h2h \
-  --ckpt-a "${CKPT_A}" --ckpt-b "${CKPT_B}" \
-  --name-a "${NAME_A}" --name-b "${NAME_B}" \
-  --rounds "${ROUNDS}" --workers "${WORKERS}" \
-  --prob-a-singleton "${PROB_A}" \
-  --out "${OUT}"
+uv run python -m tools.ffa_h2h "${args[@]}"
 
 echo "ffa_h2h done. CSV: ${OUT}"

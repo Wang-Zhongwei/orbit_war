@@ -43,10 +43,23 @@ _NAME_B = "B"
 
 
 def _register_both(ckpt_a, ckpt_b, name_a, name_b, src_a, src_b, deterministic):
-    """Register both checkpoints in arena's AGENTS table (this process)."""
+    """Register the checkpoint side(s) in arena's AGENTS table (this process).
+
+    A side whose ckpt is None is a pre-registered agent (e.g. sub_v8), already in
+    AGENTS via the src.evaluation import — we just reference it by name. Note the
+    pre-registered submission agents are built (with their own embedded src_jax)
+    before _register_jax_agent evicts/reimports, so the two coexist.
+    """
     from arena import _register_jax_agent
-    _register_jax_agent(ckpt_a, deterministic=deterministic, name=name_a, src_root=src_a)
-    _register_jax_agent(ckpt_b, deterministic=deterministic, name=name_b, src_root=src_b)
+    from src.evaluation import AGENTS
+    if ckpt_a:
+        _register_jax_agent(ckpt_a, deterministic=deterministic, name=name_a, src_root=src_a)
+    elif name_a not in AGENTS:
+        raise KeyError(f"side-A agent {name_a!r} is not a registered agent")
+    if ckpt_b:
+        _register_jax_agent(ckpt_b, deterministic=deterministic, name=name_b, src_root=src_b)
+    elif name_b not in AGENTS:
+        raise KeyError(f"side-B agent {name_b!r} is not a registered agent")
 
 
 def _init_worker(ckpt_a, ckpt_b, name_a, name_b, src_a, src_b, deterministic):
@@ -107,10 +120,14 @@ def _run_round(task):
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--ckpt-a", required=True)
-    p.add_argument("--ckpt-b", required=True)
-    p.add_argument("--name-a", default="A")
-    p.add_argument("--name-b", default="B")
+    # Each side is EITHER a checkpoint path (--ckpt-X) OR a pre-registered agent
+    # name (--agent-X, e.g. sub_v8). Exactly one per side.
+    p.add_argument("--ckpt-a", default=None, help="Checkpoint path for side A.")
+    p.add_argument("--ckpt-b", default=None, help="Checkpoint path for side B.")
+    p.add_argument("--agent-a", default=None, help="Pre-registered agent name for side A (e.g. sub_v8).")
+    p.add_argument("--agent-b", default=None, help="Pre-registered agent name for side B (e.g. sub_v8).")
+    p.add_argument("--name-a", default=None, help="Display label for side A (default: agent name or 'A').")
+    p.add_argument("--name-b", default=None, help="Display label for side B (default: agent name or 'B').")
     p.add_argument("--src-a", default=None, help="src_jax root for ckpt A (default: this repo).")
     p.add_argument("--src-b", default=None, help="src_jax root for ckpt B (default: this repo).")
     p.add_argument("--rounds", type=int, default=256)
@@ -123,9 +140,17 @@ def main(argv=None) -> int:
     p.add_argument("--out", type=Path, default=Path("results/ffa_h2h.csv"))
     args = p.parse_args(list(argv) if argv is not None else None)
 
-    name_a, name_b = args.name_a, args.name_b
+    # Resolve each side: exactly one of --ckpt-X / --agent-X.
+    if bool(args.ckpt_a) == bool(args.agent_a):
+        print("Side A: pass exactly one of --ckpt-a or --agent-a.", file=sys.stderr)
+        return 2
+    if bool(args.ckpt_b) == bool(args.agent_b):
+        print("Side B: pass exactly one of --ckpt-b or --agent-b.", file=sys.stderr)
+        return 2
+    name_a = args.name_a or args.agent_a or "A"
+    name_b = args.name_b or args.agent_b or "B"
     if name_a == name_b:
-        print("--name-a and --name-b must differ.", file=sys.stderr)
+        print("Side labels must differ (set --name-a/--name-b).", file=sys.stderr)
         return 2
     deterministic = not args.stochastic
     init_args = (args.ckpt_a, args.ckpt_b, name_a, name_b, args.src_a, args.src_b, deterministic)
