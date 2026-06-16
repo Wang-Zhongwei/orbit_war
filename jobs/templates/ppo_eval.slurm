@@ -28,10 +28,6 @@ set -euo pipefail
 #   ROUNDS       seed rounds per (ckpt,opp)      (default 64)
 #   CKPT_STRIDE  eval every N updates            (default 100)
 #   RESULTS_DIR  where match CSVs go             (default results/ppo_eval/<RUN_NAME>)
-#   SRC_ROOT     dir whose src_jax/ matches the *jax checkpoint's* arch
-#                (default: the v7arch worktree, since the ppo_low_kl* runs were
-#                 trained there). Opponents are standalone submissions that embed
-#                 their own src, so SRC_ROOT only affects our jax agent.
 
 REPO_ROOT="/home/018270239/orbit_war"
 cd "${REPO_ROOT}"
@@ -42,15 +38,9 @@ OUT_DIR="${OUT_DIR:-artifacts/ppo}"
 OPPONENTS="${OPPONENTS:-sub_v7 sub_v8}"
 ROUNDS="${ROUNDS:-64}"
 CKPT_STRIDE="${CKPT_STRIDE:-100}"
-SRC_ROOT="${SRC_ROOT:-${REPO_ROOT}}"
 RESULTS_DIR="${RESULTS_DIR:-results/ppo_eval/${RUN_NAME}}"
 CKPT_DIR="${OUT_DIR}/${RUN_NAME}"
 mkdir -p "${RESULTS_DIR}"
-
-if [[ ! -d "${SRC_ROOT}/src_jax" ]]; then
-  echo "SRC_ROOT '${SRC_ROOT}' has no src_jax/ — checkpoint arch may not match. Aborting."
-  exit 1
-fi
 
 # Collect ckpt_<update>.pkl recursively, dedupe by update, keep those on the stride,
 # then append ckpt_last.pkl. Sorted ascending by update so the curve reads left->right.
@@ -80,7 +70,6 @@ fi
 
 echo "RUN_NAME=${RUN_NAME}  OUT_DIR=${OUT_DIR}"
 echo "Opponents: ${OPPONENTS}"
-echo "SRC_ROOT (jax agent arch): ${SRC_ROOT}"
 echo "Evaluating ${#ckpts[@]} checkpoints x $(wc -w <<< "${OPPONENTS}") opponents (${ROUNDS} rounds, ${SLURM_NTASKS:-1} workers)"
 echo "========================================================================"
 
@@ -95,7 +84,6 @@ for opp in ${OPPONENTS}; do
     uv run python arena.py tournament \
       --agents jax "${opp}" \
       --jax-checkpoint "${ckpt}" \
-      --jax-src-root "${SRC_ROOT}" \
       --rounds "${ROUNDS}" \
       --base-seed 1000 \
       --workers "${SLURM_NTASKS:-1}" \

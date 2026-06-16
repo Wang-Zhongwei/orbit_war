@@ -2,7 +2,7 @@
 #SBATCH --job-name=bc_train
 #SBATCH --output=./jobs/logs/bc_train-%j.out
 #SBATCH --error=./jobs/logs/bc_train-%j.err
-#SBATCH --time=00:30:00
+#SBATCH --time=04:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --partition=condo
@@ -34,6 +34,9 @@ if [[ -n "${OUT_DIR:-}" ]]; then
 fi
 if [[ -n "${RUN_NAME:-}" ]]; then
   args+=(--run_name "${RUN_NAME}")
+fi
+if [[ -n "${SHARD_TAG:-}" ]]; then
+  args+=(--shard_tag "${SHARD_TAG}")
 fi
 if [[ -n "${EPOCHS:-}" ]]; then
   args+=(--epochs "${EPOCHS}")

@@ -13,7 +13,11 @@ import jax
 import jax.numpy as jnp
 
 from .features import _make_env_encoder
-from .config import TrainConfig, default_train_config_path, load_train_config
+from .feature_versions import make_env_encoder
+from .config import (
+    TrainConfig, OpponentSpec, default_train_config_path, load_train_config,
+    parse_opponents,
+)
 from .env import make_board_pool, make_initial_carry_state
 from .policies import build_policy
 from .ppo import TrainState, build_train_state, ppo_update
@@ -96,10 +100,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--total_updates", type=int, default=None)
     parser.add_argument("--augment", action="store_true", default=False)
-    parser.add_argument("--jax-src-root", "--jax_src_root", dest="jax_src_root", default=None,
-                        help="Pin the src_jax arch this run trains (e.g. a worktree path) "
-                             "regardless of the checked-out branch; overrides cfg.jax_src_root. "
-                             "Handled by re-exec before src_jax is imported — see config.py.")
     parser.add_argument("--no_wandb", action="store_true")
     return parser.parse_args()
 
@@ -167,12 +167,6 @@ def _enable_compile_cache() -> None:
 
 
 def main() -> None:
-    # If --jax-src-root pins a different src_jax arch than the live tree, re-exec
-    # through tools/train_pinned.py FIRST — before any src_jax submodule (or JAX)
-    # is touched — so the pinned tree's relative imports resolve. No-op otherwise.
-    from .config import maybe_reexec_for_pin
-    maybe_reexec_for_pin("train")
-
     from .accel import setup_accelerator
     setup_accelerator()  # CPU / GPU / TPU — pins matmul precision for backend parity
     _enable_compile_cache()
@@ -225,15 +219,17 @@ def main() -> None:
     )
 
     # ── Encoder (shared between rollout and bootstrap value) ──────────────────
-    encode_batch = _make_env_encoder(K, cfg.env)
+    encode_batch = make_env_encoder(K, cfg.env, getattr(cfg.model, "feat_version", "v7"))
 
     # ── Policy module + train state ───────────────────────────────────────────
     policy      = build_policy(cfg)
     train_state = build_train_state(cfg, seed=cfg.seed)
     key         = jax.random.PRNGKey(cfg.seed)
 
+    learner_version = getattr(cfg.model, "feat_version", "v7")
     start_update = 1
     ref_params = None
+    ref_version = None
     if resume:
         with open(resume, "rb") as f:
             ckpt = pickle.load(f)
@@ -254,39 +250,72 @@ def main() -> None:
         print(f"Resumed from {resume} (update {ckpt['update']})")
         if cfg.ppo.kl_coef > 0 and ref_policy is None:
             ref_params = restored["params"]
+            ref_version = learner_version
             print(f"KL reference: resume checkpoint (kl_coef={cfg.ppo.kl_coef})")
 
     if ref_policy:
         with open(ref_policy, "rb") as f:
             ref_ckpt = pickle.load(f)
         ref_params = jax.tree_util.tree_map(jnp.asarray, ref_ckpt["params"])
-        print(f"KL reference: {ref_policy} (kl_coef={cfg.ppo.kl_coef})")
+        ref_version = cfg.ref_policy_feat_version or learner_version
+        print(f"KL reference: {ref_policy} (feat_version={ref_version}, kl_coef={cfg.ppo.kl_coef})")
 
-    # Build opponent pool — "self", "heuristic", or "ckpt:PATH".
-    # Heuristic slots store dummy params (learner params) that are never used;
-    # the rollout bypasses neural inference for those envs entirely.
-    opp_pool: list[tuple[str, object]] = []
-    for opp_name in cfg.opponents:
-        if opp_name == "self":
-            opp_pool.append(("self", train_state.params))
-        elif opp_name == "heuristic":
-            opp_pool.append(("heuristic", train_state.params))  # dummy — never used
+    # Build opponent pool from normalised specs (self / heuristic / ckpt[, feat_version]).
+    # Heuristic slots store dummy params (learner params) that are never used; the
+    # rollout bypasses neural inference for those envs entirely. A ckpt opponent may
+    # use a different feat_version (encoder) than the learner — its params are run
+    # through the same dim-agnostic module on its own-version features.
+    opp_specs = parse_opponents(cfg.opponents)
+    opp_pool: list[tuple[OpponentSpec, object]] = []
+    opp_versions: set[str] = set()
+    for spec in opp_specs:
+        if spec.kind == "self":
+            opp_pool.append((spec, train_state.params))
+            opp_versions.add(learner_version)
+        elif spec.kind == "heuristic":
+            opp_pool.append((spec, train_state.params))  # dummy — never used
             print("Heuristic opponent registered (JAX stateless greedy).")
-        elif opp_name.startswith("ckpt:"):
-            path = opp_name[5:]
-            with open(path, "rb") as f:
+        elif spec.kind == "ckpt":
+            with open(spec.path, "rb") as f:
                 opp_ckpt = pickle.load(f)
-            opp_pool.append((opp_name, jax.tree_util.tree_map(jnp.asarray, opp_ckpt["params"])))
-            print(f"Checkpoint opponent loaded: {path}")
+            opp_pool.append((spec, jax.tree_util.tree_map(jnp.asarray, opp_ckpt["params"])))
+            v = spec.feat_version or learner_version
+            opp_versions.add(v)
+            print(f"Checkpoint opponent loaded: {spec.path} (feat_version={v})")
         else:
-            raise ValueError(f"Unknown training opponent {opp_name!r}. Use 'self', 'heuristic', or 'ckpt:PATH'.")
+            raise ValueError(f"Unknown opponent kind {spec.kind!r}.")
 
-    heuristic_opp_mask = tuple(name == "heuristic" for name, _ in opp_pool)
+    # All neural opponents in one stacked pool must share an encoder (their params
+    # are stacked along a leading axis, so the shapes must match).
+    if len(opp_versions) > 1:
+        raise ValueError(
+            f"mixed opponent feat_versions {sorted(opp_versions)} in one pool is "
+            f"unsupported; use a single opponent feat_version per run."
+        )
+    opp_version = next(iter(opp_versions), learner_version)
+    opp_encode_batch = (
+        encode_batch if opp_version == learner_version
+        else make_env_encoder(K, cfg.env, opp_version)
+    )
+
+    heuristic_opp_mask = tuple(spec.kind == "heuristic" for spec, _ in opp_pool)
 
     # Stack pool into [n_opponents, ...] — env i uses slot i % n_opponents.
     stacked_opp_params = jax.tree_util.tree_map(
         lambda *xs: jnp.stack(xs), *[p for _, p in opp_pool]
     )
+
+    # KL reference encoder: the frozen ref encodes the learner's visited states with
+    # its own (possibly different) feat_version; its logits are precomputed in the
+    # rollout and read by the update. None unless KL is active.
+    compute_ref_logits = ref_params is not None and cfg.ppo.kl_coef > 0
+    ref_encode_batch = None
+    if compute_ref_logits:
+        ref_encode_batch = (
+            encode_batch if (ref_version or learner_version) == learner_version
+            else make_env_encoder(K, cfg.env, ref_version)
+        )
+        print(f"KL reference encoder: feat_version={ref_version or learner_version}")
 
     # ── JIT-compiled rollout fn ───────────────────────────────────────────────
     collect = make_rollout_fn(
@@ -298,6 +327,10 @@ def main() -> None:
         n_opponents         = len(opp_pool),
         heuristic_opp_mask  = heuristic_opp_mask,
         augment             = cfg.ppo.augment,
+        opp_encode_batch    = opp_encode_batch,
+        ref_params          = ref_params if compute_ref_logits else None,
+        ref_encode_batch    = ref_encode_batch,
+        compute_ref_logits  = compute_ref_logits,
     )
 
     # ── Initial carry ─────────────────────────────────────────────────────────
@@ -347,16 +380,16 @@ def main() -> None:
                 epochs=cfg.ppo.epochs,
                 minibatch_size=cfg.ppo.minibatch_size,
                 key=key,
-                ref_params=ref_params,
                 kl_coef=cfg.ppo.kl_coef,
+                use_kl=compute_ref_logits,
             )
             jax.block_until_ready(train_state.params)
             t_ppo = time.time() - t_update - t_collect - t_batch
 
             # ── Self-play sync: refresh all "self" slots in the stacked pool ───
-            if any(n == "self" for n, _ in opp_pool) and update % cfg.self_play_update_interval == 0:
-                for i, (name, _) in enumerate(opp_pool):
-                    if name == "self":
+            if any(spec.kind == "self" for spec, _ in opp_pool) and update % cfg.self_play_update_interval == 0:
+                for i, (spec, _) in enumerate(opp_pool):
+                    if spec.kind == "self":
                         stacked_opp_params = jax.tree_util.tree_map(
                             lambda s, p: s.at[i].set(p), stacked_opp_params, train_state.params
                         )

@@ -85,7 +85,8 @@ def main() -> None:
         board_pool, N_BOARDS, N, cfg.seed, cfg.alternate_player_sides
     )
     opp_players = 1 - learner_players
-    encode_batch = _make_env_encoder(K, cfg.env)
+    from src_jax.feature_versions import make_env_encoder
+    encode_batch = make_env_encoder(K, cfg.env, getattr(cfg.model, "feat_version", "v7"))
 
     # ── component fns (mirror rollout.py scan_fn) ─────────────────────────────
     enc_one = jax.jit(encode_batch)

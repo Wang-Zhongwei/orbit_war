@@ -73,7 +73,8 @@ def _phantom_encode_check(cfg, seed: int) -> None:
     from src_jax.env import make_board_pool
 
     pool = make_board_pool(2, seed, num_agents=2, mix_4player_frac=1.0)  # 2-player boards
-    encode_batch = _make_env_encoder(cfg.env.candidate_count, cfg.env)
+    from src_jax.feature_versions import make_env_encoder
+    encode_batch = make_env_encoder(cfg.env.candidate_count, cfg.env, getattr(cfg.model, "feat_version", "v7"))
     # Encode each board from the viewpoint of phantom seat 2 (does not exist on a 2p board).
     phantom_players = jnp.full((2,), 2, dtype=jnp.int32)
     enc = encode_batch(pool, phantom_players)

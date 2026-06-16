@@ -2,7 +2,7 @@
 #SBATCH --job-name=ppo_train
 #SBATCH --output=/home/018270239/orbit_war/jobs/logs/ppo_train-%j.out
 #SBATCH --error=/home/018270239/orbit_war/jobs/logs/ppo_train-%j.err
-#SBATCH --time=10:00:00
+#SBATCH --time=12:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --partition=gpuqs
@@ -31,10 +31,9 @@ set -euo pipefail
 #   RUN_NAME   run/ckpt name     (default from config: ppo_from_bc_loser0)
 #   TOTAL_UPDATES  override ppo.total_updates
 #   REF_POLICY     explicit KL reference ckpt (default: the RESUME checkpoint, via train.py)
-#   JAX_SRC_ROOT   pin the trained arch to a worktree's src_jax (default: live tree).
-#                  e.g. JAX_SRC_ROOT=$PWD/.claude/worktrees/v9arch to train the previous
-#                  (v9) arch now that the live tree is the v7 arch.
-#                  train.py re-execs via tools/train_pinned.py to pin it.
+#
+# Feature arch (v7 / v9) is selected in the config via model.feat_version — both
+# encoders live in-tree (src_jax/features.py and features_v9.py). No worktree pin.
 
 export WANDB_MODE=offline
 # Allocate GPU memory on demand rather than JAX's default ~75% up-front grab.
@@ -71,7 +70,6 @@ args+=(--config "${CONFIG}")
 [[ -n "${TOTAL_UPDATES:-}" ]] && args+=(--total_updates "${TOTAL_UPDATES}")
 [[ -n "${REF_POLICY:-}"    ]] && args+=(--ref_policy    "${REF_POLICY}")
 [[ -n "${RESUME:-}"        ]] && args+=(--resume        "${RESUME}")
-[[ -n "${JAX_SRC_ROOT:-}"  ]] && args+=(--jax-src-root  "${JAX_SRC_ROOT}")
 
 echo "Running command: uv run python -m src_jax.train ${args[*]}"
 uv run python -m src_jax.train "${args[@]}"

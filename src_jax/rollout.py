@@ -25,6 +25,7 @@ from .physics import (
 from .features import (
     MIN_SOURCE_SHIPS, _make_env_encoder, global_feature_dim,
 )
+from .feature_versions import make_env_encoder
 from .augment import apply_augmentation_batched
 from .ppo import TrainingBatch, sample_actions
 from .env import select_boards
@@ -57,6 +58,7 @@ class RolloutStep(NamedTuple):
     src_valid: jnp.ndarray # [N, MAX_SRC] bool
     reward: jnp.ndarray    # [N] float32
     done: jnp.ndarray      # [N] bool
+    ref_target_logits: jnp.ndarray  # [N, MAX_SRC, K] (KL) or [N, 1] placeholder
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +108,10 @@ def make_rollout_fn(
     n_opponents: int = 1,
     heuristic_opp_mask: tuple[bool, ...] = (),
     augment: bool = False,
+    opp_encode_batch=None,
+    ref_params=None,
+    ref_encode_batch=None,
+    compute_ref_logits: bool = False,
 ):
     """
     Build and return a JIT-compiled rollout collector.
@@ -121,6 +127,17 @@ def make_rollout_fn(
     heuristic_opp_mask  : tuple[bool] length n_opponents — True for heuristic slots.
                           Heuristic opponents bypass neural inference entirely.
                           opp_params slots for heuristic indices are ignored (pass dummies).
+
+    opp_encode_batch    : encoder for neural opponents (cross-version play). None =
+                          use the learner's encoder. opp_params are run through the
+                          same dim-agnostic ``module`` on these features.
+    ref_params          : frozen KL-reference params (run through ``module``). When
+                          set with compute_ref_logits, the rollout precomputes the
+                          ref's target logits on each visited state.
+    ref_encode_batch    : encoder for the KL reference (its own feat_version). None =
+                          use the learner's encoder.
+    compute_ref_logits  : if True, store ref target logits [N, MAX_SRC, K] per step;
+                          else store a [N, 1] placeholder.
 
     Returns
     -------
@@ -152,7 +169,11 @@ def make_rollout_fn(
     # Static bool array for per-env selection in the mixed case (baked into JIT).
     _heuristic_arr = jnp.array(heuristic_opp_mask, dtype=jnp.bool_)
 
-    encode_batch = _make_env_encoder(K, cfg.env)
+    encode_batch = make_env_encoder(K, cfg.env, getattr(cfg.model, "feat_version", "v7"))
+    # Opponent / reference encoders default to the learner's (same-version play).
+    opp_encode_batch = opp_encode_batch or encode_batch
+    ref_encode_batch = ref_encode_batch or encode_batch
+    _compute_ref = bool(compute_ref_logits and ref_params is not None)
     _batched_step = jax.jit(jax.vmap(functools.partial(jax_step, episode_steps=episode_steps)))
     _vmap_heuristic = jax.vmap(heuristic_actions)
 
@@ -260,6 +281,29 @@ def make_rollout_fn(
         ti, lp, val, key = _run_policy(params, l_enc, key, deterministic=False)
         l_acts = _enc_to_actions(l_enc, ti)
 
+        # Frozen KL-reference target logits on the SAME visited state. The ref uses
+        # its own-version encoder and (when augmenting) the SAME aug_ids as the
+        # learner, so ref and learner logits describe the same (augmented) board and
+        # are slot-aligned. Run through the dim-agnostic module with ref_params.
+        if _compute_ref:
+            ref_enc = ref_encode_batch(state, learner_players)
+            if augment:
+                rsf, rcf, rgf = apply_augmentation_batched(
+                    ref_enc.self_feats, ref_enc.cand_feats, ref_enc.global_feat, aug_ids,
+                )
+                ref_enc = ref_enc._replace(self_feats=rsf, cand_feats=rcf, global_feat=rgf)
+            ref_gf = jnp.broadcast_to(
+                ref_enc.global_feat[:, None, :], (N_ENVS, MAX_SRC, GLOB_DIM)
+            )
+            ref_out = jax.vmap(
+                lambda sf_i, cf_i, gf_i, cm_i, sv_i: module.apply(
+                    ref_params, sf_i, cf_i, gf_i, cm_i, sv_i
+                )
+            )(ref_enc.self_feats, ref_enc.cand_feats, ref_gf, ref_enc.cand_mask, ref_enc.src_valid)
+            ref_tgt = ref_out.target_logits          # [N, MAX_SRC, K]
+        else:
+            ref_tgt = jnp.zeros((N_ENVS, 1), jnp.float32)  # placeholder (unused)
+
         # Opponent actions. Per env there are n_opp = num_agents - 1 opposing seats,
         # each controlled by the same (shared) opponent policy but encoded from its
         # own egocentric viewpoint. We unroll over the seats (n_opp is static) so the
@@ -274,7 +318,7 @@ def make_rollout_fn(
                 h_acts = _vmap_heuristic(state, opp_players_j)
 
             if _any_neural:
-                o_enc = encode_batch(state, opp_players_j)
+                o_enc = opp_encode_batch(state, opp_players_j)
                 if n_opponents == 1:
                     # All envs share the same params — use the efficient batched forward.
                     single_opp = jax.tree_util.tree_map(lambda p: p[0], opp_params)
@@ -359,6 +403,7 @@ def make_rollout_fn(
             target_indices=ti, log_probs=lp, values=val,
             src_valid=l_enc.src_valid,
             reward=reward, done=done,
+            ref_target_logits=ref_tgt,
         )
         new_carry = RolloutCarry(next_states, next_board_idx, next_ep_reward, next_lp, key)
         return new_carry, step
@@ -472,6 +517,7 @@ def build_training_batch(steps: RolloutStep, step_returns: jnp.ndarray) -> Train
     lp  = _r(steps.log_probs)           # [B, MAX_SRC]
     val = _r(steps.values)              # [B, MAX_SRC]
     sv  = _r(steps.src_valid)           # [B, MAX_SRC]
+    rtl = _r(steps.ref_target_logits)   # [B, MAX_SRC, K] (KL) or [B, 1] placeholder
     ret = step_returns.reshape(B)       # [B]
 
     return TrainingBatch(
@@ -484,6 +530,7 @@ def build_training_batch(steps: RolloutStep, step_returns: jnp.ndarray) -> Train
         returns            = ret,
         advantages         = ret[:, None] - val,  # [B, MAX_SRC]
         src_valid          = sv,
+        ref_target_logits  = rtl,
     )
 
 

@@ -53,13 +53,26 @@ ARCH_BUILDERS = {
 
 
 def build_policy(cfg):
-    """Construct the policy module selected by ``cfg.model.arch``."""
+    """Construct the policy module selected by ``cfg.model.arch``.
+
+    The arch builders bake in the default ("v7") feature dims. For another
+    ``cfg.model.feat_version`` we swap the (metadata-only) dim fields so
+    ``init_params`` sizes its dummy input correctly — the net itself is
+    dim-agnostic (flax ``Dense`` infers the input width at apply time).
+    """
     arch = getattr(cfg.model, "arch", "cross_source")
     try:
-        return ARCH_BUILDERS[arch](cfg)
+        module = ARCH_BUILDERS[arch](cfg)
     except KeyError:
         valid = sorted(k for k in ARCH_BUILDERS if k)
         raise ValueError(f"Unknown model.arch={arch!r}; expected one of {valid}") from None
+
+    version = getattr(cfg.model, "feat_version", "v7")
+    if version and version != "v7":
+        from ..feature_versions import feature_dims
+        sd, cd, gd = feature_dims(version)
+        module = module.clone(self_dim=sd, candidate_dim=cd, global_dim=gd)
+    return module
 
 
 def init_params(module, seed: int = 0) -> dict:

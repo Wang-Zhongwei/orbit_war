@@ -101,6 +101,12 @@ class ModelConfig:
     # original "value update doesn't perturb the action head" property while
     # still saving the second encode). No effect unless shared_backbone=True.
     value_stop_grad: bool = False
+    # Feature-encoder version (see src_jax/feature_versions.py):
+    #   "v7" (default) — features.py     (self=25, cand=30) — current main arch.
+    #   "v9"           — features_v9.py  (self=17, cand=26) — leaner vendored arch.
+    # Selects the LEARNER's encoder and the metadata dims init_params sizes from.
+    # The opponent / KL-reference may use a different version (their ckpt's arch).
+    feat_version: str = "v7"
 
     def __setstate__(self, state) -> None: _setstate(self, state)
 
@@ -204,6 +210,18 @@ class BCConfig:
 
 
 @dataclass
+class OpponentSpec:
+    """Normalised training opponent. kind: "self" | "heuristic" | "ckpt".
+    feat_version (ckpt only) selects the encoder for that opponent; None = same
+    as the learner."""
+    kind: str
+    path: str | None = None
+    feat_version: str | None = None
+
+    def __setstate__(self, state) -> None: _setstate(self, state)
+
+
+@dataclass
 class TrainConfig:
     seed: int = 42
     run_name: str = "default"
@@ -212,7 +230,16 @@ class TrainConfig:
     log_every: int = 1
     resume: str | None = None       # checkpoint path to resume training from (CLI --resume overrides)
     ref_policy: str | None = None   # frozen KL reference checkpoint (CLI --ref_policy overrides)
-    opponents: list[str] = field(default_factory=lambda: ["self"])
+    # Feature version of the KL reference checkpoint's encoder. None = same as the
+    # learner (cfg.model.feat_version). Set e.g. "v7" to anchor a v9 learner to a
+    # v8 (v7-feature) reference: the reference encodes the shared state with its own
+    # encoder and the KL is taken over the (slot-aligned) candidate logits.
+    ref_policy_feat_version: str | None = None
+    # Opponents: each entry is "self" / "heuristic" / "ckpt:PATH", or a mapping
+    #   {ckpt: PATH, feat_version: v7}
+    # feat_version (per ckpt opponent) selects that opponent's encoder; omit = same
+    # as the learner. See parse_opponents().
+    opponents: list = field(default_factory=lambda: ["self"])
     eval_opponents: list[str] = field(default_factory=list)
     self_play_update_interval: int = 50
     eval_update_interval: int = 50
@@ -270,6 +297,38 @@ def _config_from_dict(data: dict[str, Any]) -> TrainConfig:
     return cfg
 
 
+def parse_opponents(raw: list) -> list[OpponentSpec]:
+    """Normalise cfg.opponents (strings and/or {ckpt, feat_version} mappings) into
+    a list of OpponentSpec."""
+    specs: list[OpponentSpec] = []
+    for entry in raw:
+        if isinstance(entry, OpponentSpec):
+            specs.append(entry)
+        elif isinstance(entry, str):
+            if entry in ("self", "heuristic"):
+                specs.append(OpponentSpec(kind=entry))
+            elif entry.startswith("ckpt:"):
+                specs.append(OpponentSpec(kind="ckpt", path=entry[5:]))
+            else:
+                raise ValueError(
+                    f"bad opponent {entry!r}; use 'self', 'heuristic', 'ckpt:PATH', "
+                    f"or a mapping {{ckpt: PATH, feat_version: v7}}"
+                )
+        elif isinstance(entry, dict):
+            fv = entry.get("feat_version")
+            if "ckpt" in entry:
+                specs.append(OpponentSpec(kind="ckpt", path=entry["ckpt"], feat_version=fv))
+            elif entry.get("self"):
+                specs.append(OpponentSpec(kind="self", feat_version=fv))
+            elif entry.get("heuristic"):
+                specs.append(OpponentSpec(kind="heuristic"))
+            else:
+                raise ValueError(f"bad opponent mapping {entry!r}; expected a 'ckpt' key")
+        else:
+            raise ValueError(f"bad opponent entry {entry!r}")
+    return specs
+
+
 def _apply(instance: Any, values: dict[str, Any], skip: set[str] | None = None) -> None:
     if not isinstance(values, dict):
         return
@@ -291,62 +350,3 @@ def _coerce(value: Any, default: Any) -> Any:
     if isinstance(default, float):
         return float(value)
     return value
-
-
-# ── jax_src_root: pin the trained arch to a worktree ───────────────────────────
-# Env var the launcher sets so a re-execed (already-pinned) process never loops.
-PIN_ENV = "ORBIT_JAX_PINNED"
-
-
-def _yaml_jax_src_root(config_path: str | None) -> str | None:
-    """Read the top-level ``jax_src_root`` key from a config yaml, cheaply and
-    without importing the rest of src_jax (so it is safe to call before the pin)."""
-    if not config_path:
-        return None
-    try:
-        data = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
-    except OSError:
-        return None
-    root = data.get("jax_src_root") if isinstance(data, dict) else None
-    return str(root) if root else None
-
-
-def resolve_jax_src_root(argv: list[str] | None = None) -> str | None:
-    """Resolve the requested src_jax root from ``--jax-src-root`` on the command
-    line (highest priority) or the ``jax_src_root`` key of the ``--config`` yaml.
-    Returns an absolute path string, or None when no pin was requested."""
-    import argparse
-
-    argv = list(sys.argv[1:] if argv is None else argv)
-    p = argparse.ArgumentParser(add_help=False)
-    p.add_argument("--config", default=None)
-    p.add_argument("--jax-src-root", "--jax_src_root", dest="jax_src_root", default=None)
-    known, _ = p.parse_known_args(argv)
-    root = known.jax_src_root or _yaml_jax_src_root(known.config)
-    return str(Path(root).resolve()) if root else None
-
-
-def maybe_reexec_for_pin(target: str) -> None:
-    """If a src_jax pin is requested and this process is not already pinned,
-    re-exec through ``tools/train_pinned.py`` so the pinned tree's src_jax is on
-    sys.path *before* the trainer's relative imports resolve. A no-op when no pin
-    is requested, when already running under the launcher (``PIN_ENV`` set), or
-    when the requested root is the live tree. ``target`` is the trainer module
-    suffix: "train" or "bc_train"."""
-    if os.environ.get(PIN_ENV) is not None:
-        return
-    root = resolve_jax_src_root()
-    if not root:
-        return
-    repo_root = Path(__file__).resolve().parents[1]
-    if Path(root) == repo_root:
-        return  # pin points at the live tree — nothing to switch
-    launcher = repo_root / "tools" / "train_pinned.py"
-    if not launcher.is_file():
-        raise FileNotFoundError(
-            f"jax_src_root={root!r} requested but launcher {launcher} is missing"
-        )
-    os.execv(
-        sys.executable,
-        [sys.executable, str(launcher), "--target", target, *sys.argv[1:]],
-    )

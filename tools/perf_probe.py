@@ -65,7 +65,7 @@ def main():
           f"epochs={cfg.ppo.epochs} kl_coef={cfg.ppo.kl_coef}", flush=True)
 
     k = jax.random.PRNGKey(0)
-    ks = jax.random.split(k, 6)
+    ks = jax.random.split(k, 7)
     batch = TrainingBatch(
         self_features      = _real((B, MAX_SRC, SELF), key=ks[0]),
         candidate_features = _real((B, MAX_SRC, K, CAND), key=ks[1]),
@@ -76,17 +76,18 @@ def main():
         returns            = _real((B,), key=ks[4]),
         advantages         = _real((B, MAX_SRC), key=ks[5]),
         src_valid          = _real((B, MAX_SRC), jnp.bool_),
+        # KL ref logits are now precomputed in the rollout and carried in the batch.
+        ref_target_logits  = _real((B, MAX_SRC, K), key=ks[6]),
     )
     jax.block_until_ready(batch.self_features)
 
     def run(mb, epochs, kl_on):
         kc = cfg.ppo.kl_coef if kl_on else 0.0
-        ref = ts.params if kl_on else None
         key = jax.random.PRNGKey(1)
         return ppo_update(
             ts, batch, clip_coef=cfg.ppo.clip_coef, ent_coef=cfg.ppo.ent_coef,
             vf_coef=cfg.ppo.vf_coef, epochs=epochs, minibatch_size=mb,
-            key=key, ref_params=ref, kl_coef=kc,
+            key=key, kl_coef=kc, use_kl=kl_on,
         )
 
     # All timed at epochs=1 (ppo total ~= 4x these). Each call is ~1 epoch so it's

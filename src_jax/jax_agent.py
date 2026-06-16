@@ -19,6 +19,7 @@ import jax.numpy as jnp
 
 from .bc_data import obs_to_env_state
 from .features import MIN_SOURCE_SHIPS, _make_env_encoder, self_feature_dim, candidate_feature_dim
+from .feature_versions import make_env_encoder
 from .physics import MAX_BASE_PLANETS, MAX_PLANETS, MAX_FLEETS, N_COMET_GROUPS, COMET_PER_GROUP, EnvState
 from .policies import build_policy
 from .rollout import GLOB_DIM
@@ -61,7 +62,7 @@ def build_agent(
     K = cfg.env.candidate_count
 
     module    = build_policy(cfg)
-    encode_fn = _make_env_encoder(K, cfg.env)
+    encode_fn = make_env_encoder(K, cfg.env, getattr(cfg.model, "feat_version", "v7"))
 
     MAX_SRC = MAX_BASE_PLANETS
 

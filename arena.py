@@ -65,14 +65,8 @@ def _register_jax_agent(
     checkpoint_path: str,
     deterministic: bool,
     name: str = "jax",
-    src_root: str | None = None,
 ) -> None:
     """Build a JAX BC/RL agent from checkpoint and register it in AGENTS under ``name``.
-
-    ``src_root`` is the directory whose ``src_jax/`` package matches this
-    checkpoint's architecture (default: this repo, i.e. arena.py's dir). Pass a
-    worktree path when the checkpoint was trained from a tree whose arch differs
-    from the working repo (e.g. ``.claude/worktrees/featexp``).
 
     Why this is fiddly: importing ``src.evaluation`` (top of this module) loads
     the PPO submission opponents (sub_v6/v7/v8…), each of which unpacks its OWN
@@ -82,7 +76,7 @@ def _register_jax_agent(
     (e.g. a 30-dim cand_proj) instead of ours, mismatching this checkpoint's
     params (ScopeParamShapeError). Those submission agents are already built at
     import time and hold direct refs to their own modules, so we can safely evict
-    the shared slot and re-import the correct tree from ``src_root``.
+    the shared slot and re-import the correct tree from this repo.
     """
     import importlib
     import pickle
@@ -90,7 +84,7 @@ def _register_jax_agent(
     import jax
     import jax.numpy as jnp
 
-    root = src_root or str(Path(__file__).resolve().parent)
+    root = str(Path(__file__).resolve().parent)
 
     # Evict any hijacked src_jax* (submission /tmp trees) so the import below
     # resolves freshly against ``root``. The submission agent closures keep their
@@ -208,8 +202,7 @@ _WORKER_JAX_NAME: str = "jax"
 _WORKER_JAX_DETERMINISTIC: bool = True
 
 
-def _worker_init(checkpoint_path: str | None, name: str, deterministic: bool,
-                 src_root: str | None = None) -> None:
+def _worker_init(checkpoint_path: str | None, name: str, deterministic: bool) -> None:
     """Pool initializer: register the JAX agent once per worker process."""
     global _WORKER_JAX_CHECKPOINT, _WORKER_JAX_NAME, _WORKER_JAX_DETERMINISTIC
     _WORKER_JAX_CHECKPOINT = checkpoint_path
@@ -217,7 +210,7 @@ def _worker_init(checkpoint_path: str | None, name: str, deterministic: bool,
     _WORKER_JAX_DETERMINISTIC = deterministic
     if checkpoint_path is not None:
         _register_jax_agent(checkpoint_path, deterministic=deterministic,
-                            name=name, src_root=src_root)
+                            name=name)
 
 
 def _match_task(task: dict) -> dict:
@@ -265,7 +258,6 @@ def tournament(
     jax_checkpoint: str | None = None,
     jax_name: str = "jax",
     jax_deterministic: bool = True,
-    jax_src_root: str | None = None,
 ) -> None:
     """Round-robin 1v1 with randomized slot ordering.
 
@@ -332,7 +324,7 @@ def tournament(
         with ctx.Pool(
             workers,
             initializer=_worker_init,
-            initargs=(jax_checkpoint, jax_name, jax_deterministic, jax_src_root),
+            initargs=(jax_checkpoint, jax_name, jax_deterministic),
         ) as pool:
             for result in pool.imap_unordered(_match_task, tasks):
                 _handle_result(result)
@@ -348,7 +340,7 @@ def tournament(
 # batched on-device when every seat is a JAX policy.
 # ---------------------------------------------------------------------------
 
-def _jax_spec_for(name, *, jax_checkpoint, jax_name, jax_src_root, deterministic):
+def _jax_spec_for(name, *, jax_checkpoint, jax_name, deterministic):
     """Return an eval_jax EvalSpec for ``name`` if it's a JAX-arch agent, else None.
 
     Recognizes the loaded ``--jax-checkpoint`` agent (registered under jax_name)
@@ -358,7 +350,7 @@ def _jax_spec_for(name, *, jax_checkpoint, jax_name, jax_src_root, deterministic
     ej = _eval_jax
 
     if jax_checkpoint is not None and name == jax_name:
-        return ej.spec_from_checkpoint(jax_checkpoint, jax_src_root, deterministic)
+        return ej.spec_from_checkpoint(jax_checkpoint, deterministic)
     if name in ej._JAX_SUBMISSION_KEYS:
         return ej.spec_from_submission(name)
     return None
@@ -406,7 +398,6 @@ def panel(
     jax_checkpoint: str | None = None,
     jax_name: str = "jax",
     jax_deterministic: bool = True,
-    jax_src_root: str | None = None,
 ) -> dict[str, float]:
     """Evaluate ``eval_agent`` vs each opponent over ``rounds`` games.
 
@@ -436,7 +427,7 @@ def panel(
 
     eval_spec = _jax_spec_for(
         eval_agent, jax_checkpoint=jax_checkpoint, jax_name=jax_name,
-        jax_src_root=jax_src_root, deterministic=jax_deterministic,
+        deterministic=jax_deterministic,
     )
 
     # Balanced + shuffled seat for the evaluated agent, one per round. spec 0 =
@@ -453,7 +444,7 @@ def panel(
     for opp in opponents:
         opp_spec = _jax_spec_for(
             opp, jax_checkpoint=jax_checkpoint, jax_name=jax_name,
-            jax_src_root=jax_src_root, deterministic=jax_deterministic,
+            deterministic=jax_deterministic,
         )
         batched = eval_spec is not None and opp_spec is not None
 
@@ -537,11 +528,6 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="Registry key used for the loaded JAX agent (default: jax).")
         g.add_argument("--jax-stochastic", action="store_true",
                        help="Sample from the JAX policy instead of taking argmax.")
-        g.add_argument("--jax-src-root", type=str, default=None,
-                       help="Directory whose src_jax/ matches the checkpoint's arch "
-                            "(default: this repo). Set to a .claude/worktrees/<wt> path "
-                            "when the checkpoint was trained from a tree whose arch "
-                            "differs from the working repo.")
 
     p_match = sub.add_parser("match", help="Run a single match.")
     p_match.add_argument(
@@ -621,7 +607,6 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.jax_checkpoint,
             deterministic=not args.jax_stochastic,
             name=args.jax_name,
-            src_root=getattr(args, "jax_src_root", None),
         )
 
     if args._handler == "match":
@@ -674,7 +659,6 @@ def main(argv: Iterable[str] | None = None) -> int:
             jax_checkpoint=getattr(args, "jax_checkpoint", None),
             jax_name=getattr(args, "jax_name", "jax"),
             jax_deterministic=not getattr(args, "jax_stochastic", False),
-            jax_src_root=getattr(args, "jax_src_root", None),
         )
         return 0
 
@@ -691,7 +675,6 @@ def main(argv: Iterable[str] | None = None) -> int:
             jax_checkpoint=getattr(args, "jax_checkpoint", None),
             jax_name=getattr(args, "jax_name", "jax"),
             jax_deterministic=not getattr(args, "jax_stochastic", False),
-            jax_src_root=getattr(args, "jax_src_root", None),
         )
         return 0
 

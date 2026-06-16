@@ -150,6 +150,7 @@ def main() -> None:
             returns            = _sds((B,)),
             advantages         = _sds((B, MAX_SRC)),
             src_valid          = _sds((B, MAX_SRC), jnp.bool_),
+            ref_target_logits  = _sds((B, MAX_SRC, K)),
         )
         _probe(
             f"ppo_update (epochs={cfg.ppo.epochs} mb={cfg.ppo.minibatch_size} kl={use_kl})",
@@ -158,7 +159,7 @@ def main() -> None:
             dict(clip_coef=cfg.ppo.clip_coef, ent_coef=cfg.ppo.ent_coef,
                  vf_coef=cfg.ppo.vf_coef, epochs=cfg.ppo.epochs,
                  minibatch_size=cfg.ppo.minibatch_size, key=key,
-                 ref_params=train_state.params, kl_coef=cfg.ppo.kl_coef, use_kl=use_kl),
+                 kl_coef=cfg.ppo.kl_coef, use_kl=use_kl),
         )
 
     # ── Probe 3: full rollout collect (the prime suspect) ──────────────────────

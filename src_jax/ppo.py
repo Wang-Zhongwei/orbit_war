@@ -79,11 +79,16 @@ class TrainingBatch:
     returns: jax.Array              # [B]              float32
     advantages: jax.Array           # [B, MAX_SRC]     float32
     src_valid: jax.Array            # [B, MAX_SRC]     bool
+    # Frozen KL-reference target logits, precomputed in the rollout from the ref's
+    # own-version encoder on the (same, augmented) visited states. [B, MAX_SRC, K]
+    # when KL is active; a [B, 1] placeholder otherwise (unused).
+    ref_target_logits: jax.Array
 
 
 _TB_FIELDS = [
     'self_features', 'candidate_features', 'global_features', 'candidate_mask',
     'target_index', 'log_prob', 'returns', 'advantages', 'src_valid',
+    'ref_target_logits',
 ]
 jax.tree_util.register_pytree_node(
     TrainingBatch,
@@ -162,7 +167,6 @@ def _ppo_update_jit(
     epochs: int,
     minibatch_size: int,
     key: jax.Array,
-    ref_params: dict,
     kl_coef: float,
     use_kl: bool,
 ) -> tuple[TrainState, jax.Array, jax.Array]:
@@ -175,6 +179,7 @@ def _ppo_update_jit(
     ti      = batch.target_index         # [B, MAX_SRC]
     ret     = batch.returns              # [B]
     adv_raw = batch.advantages           # [B, MAX_SRC]
+    rtl     = batch.ref_target_logits    # [B, MAX_SRC, K] (KL) or [B, 1] placeholder
 
     valid   = sv.astype(jnp.float32)
     n_valid = valid.sum() + 1e-8
@@ -198,13 +203,12 @@ def _ppo_update_jit(
     GLOB_DIM = gf.shape[-1]
     K        = cm.shape[-1]
 
-    # Reference (frozen) policy logits for the KL term are computed PER MINIBATCH
-    # inside mb_step (see below), not for the whole batch at once. The full-batch
-    # forward materialises the transformer's attention activations for all B rows
-    # simultaneously (~hundreds of GiB at num_envs×rollout_steps), which OOMs even
-    # an 80 GB H100. Per-minibatch caps the footprint at the same size as the
-    # policy forward, at the cost of recomputing the (forward-only, frozen) ref
-    # pass epochs×n_mb times — cheap relative to the policy forward+backward.
+    # Reference (frozen) policy logits for the KL term are PRECOMPUTED in the
+    # rollout (rollout.py) — once per visited state, with the reference's own-version
+    # encoder on the same (augmented) features the learner saw — and carried in
+    # batch.ref_target_logits. The update just slices them per minibatch. This both
+    # supports a cross-feature-version reference (the ref's encoder differs from the
+    # learner's) and avoids re-running the frozen ref forward epochs×n_mb times.
 
     # Pre-split one key per epoch so the scan carries only the TrainState.
     key, *epoch_keys = jax.random.split(key, epochs + 1)
@@ -215,18 +219,10 @@ def _ppo_update_jit(
         """idx: [mb] int32 — row indices into the full batch."""
         sv_mb = sv[idx]
 
-        # Frozen reference logits for this minibatch only (forward-only; ref_params
-        # is a constant w.r.t. the differentiated params, so no grad flows here).
+        # Frozen reference logits for this minibatch — sliced from the precomputed
+        # batch.ref_target_logits (no forward here; a constant w.r.t. the params).
         if use_kl:
-            gf_exp_r = jnp.broadcast_to(gf[idx][:, None, :], (mb, MAX_SRC, GLOB_DIM))
-            ref_out_mb = jax.vmap(
-                lambda sf_i, cf_i, gf_i, cm_i, sv_i: state.apply_fn(
-                    ref_params, sf_i, cf_i, gf_i, cm_i, sv_i
-                )
-            )(sf[idx], cf[idx], gf_exp_r, cm[idx], sv_mb)
-            ref_tgt_mb = _safe_target_logits(
-                ref_out_mb.target_logits.reshape(mb * MAX_SRC, K)
-            )
+            ref_tgt_mb = _safe_target_logits(rtl[idx].reshape(mb * MAX_SRC, K))
         else:
             ref_tgt_mb = None
 
@@ -302,8 +298,8 @@ def ppo_update(
     epochs: int,
     minibatch_size: int,
     key: jax.Array,
-    ref_params: dict | None = None,
     kl_coef: float = 0.0,
+    use_kl: bool = False,
 ) -> tuple[TrainState, dict[str, float], jax.Array]:
     if batch.self_features.shape[0] == 0:
         return state, {
@@ -312,14 +308,13 @@ def ppo_update(
             "kl_ref": 0.0, "explained_variance": 0.0,
         }, key
 
-    use_kl      = ref_params is not None and kl_coef > 0.0
-    _ref_params = ref_params if use_kl else state.params
+    use_kl = bool(use_kl) and kl_coef > 0.0
 
     state, m, key = _ppo_update_jit(
         state, batch,
         clip_coef=clip_coef, ent_coef=ent_coef, vf_coef=vf_coef,
         epochs=epochs, minibatch_size=minibatch_size,
-        key=key, ref_params=_ref_params, kl_coef=kl_coef, use_kl=use_kl,
+        key=key, kl_coef=kl_coef, use_kl=use_kl,
     )
 
     # Single device→host transfer for all 8 metric values.

@@ -53,6 +53,7 @@ from .physics import (
     N_AGENTS,
 )
 from .features import MIN_SOURCE_SHIPS, _make_env_encoder
+from .feature_versions import make_env_encoder
 from .policies import build_policy
 from .rollout import _build_actions_single
 from .env import make_board_pool, select_boards
@@ -216,7 +217,9 @@ def _self_or_ckpt_spec(name, learner_cfg, learner_params):
         params = ckpt["params"]
         det    = True
     module    = build_policy(cfg)
-    encode_fn = _make_env_encoder(cfg.env.candidate_count, cfg.env)
+    encode_fn = make_env_encoder(
+        cfg.env.candidate_count, cfg.env, getattr(cfg.model, "feat_version", "v7")
+    )
     return module, encode_fn, params, det
 
 
@@ -347,7 +350,9 @@ def run_eval_jax(
     learner_players = (jnp.arange(n_envs) % 2).astype(jnp.int32)
 
     learner_module    = build_policy(cfg)
-    learner_encode_fn = _make_env_encoder(cfg.env.candidate_count, cfg.env)
+    learner_encode_fn = make_env_encoder(
+        cfg.env.candidate_count, cfg.env, getattr(cfg.model, "feat_version", "v7")
+    )
     learner_act = _make_act_fn(
         learner_module, learner_encode_fn, deterministic=deterministic_learner,
     )
@@ -411,7 +416,9 @@ def run_eval_jax_4p(
 
     learner_spec = EvalSpec(
         build_policy(cfg),
-        _make_env_encoder(cfg.env.candidate_count, cfg.env),
+        make_env_encoder(
+            cfg.env.candidate_count, cfg.env, getattr(cfg.model, "feat_version", "v7")
+        ),
         learner_params,
         deterministic_learner,
     )
@@ -570,28 +577,29 @@ def play_match_batched(specs, seat_assign, n_envs, base_seed, episode_steps):
 # Spec builders for arena agents
 # ---------------------------------------------------------------------------
 
-def spec_from_checkpoint(ckpt_path, src_root=None, deterministic=True) -> EvalSpec:
+def spec_from_checkpoint(ckpt_path, deterministic=True) -> EvalSpec:
     """Build an EvalSpec from a JAX checkpoint .pkl.
 
-    ``src_root`` is the tree whose ``src_jax`` matches the checkpoint's arch
-    (default: this repo). Loaded under a pinned import so a hijacked
+    Loaded under a pinned import of this repo's ``src_jax`` so a hijacked
     ``sys.modules['src_jax']`` (from submission opponents) can't mismatch shapes —
-    same robustness as ``arena._register_jax_agent``.
+    same robustness as ``arena._register_jax_agent``. (Feature arch is selected
+    in-tree via ``cfg.model.feat_version``; there is no external src tree to pin.)
     """
     import importlib
 
     from src.evaluation import _pinned_src_jax
 
-    root = Path(src_root) if src_root else _REPO_ROOT
     with open(ckpt_path, "rb") as f:
         ckpt = pickle.load(f)
     cfg = ckpt["config"]
-    with _pinned_src_jax(root):
+    with _pinned_src_jax(_REPO_ROOT):
         pol = importlib.import_module("src_jax.policies")
-        fea = importlib.import_module("src_jax.features")
+        fv  = importlib.import_module("src_jax.feature_versions")
         params    = jax.tree_util.tree_map(jnp.asarray, ckpt["params"])
         module    = pol.build_policy(cfg)
-        encode_fn = fea._make_env_encoder(cfg.env.candidate_count, cfg.env)
+        encode_fn = fv.make_env_encoder(
+            cfg.env.candidate_count, cfg.env, getattr(cfg.model, "feat_version", "v7")
+        )
     return EvalSpec(module, encode_fn, params, deterministic)
 
 
