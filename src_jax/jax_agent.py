@@ -4,12 +4,14 @@ JAX policy → kaggle-environment callable agent.
 Usage:
     from src_jax.jax_agent import make_jax_agent
 
+    agent = make_jax_agent("sub_v86")  # short name from submission/checkpoint_mapping.json
     agent = make_jax_agent("artifacts/bc/bc_pretrain/ckpt_last.pkl")
     env.run([agent, opponent])
 """
 
 from __future__ import annotations
 
+import json
 import pickle
 from pathlib import Path
 from typing import Callable
@@ -27,6 +29,30 @@ from .physics import (
 )
 from .policies import build_policy
 from .rollout import GLOB_DIM
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_CHECKPOINT_MAPPING_PATH = _REPO_ROOT / "submission" / "checkpoint_mapping.json"
+_CHECKPOINT_MAPPING: dict[str, str] | None = None
+
+
+def _load_checkpoint_mapping() -> dict[str, str]:
+    global _CHECKPOINT_MAPPING
+    if _CHECKPOINT_MAPPING is None:
+        with open(_CHECKPOINT_MAPPING_PATH) as f:
+            _CHECKPOINT_MAPPING = json.load(f)
+    return _CHECKPOINT_MAPPING
+
+
+def _resolve_checkpoint_path(name_or_path: str | Path) -> Path:
+    """Map a short name (e.g. ``sub_v86``) or checkpoint path to an absolute path."""
+    key = str(name_or_path)
+    mapped = _load_checkpoint_mapping().get(key)
+    if mapped is not None:
+        return (_REPO_ROOT / mapped).resolve()
+    path = Path(name_or_path)
+    if not path.is_absolute():
+        path = _REPO_ROOT / path
+    return path.resolve()
 
 
 def _obs_to_dict(obs) -> dict:
@@ -261,11 +287,15 @@ def make_jax_agent(
 ) -> Callable:
     """Return an obs->moves callable that runs a policy checkpoint.
 
+    ``checkpoint_path`` may be a filesystem path or a short name listed in
+    ``submission/checkpoint_mapping.json`` (e.g. ``"sub_v86"``).
+
     This is the public checkpoint-loading wrapper used by notebooks and arena
     scripts. The lower-level ``build_agent`` is useful when params/config are
     already loaded in memory.
     """
-    with open(checkpoint_path, "rb") as f:
+    resolved = _resolve_checkpoint_path(checkpoint_path)
+    with open(resolved, "rb") as f:
         ckpt = pickle.load(f)
 
     params = jax.tree_util.tree_map(jnp.asarray, ckpt["params"])
