@@ -58,6 +58,11 @@ model:
   shared_backbone: true
   value_stop_grad: true
   feat_version: v91
+  # Cross-source mixer depth. The mixer attends over the owned-planet (MAX_SRC)
+  # set; 2 blocks add a transitive coalition-coordination hop. Safe to raise here
+  # because this is a from-scratch v91 student (no mixer warm-start to break).
+  # A/B: set 1 vs 2 across two runs.
+  n_xsrc_blocks: 2
 
 ppo:
   rollout_steps: 64

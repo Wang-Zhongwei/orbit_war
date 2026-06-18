@@ -42,6 +42,7 @@ class _EntityBackbonePolicy(nn.Module):
     n_heads: int = 4
     n_layers: int = 2
     ff_dim: int = 256
+    n_xsrc_blocks: int = 1
     value_queries: int = 4
     shared_backbone: bool = False
     value_stop_grad: bool = False
@@ -70,9 +71,9 @@ class _EntityBackbonePolicy(nn.Module):
             d_model=H, n_layers=self.n_layers, n_heads=self.n_heads, ff_dim=self.ff_dim,
             name="policy_encoder",
         )(self_features, global_features, candidate_features, candidate_mask)
-        p_self = CrossSourceMixer(d_model=H, n_heads=self.n_heads, name="policy_xsrc")(
-            p_self, src_valid
-        )
+        p_self = CrossSourceMixer(
+            d_model=H, n_heads=self.n_heads, n_blocks=self.n_xsrc_blocks, name="policy_xsrc",
+        )(p_self, src_valid)
 
         target_logits = self._score(p_self, p_global, p_cand)               # [N, K]
         # Finite floor (not -inf) keeps entropy / log_softmax NaN-free.
@@ -95,9 +96,9 @@ class _EntityBackbonePolicy(nn.Module):
                 d_model=H, n_layers=self.n_layers, n_heads=self.n_heads, ff_dim=self.ff_dim,
                 name="value_encoder",
             )(self_features, global_features, candidate_features, candidate_mask)
-            v_self = CrossSourceMixer(d_model=H, n_heads=self.n_heads, name="value_xsrc")(
-                v_self, src_valid
-            )
+            v_self = CrossSourceMixer(
+                d_model=H, n_heads=self.n_heads, n_blocks=self.n_xsrc_blocks, name="value_xsrc",
+            )(v_self, src_valid)
         value = MultiQueryValueHead(
             d_model=H, n_queries=self.value_queries, n_heads=self.n_heads, hidden=H,
             name="value_head",
@@ -162,6 +163,7 @@ def _common_kwargs(cfg) -> dict:
         n_heads         = getattr(cfg.model, "n_heads", 4),
         n_layers        = getattr(cfg.model, "n_layers", 2),
         ff_dim          = ff_dim,
+        n_xsrc_blocks   = getattr(cfg.model, "n_xsrc_blocks", 1),
         value_queries   = getattr(cfg.model, "value_queries", 4),
         shared_backbone = getattr(cfg.model, "shared_backbone", False),
         value_stop_grad = getattr(cfg.model, "value_stop_grad", False),

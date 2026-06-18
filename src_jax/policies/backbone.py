@@ -109,10 +109,24 @@ class EntityEncoder(nn.Module):
 
 
 class CrossSourceMixer(nn.Module):
-    """Let each source attend to every valid sibling source (coalition signal)."""
+    """Let each source attend to every valid sibling source (coalition signal).
+
+    The mixer attends over the ``MAX_SRC`` (owned-planet) dimension, so a single
+    block only gives pairwise source visibility. ``n_blocks`` stacks pre-LN
+    attention+FFN blocks so sources can coordinate *transitively* (A↔B↔C) across
+    the owned-planet set — coalition attacks / no double-sending over more than
+    one hop.
+
+    Back-compat: block 0 keeps the original *unindexed* parameter names
+    (``cs_ln1``/``cs_attn``/``cs_ln2``/``cs_fc1``/``cs_fc2``), so an ``n_blocks=1``
+    mixer is byte-identical to the pre-knob version and existing checkpoints load
+    unchanged. Extra blocks get a ``_{i}`` suffix; warm-starting a 2-block mixer
+    from a 1-block checkpoint restores block 0 and cold-inits the rest.
+    """
 
     d_model: int
     n_heads: int
+    n_blocks: int = 1
 
     @nn.compact
     def __call__(self, self_emb: jax.Array, src_valid: jax.Array) -> jax.Array:
@@ -121,16 +135,19 @@ class CrossSourceMixer(nn.Module):
         # as keys so padding doesn't pollute the coalition signal.
         N = self_emb.shape[0]
         cs_mask = src_valid[None, None, None, :]
-        normed  = nn.LayerNorm(name="cs_ln1")(self_emb)
-        # Attention can return broadcast leading dims from the 4-D mask; collapse
-        # back to [N, H] (parity with CrossSourcePolicy's cross-source block).
-        self_emb = (self_emb + nn.MultiHeadDotProductAttention(
-            num_heads=self.n_heads, qkv_features=H, out_features=H, name="cs_attn",
-        )(normed, mask=cs_mask)).reshape(N, H)
-        normed2 = nn.LayerNorm(name="cs_ln2")(self_emb)
-        self_emb = self_emb + nn.Dense(H, name="cs_fc2")(
-            nn.gelu(nn.Dense(4 * H, name="cs_fc1")(normed2))
-        )
+        for i in range(self.n_blocks):
+            sfx = "" if i == 0 else f"_{i}"
+            normed = nn.LayerNorm(name=f"cs_ln1{sfx}")(self_emb)
+            # Attention can return broadcast leading dims from the 4-D mask;
+            # collapse back to [N, H] (parity with CrossSourcePolicy's block).
+            self_emb = (self_emb + nn.MultiHeadDotProductAttention(
+                num_heads=self.n_heads, qkv_features=H, out_features=H,
+                name=f"cs_attn{sfx}",
+            )(normed, mask=cs_mask)).reshape(N, H)
+            normed2 = nn.LayerNorm(name=f"cs_ln2{sfx}")(self_emb)
+            self_emb = self_emb + nn.Dense(H, name=f"cs_fc2{sfx}")(
+                nn.gelu(nn.Dense(4 * H, name=f"cs_fc1{sfx}")(normed2))
+            )
         return self_emb
 
 

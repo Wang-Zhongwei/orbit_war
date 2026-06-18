@@ -86,6 +86,11 @@ class ModelConfig:
     n_heads: int = 4
     n_layers: int = 2
     ff_dim: int = 0          # 0 → default to 2 * hidden_size at build time
+    # Cross-source mixer depth (entity_* arches). The mixer attends over the
+    # MAX_SRC owned-planet set; 1 block = pairwise source visibility, >1 stacks
+    # blocks for transitive coalition coordination. Block 0 keeps unindexed param
+    # names so n_xsrc_blocks=1 stays checkpoint-compatible with pre-knob models.
+    n_xsrc_blocks: int = 1
     value_queries: int = 4
     score_blocks: int = 2    # residual head depth (entity_deep_mlp only)
     # Shared-backbone option (entity_* arches only). When True the value head
@@ -116,6 +121,10 @@ class ModelConfig:
 class PPOConfig:
     rollout_steps: int = 64
     num_envs: int = -1
+    # Size of the fixed training board pool (generated once from cfg.seed and
+    # cycled on reset). Training-board diversity scales with this — a larger pool
+    # = more distinct geometries seen, less overfitting to specific boards.
+    n_boards: int = 2048
     total_updates: int = 1000
     epochs: int = 4
     minibatch_size: int = 256
