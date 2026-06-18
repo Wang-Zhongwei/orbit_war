@@ -16,11 +16,15 @@ from typing import Callable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from .bc_data import obs_to_env_state
-from .features import MIN_SOURCE_SHIPS, _make_env_encoder, self_feature_dim, candidate_feature_dim
+from .features import MIN_SOURCE_SHIPS, _make_env_encoder, self_feature_dim, candidate_feature_dim, aim_fleets
 from .feature_versions import make_env_encoder
-from .physics import MAX_BASE_PLANETS, MAX_PLANETS, MAX_FLEETS, N_COMET_GROUPS, COMET_PER_GROUP, EnvState
+from .physics import (
+    MAX_BASE_PLANETS, MAX_PLANETS, MAX_FLEETS, N_COMET_GROUPS, COMET_PER_GROUP,
+    COMET_SLOT_BASE, EnvState,
+)
 from .policies import build_policy
 from .rollout import GLOB_DIM
 
@@ -50,6 +54,74 @@ def _safe_target_logits(target_logits: jax.Array) -> jax.Array:
     return jnp.where(invalid[:, None], jnp.zeros_like(target_logits), target_logits)
 
 
+def _evac_plan(state: EnvState, player: jax.Array):
+    """Comet evacuation plan (one env, no batch dim).
+
+    An owned comet whose path is exhausted is about to leave the board next tick;
+    any ships still garrisoned on it are lost permanently. For each such comet we
+    dump its ENTIRE garrison to the nearest friendly planet whose lane is clear,
+    and if that lane is blocked (or there is no friendly planet) to the nearest
+    enemy planet instead. Lane blocking reuses ``aim_fleets`` — the same
+    static + rotating-planet blocker check the encoder uses — so an evac fleet
+    never gets aimed straight into the sun or a moving planet.
+
+    Returns per-planet-slot arrays [MAX_PLANETS]:
+        valid : this slot is an evacuating comet with a usable destination
+        ids   : source planet id  (== state.p_id)
+        angle : launch angle toward the chosen destination
+        ships : ships to send (the comet's full garrison)
+    """
+    pl  = player[0]
+    idx = jnp.arange(MAX_PLANETS, dtype=jnp.int32)
+
+    # Ticks of path left on each comet slot. comet_path_idx is per-GROUP; map each
+    # slot to its (group, member) and compare against that member's path length.
+    gi    = jnp.clip((idx - COMET_SLOT_BASE) // COMET_PER_GROUP, 0, N_COMET_GROUPS - 1)
+    sj    = jnp.clip((idx - COMET_SLOT_BASE) %  COMET_PER_GROUP, 0, COMET_PER_GROUP - 1)
+    idx_g = jnp.maximum(state.comet_path_idx, jnp.int32(0))            # [N_CG]
+    ticks_rem = state.comet_path_lens[gi, sj] - idx_g[gi]              # [MAX_PLANETS]
+
+    ships     = jnp.floor(state.p_ships).astype(jnp.int32)           # send everything (floor: never exceed garrison)
+    evac_is   = (
+        state.p_is_comet
+        & (ticks_rem <= 0)                # path exhausted -> leaving the board
+        & state.p_alive
+        & (state.p_owner == pl)
+        & (ships >= 1)
+    )                                                                 # [MAX_PLANETS]
+
+    # Distance from every (potential source) planet to every (potential dest).
+    dx   = state.p_x[:, None] - state.p_x[None, :]
+    dy   = state.p_y[:, None] - state.p_y[None, :]
+    dist = jnp.sqrt(dx * dx + dy * dy + 1e-8)                          # [P, P]
+    not_self    = idx[:, None] != idx[None, :]
+    is_friendly = state.p_alive[None, :] & (state.p_owner[None, :] == pl) \
+        & (~state.p_is_comet[None, :]) & not_self
+    is_enemy    = state.p_alive[None, :] & (state.p_owner[None, :] != pl) \
+        & (state.p_owner[None, :] != -1) & (~state.p_is_comet[None, :]) & not_self
+
+    BIG = jnp.float32(1e30)
+    nf  = jnp.argmin(jnp.where(is_friendly, dist, BIG), axis=1).astype(jnp.int32)
+    ne  = jnp.argmin(jnp.where(is_enemy,    dist, BIG), axis=1).astype(jnp.int32)
+    has_f = jnp.any(is_friendly, axis=1)
+    has_e = jnp.any(is_enemy,    axis=1)
+
+    angle_f, blk_f = aim_fleets(
+        state.p_x, state.p_y, state.p_radius, state.p_alive, state.p_is_comet,
+        state.angular_velocity, idx, nf, ships,
+    )
+    angle_e, blk_e = aim_fleets(
+        state.p_x, state.p_y, state.p_radius, state.p_alive, state.p_is_comet,
+        state.angular_velocity, idx, ne, ships,
+    )
+
+    use_f = has_f & (~blk_f)                       # nearest friend, lane clear
+    use_e = (~use_f) & has_e & (~blk_e)            # else nearest enemy, lane clear
+    valid = evac_is & (use_f | use_e)
+    angle = jnp.where(use_f, angle_f, angle_e)
+    return valid, state.p_id, angle, ships
+
+
 def build_agent(
     params,
     cfg,
@@ -69,6 +141,8 @@ def build_agent(
     @jax.jit
     def _forward(sf, cf, gf, cm, sv):
         return module.apply(params, sf, cf, gf, cm, sv)
+
+    _evac = jax.jit(_evac_plan)
 
     def agent(obs) -> list:
         nonlocal rng_key
@@ -106,6 +180,20 @@ def build_agent(
         ships_send      = jnp.maximum(MIN_SOURCE_SHIPS, src_ships)
         selected_angles = angles[row_idx, ti]
 
+        # Comet evacuation override: any owned comet about to leave the board dumps
+        # its full garrison to the nearest friendly planet (clear lane) else the
+        # nearest enemy. This is a hard override — the policy move for that same
+        # planet is dropped so the comet doesn't double-send.
+        ev_valid, ev_ids, ev_angle, ev_ships = _evac(state, player)
+        ev_slots   = np.nonzero(np.asarray(ev_valid))[0]   # usually empty; ≤4 active comets
+        ev_ids     = np.asarray(ev_ids)
+        ev_angle   = np.asarray(ev_angle)
+        ev_ships   = np.asarray(ev_ships)
+        evac_ids: set  = {int(ev_ids[s]) for s in ev_slots}
+        evac_moves: list = [
+            [int(ev_ids[s]), float(ev_angle[s]), int(ev_ships[s])] for s in ev_slots
+        ]
+
         moves: list = []
         for i in range(MAX_SRC):
             if not bool(src_valid[i]):
@@ -115,8 +203,11 @@ def build_agent(
                 continue
             if not bool(cand_mask[i, t]):
                 continue
+            if int(src_ids[i]) in evac_ids:   # comet evacuating: skip policy move
+                continue
             moves.append([int(src_ids[i]), float(selected_angles[i]), int(ships_send[i])])
 
+        moves.extend(evac_moves)
         return moves
 
     # Warm up both JITs (encode_fn and _forward) so first in-game call doesn't
@@ -159,6 +250,7 @@ def build_agent(
     _dummy_cm = _dummy_enc.cand_mask[0]
     _dummy_sv = _dummy_enc.src_valid[0]
     _forward(_dummy_sf, _dummy_cf, _dummy_gf, _dummy_cm, _dummy_sv)
+    jax.block_until_ready(_evac(_dummy_state, _dummy_player))   # warm the evac JIT too
 
     return agent
 
