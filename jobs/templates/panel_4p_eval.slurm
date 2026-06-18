@@ -3,7 +3,7 @@
 #SBATCH --output=/home/018270239/orbit_war/jobs/logs/panel_4p_eval-%j.out
 #SBATCH --error=/home/018270239/orbit_war/jobs/logs/panel_4p_eval-%j.err
 #SBATCH --time=00:40:00
-#SBATCH --partition=gpuqs
+#SBATCH --partition=gpuqs,condo
 #SBATCH --gres=gpu:h100:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1

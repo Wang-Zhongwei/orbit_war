@@ -5,7 +5,7 @@
 #SBATCH --time=00:20:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
-#SBATCH --partition=gpuqs
+#SBATCH --partition=gpuqs,condo
 #SBATCH --gres=gpu:h100:1
 
 set -euo pipefail

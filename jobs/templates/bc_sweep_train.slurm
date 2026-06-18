@@ -5,7 +5,7 @@
 #SBATCH --time=16:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
-#SBATCH --partition=gpuqs
+#SBATCH --partition=gpuqs,condo
 #SBATCH --gres=gpu:a100:1
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=wang.15032@osu.edu
