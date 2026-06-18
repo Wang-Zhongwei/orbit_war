@@ -202,24 +202,33 @@ def make_rollout_fn(
         return ti, lp, val, key
 
     def _run_opp_policy(stacked_opp_params, enc, key, deterministic):
-        # stacked_opp_params: [n_opponents, ...] — select per env via round-robin
-        opp_idx = jnp.arange(N_ENVS, dtype=jnp.int32) % n_opponents
-        per_env_params = jax.tree_util.tree_map(lambda p: p[opp_idx], stacked_opp_params)
+        # stacked_opp_params: [n_opponents, ...] — env i uses slot i % n_opponents.
+        #
+        # Run each opponent slot as a SHARED-weight forward over all envs (like the
+        # single-opponent fast path), then select per env by round-robin mask. Two
+        # alternatives both OOM at num_envs=1024:
+        #   * gathering a per-env param tree `p[opp_idx]` and vmapping module.apply
+        #     with batched weights — replicates weights N_ENVS× and forces XLA to
+        #     materialize a per-env weight-contraction intermediate (~26 GB);
+        #   * a Python-unrolled `for k in range(n_opponents)` — XLA schedules all
+        #     n_opponents forwards in parallel, so their activations co-reside
+        #     (~12 forwards across the 3 FFA seats ≈ 29 GB single buffer).
+        # Instead loop with lax.fori_loop so the slots run SEQUENTIALLY — only one
+        # slot's activations are live at a time, bounding peak memory to ~one
+        # forward regardless of pool size. Weights are tiny, so the n_opponents×
+        # redundant (masked) forwards are far cheaper than the OOM.
+        opp_idx = jnp.arange(N_ENVS, dtype=jnp.int32) % n_opponents   # [N]
 
-        sf = enc.self_feats  # [N, MAX_SRC, SELF_DIM]
-        cf = enc.cand_feats  # [N, MAX_SRC, K, CAND_DIM]
-        gf = jnp.broadcast_to(enc.global_feat[:, None, :], (N_ENVS, MAX_SRC, GLOB_DIM))
-        cm = enc.cand_mask   # [N, MAX_SRC, K]
-        sv = enc.src_valid   # [N, MAX_SRC] bool
+        def body(k, state):
+            ti_acc, key = state
+            params_k = jax.tree_util.tree_map(lambda p: p[k], stacked_opp_params)
+            ti_k, _, _, key = _run_policy(params_k, enc, key, deterministic=deterministic)
+            ti_acc = jnp.where((opp_idx == k)[:, None], ti_k, ti_acc)
+            return ti_acc, key
 
-        outputs = jax.vmap(
-            lambda p, sf_i, cf_i, gf_i, cm_i, sv_i: module.apply(p, sf_i, cf_i, gf_i, cm_i, sv_i)
-        )(per_env_params, sf, cf, gf, cm, sv)                               # [N, MAX_SRC, ...]
-
-        flat = jax.tree_util.tree_map(lambda x: x.reshape(N_ENVS * MAX_SRC, *x.shape[2:]), outputs)
-        key, subkey = jax.random.split(key)
-        ti_f, _, _, key = sample_actions(flat, subkey, deterministic=deterministic)
-        return ti_f.reshape(N_ENVS, MAX_SRC), key
+        ti_acc = jnp.zeros((N_ENVS, MAX_SRC), jnp.int32)
+        ti_acc, key = jax.lax.fori_loop(0, n_opponents, body, (ti_acc, key))
+        return ti_acc, key
 
     def _enc_to_actions(enc, ti):
         def one_env(src_ids, src_ships, cand_mask, angles, valid, ti_i):
