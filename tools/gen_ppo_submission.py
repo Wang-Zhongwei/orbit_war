@@ -28,6 +28,8 @@ BUNDLE = [
     "src_jax/generation.py",
     "src_jax/physics.py",
     "src_jax/features.py",
+    "src_jax/features_v9.py",
+    "src_jax/feature_versions.py",
     "src_jax/bc_data.py",
     "src_jax/jax_agent.py",
     "src_jax/policies/__init__.py",

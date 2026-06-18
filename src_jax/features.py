@@ -890,9 +890,9 @@ def _make_env_encoder(K: int, env_cfg):
             next_s_t = _rs_s * c_t + _rs_c * s_t
             return (
                 new_acc,
-                jnp.where(t <= 5,  new_acc, acc_5),
-                jnp.where(t <= 10, new_acc, acc_10),
-                jnp.where(t <= 15, new_acc, acc_15),
+                jnp.where(t == _T5,  new_acc, acc_5),
+                jnp.where(t == _T10, new_acc, acc_10),
+                jnp.where(t == _T15, new_acc, acc_15),
                 garrison,
                 owner,
                 prev_owner,

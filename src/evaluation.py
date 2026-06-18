@@ -113,6 +113,8 @@ _PPO_SUBMISSIONS = {
     "sub_v8":  ("sub_v8",             "main"),
     "sub_v81": ("sub_v8.1",           "main"),
     "sub_v82": ("sub_v8.2",           "main"),
+    "sub_v86": ("sub_v8.6",           "main"),
+    "sub_v861": ("sub_v8.6.1",        "main"),
 }
 
 

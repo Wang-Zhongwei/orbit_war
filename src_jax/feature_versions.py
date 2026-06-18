@@ -6,6 +6,8 @@ Main carries two in-tree feature encoders:
                    the current main arch (richer horizons / capture-margin feats).
   "v9"           — ``src_jax/features_v9.py``  self=17, cand=26, global=12
                    the leaner arch vendored from the (now-removed) archv9 worktree.
+  "v91"          — ``src_jax/features_v91.py`` self=18, cand=30, global=12
+                   v9 + 15-tick capture-outcome snapshots (5/10/15/20/final).
 
 A PPO run picks the learner's encoder via ``cfg.model.feat_version``. The opponent
 and the KL reference may use a *different* version (whatever their checkpoint was
@@ -24,7 +26,7 @@ from __future__ import annotations
 import importlib
 
 # version key → submodule name within this package
-_MODULES = {"v7": "features", "v9": "features_v9"}
+_MODULES = {"v7": "features", "v9": "features_v9", "v91": "features_v91"}
 
 DEFAULT_VERSION = "v7"
 

@@ -104,6 +104,7 @@ class ModelConfig:
     # Feature-encoder version (see src_jax/feature_versions.py):
     #   "v7" (default) — features.py     (self=25, cand=30) — current main arch.
     #   "v9"           — features_v9.py  (self=17, cand=26) — leaner vendored arch.
+    #   "v91"          — features_v91.py (self=18, cand=30) — v9 + 15-tick snapshots.
     # Selects the LEARNER's encoder and the metadata dims init_params sizes from.
     # The opponent / KL-reference may use a different version (their ckpt's arch).
     feat_version: str = "v7"
