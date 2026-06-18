@@ -169,6 +169,7 @@ def _ppo_update_jit(
     key: jax.Array,
     kl_coef: float,
     use_kl: bool,
+    max_grad_norm: float,
 ) -> tuple[TrainState, jax.Array, jax.Array]:
     sf      = batch.self_features        # [B, MAX_SRC, self_dim]
     cf      = batch.candidate_features   # [B, MAX_SRC, K, cand_dim]
@@ -198,6 +199,7 @@ def _ppo_update_jit(
     ec = jnp.float32(ent_coef)
     vc = jnp.float32(vf_coef)
     kc = jnp.float32(kl_coef)
+    mgn = jnp.float32(max_grad_norm)
 
     MAX_SRC  = sf.shape[1]
     GLOB_DIM = gf.shape[-1]
@@ -266,25 +268,33 @@ def _ppo_update_jit(
         (loss, (pg, vl, em, kl, ratio, new_lp)), grads = jax.value_and_grad(
             loss_fn, has_aux=True
         )(state.params)
+
+        # Pre-clip global grad norm (matches what clip_by_global_norm sees) and
+        # whether this minibatch step actually hit the clip. Averaged over the
+        # scan, gn_mb is the mean pre-clip norm and clip_mb is the FRACTION of
+        # minibatch updates whose gradient exceeded max_grad_norm.
+        gn_mb   = optax.global_norm(grads)
+        clip_mb = (gn_mb > mgn).astype(jnp.float32)
+
         state = state.apply_gradients(grads=grads)
 
         valid_m = sv_mb.astype(jnp.float32)
         n_vm    = valid_m.sum() + 1e-8
         cf_mb   = ((jnp.abs(ratio - 1.0) > cc) * valid_m).sum() / n_vm
         kd_mb   = ((old_lp[idx] - new_lp) * valid_m).sum() / n_vm
-        return state, jnp.stack([loss, pg, vl, em, kl, cf_mb, kd_mb])
+        return state, jnp.stack([loss, pg, vl, em, kl, cf_mb, kd_mb, gn_mb, clip_mb])
 
     # ── Outer scan body: one epoch ────────────────────────────────────────────
     def epoch_step(state: TrainState, epoch_key: jax.Array) -> tuple[TrainState, jax.Array]:
         perm = jax.random.permutation(epoch_key, B)[: n_mb * mb].reshape(n_mb, mb)
         state, mb_metrics = jax.lax.scan(mb_step, state, perm)
-        return state, mb_metrics   # mb_metrics: [n_mb, 7]
+        return state, mb_metrics   # mb_metrics: [n_mb, 9]
 
     state, all_metrics = jax.lax.scan(epoch_step, state, epoch_keys)
-    # all_metrics: [epochs, n_mb, 7]
-    m = all_metrics.mean(axis=(0, 1))   # [7]
+    # all_metrics: [epochs, n_mb, 9]
+    m = all_metrics.mean(axis=(0, 1))   # [9]
 
-    # Pack ev_jax as 8th element so the caller can sync everything in one np.asarray call.
+    # Pack ev_jax as 10th element so the caller can sync everything in one np.asarray call.
     return state, jnp.append(m, ev_jax), key
 
 
@@ -300,12 +310,14 @@ def ppo_update(
     key: jax.Array,
     kl_coef: float = 0.0,
     use_kl: bool = False,
+    max_grad_norm: float = 0.5,
 ) -> tuple[TrainState, dict[str, float], jax.Array]:
     if batch.self_features.shape[0] == 0:
         return state, {
             "loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0,
             "entropy": 0.0, "clip_fraction": 0.0, "kl_divergence": 0.0,
             "kl_ref": 0.0, "explained_variance": 0.0,
+            "grad_norm": 0.0, "grad_clip_fraction": 0.0,
         }, key
 
     use_kl = bool(use_kl) and kl_coef > 0.0
@@ -315,6 +327,7 @@ def ppo_update(
         clip_coef=clip_coef, ent_coef=ent_coef, vf_coef=vf_coef,
         epochs=epochs, minibatch_size=minibatch_size,
         key=key, kl_coef=kl_coef, use_kl=use_kl,
+        max_grad_norm=max_grad_norm,
     )
 
     # Single device→host transfer for all 8 metric values.
@@ -327,5 +340,7 @@ def ppo_update(
         "kl_ref":             float(m_np[4]),
         "clip_fraction":      float(m_np[5]),
         "kl_divergence":      float(m_np[6]),
-        "explained_variance": float(m_np[7]),
+        "grad_norm":          float(m_np[7]),
+        "grad_clip_fraction": float(m_np[8]),
+        "explained_variance": float(m_np[9]),
     }, key

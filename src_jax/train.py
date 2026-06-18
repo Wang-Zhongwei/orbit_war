@@ -382,6 +382,7 @@ def main() -> None:
                 key=key,
                 kl_coef=cfg.ppo.kl_coef,
                 use_kl=compute_ref_logits,
+                max_grad_norm=cfg.ppo.max_grad_norm,
             )
             jax.block_until_ready(train_state.params)
             t_ppo = time.time() - t_update - t_collect - t_batch
@@ -416,6 +417,8 @@ def main() -> None:
                     f" ev={metrics['explained_variance']:.3f}"
                     f" entropy={metrics['entropy']:.3f}"
                     f" clip={metrics['clip_fraction']:.3f}"
+                    f" gnorm={metrics['grad_norm']:.3f}"
+                    f" gclip={metrics['grad_clip_fraction']:.3f}"
                     f"  {elapsed:.0f}s ({updates_per_s:.2f} updates/s, {update_time:.1f}s/update)"
                     f"  [collect={t_collect:.2f}s batch={t_batch:.2f}s ppo={t_ppo:.2f}s]",
                     flush=True,  # else stdout block-buffers to the slurm file and
@@ -437,6 +440,8 @@ def main() -> None:
                             "train/clip_fraction":      metrics["clip_fraction"],
                             "train/kl_divergence":      metrics["kl_divergence"],
                             "train/kl_ref":             metrics["kl_ref"],
+                            "train/grad_norm":          metrics["grad_norm"],
+                            "train/grad_clip_fraction": metrics["grad_clip_fraction"],
                             "train/explained_variance": metrics["explained_variance"],
                         },
                         step=update,
