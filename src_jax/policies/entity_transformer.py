@@ -11,6 +11,10 @@ candidate-scoring head:
 
 Same call signature / ``PolicyOutput`` as every other policy here, so they are
 selectable purely via ``cfg.model.arch``.
+
+Leading axis ``S`` = sources (``MAX_SRC`` under PPO's per-state ``vmap``, a flat
+source-row batch under BC); ``global_features`` is the state's single global
+broadcast across ``S``. See :mod:`~src_jax.policies.backbone`.
 """
 from __future__ import annotations
 
@@ -49,20 +53,20 @@ class _EntityBackbonePolicy(nn.Module):
 
     def _score(
         self,
-        self_emb: jax.Array,    # [N, H]
-        global_emb: jax.Array,  # [N, H]
-        cand_emb: jax.Array,    # [N, K, H]
-    ) -> jax.Array:             # [N, K]
+        self_emb: jax.Array,    # [S, H]
+        global_emb: jax.Array,  # [S, H]
+        cand_emb: jax.Array,    # [S, K, H]
+    ) -> jax.Array:             # [S, K]
         raise NotImplementedError
 
     @nn.compact
     def __call__(
         self,
-        self_features: jax.Array,       # [N, self_dim]
-        candidate_features: jax.Array,  # [N, K, candidate_dim]
-        global_features: jax.Array,     # [N, global_dim]
-        candidate_mask: jax.Array,      # [N, K] bool
-        src_valid: jax.Array,           # [N] bool
+        self_features: jax.Array,       # [S, self_dim]
+        candidate_features: jax.Array,  # [S, K, candidate_dim]
+        global_features: jax.Array,     # [S, global_dim]
+        candidate_mask: jax.Array,      # [S, K] bool
+        src_valid: jax.Array,           # [S] bool
     ) -> PolicyOutput:
         H = self.hidden_size
 
@@ -75,7 +79,7 @@ class _EntityBackbonePolicy(nn.Module):
             d_model=H, n_heads=self.n_heads, n_blocks=self.n_xsrc_blocks, name="policy_xsrc",
         )(p_self, src_valid)
 
-        target_logits = self._score(p_self, p_global, p_cand)               # [N, K]
+        target_logits = self._score(p_self, p_global, p_cand)               # [S, K]
         # Finite floor (not -inf) keeps entropy / log_softmax NaN-free.
         target_logits = jnp.where(candidate_mask, target_logits, MASK_LOGIT)
 
@@ -108,12 +112,12 @@ class _EntityBackbonePolicy(nn.Module):
 
     # -- shared helper: broadcast (self, global) against the K candidate axis --
     def _joint(self, self_emb, global_emb, cand_emb):
-        N, K, H = cand_emb.shape
+        S, K, H = cand_emb.shape
         return jnp.concatenate([
-            jnp.broadcast_to(self_emb[:, None, :],   (N, K, H)),
-            jnp.broadcast_to(global_emb[:, None, :], (N, K, H)),
+            jnp.broadcast_to(self_emb[:, None, :],   (S, K, H)),
+            jnp.broadcast_to(global_emb[:, None, :], (S, K, H)),
             cand_emb,
-        ], axis=-1)                                                          # [N, K, 3H]
+        ], axis=-1)                                                          # [S, K, 3H]
 
 
 class EntityMLPPolicy(_EntityBackbonePolicy):
@@ -124,7 +128,7 @@ class EntityMLPPolicy(_EntityBackbonePolicy):
         joint = self._joint(self_emb, global_emb, cand_emb)
         return nn.Dense(1, name="score")(
             nn.gelu(nn.Dense(H, name="score_hidden")(joint))
-        ).squeeze(-1)                                                        # [N, K]
+        ).squeeze(-1)                                                        # [S, K]
 
 
 class EntityDeepMLPPolicy(_EntityBackbonePolicy):
@@ -144,7 +148,7 @@ class EntityDeepMLPPolicy(_EntityBackbonePolicy):
             h = nn.gelu(nn.Dense(H, name=f"score_fc{i}a")(h))
             h = nn.Dense(H, name=f"score_fc{i}b")(h)
             x = x + h                                                        # residual
-        return nn.Dense(1, name="score")(x).squeeze(-1)                     # [N, K]
+        return nn.Dense(1, name="score")(x).squeeze(-1)                     # [S, K]
 
 
 # Back-compat alias: the first entity policy was simply ``EntityPolicy``.

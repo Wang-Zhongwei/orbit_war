@@ -72,7 +72,7 @@ def build_train_state(cfg, seed: int = 0) -> TrainState:
 class TrainingBatch:
     self_features: jax.Array        # [B, MAX_SRC, self_dim]
     candidate_features: jax.Array   # [B, MAX_SRC, K, cand_dim]
-    global_features: jax.Array      # [B, global_dim]
+    global_features: jax.Array      # [B, global_dim]  (one per state; broadcast to S sources at apply)
     candidate_mask: jax.Array       # [B, MAX_SRC, K]  bool
     target_index: jax.Array         # [B, MAX_SRC]     int32
     log_prob: jax.Array             # [B, MAX_SRC]     float32
@@ -229,6 +229,8 @@ def _ppo_update_jit(
             ref_tgt_mb = None
 
         def _fwd(params):
+            # Broadcast the per-state global across MAX_SRC; vmap over states, so
+            # apply_fn sees leading axis S == MAX_SRC.
             gf_exp = jnp.broadcast_to(gf[idx][:, None, :], (mb, MAX_SRC, GLOB_DIM))
             return jax.vmap(
                 lambda sf_i, cf_i, gf_i, cm_i, sv_i: state.apply_fn(

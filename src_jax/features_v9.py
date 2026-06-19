@@ -529,7 +529,9 @@ def aim_fleets(
 
 class _EncodedTurn(NamedTuple):
     """Fixed-size encoded observation for one env (no batch dim).
-    After vmap the leading axis is N (number of envs)."""
+    After vmap the leading axis is the env count (the network instead batches over
+    sources ``S`` — see :mod:`~src_jax.policies.backbone`); ``global_feat`` is one
+    ``[12]`` vector per env, broadcast across sources at apply time."""
     src_valid:       jnp.ndarray  # [MAX_SRC]       bool
     src_ids:         jnp.ndarray  # [MAX_SRC]       int32
     src_ships:       jnp.ndarray  # [MAX_SRC]       int32

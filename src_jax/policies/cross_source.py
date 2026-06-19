@@ -4,6 +4,10 @@ Per source planet, encodes the K candidate targets with a cross-source
 coordination attention block (so sources can form coalitions / avoid
 double-committing) plus a candidate transformer block, then scores each
 candidate. Separate value net with no shared weights.
+
+Leading axis ``S`` = sources (``MAX_SRC`` under PPO's per-state ``vmap``, a flat
+source-row batch under BC); ``global_features`` is the state's single global
+broadcast across ``S``. See :mod:`~src_jax.policies.backbone`.
 """
 from __future__ import annotations
 
@@ -24,44 +28,44 @@ class _PolicyHead(nn.Module):
     @nn.compact
     def __call__(
         self,
-        self_features: jax.Array,       # [N, self_dim]
-        candidate_features: jax.Array,  # [N, K, cand_dim]
-        global_features: jax.Array,     # [N, global_dim]
-        candidate_mask: jax.Array,      # [N, K] bool
-        src_valid: jax.Array,           # [N] bool
+        self_features: jax.Array,       # [S, self_dim]
+        candidate_features: jax.Array,  # [S, K, cand_dim]
+        global_features: jax.Array,     # [S, global_dim]
+        candidate_mask: jax.Array,      # [S, K] bool
+        src_valid: jax.Array,           # [S] bool
     ) -> jax.Array:
         H, K = self.hidden_size, self.candidate_count
-        N = self_features.shape[0]
+        S = self_features.shape[0]
 
         # 2-layer GELU MLP encoders (GELU per RLIAYN) 
         self_h   = nn.gelu(nn.Dense(H)(nn.gelu(nn.Dense(H)(self_features))))
         global_h = nn.gelu(nn.Dense(H)(nn.gelu(nn.Dense(H)(global_features))))
-        cand_flat = candidate_features.reshape(N * K, candidate_features.shape[-1])
-        cand_h   = nn.gelu(nn.Dense(H)(nn.gelu(nn.Dense(H)(cand_flat)))).reshape(N, K, H)
+        cand_flat = candidate_features.reshape(S * K, candidate_features.shape[-1])
+        cand_h   = nn.gelu(nn.Dense(H)(nn.gelu(nn.Dense(H)(cand_flat)))).reshape(S, K, H)
 
         # Within-turn cross-source coordination: each source attends to all valid
         # sibling sources so it can learn coalition attacks and avoid double-sending.
-        # Mask [1,1,1,N] broadcasts to [N, n_heads, N_q, N_k]; invalid sources are
+        # Mask [1,1,1,S] broadcasts to [S, n_heads, S_q, S_k]; invalid sources are
         # masked as keys so padding doesn't pollute the coalition signal.
         cs_mask    = src_valid[None, None, None, :]
         cs_normed  = nn.LayerNorm()(self_h)
         self_h     = (self_h + nn.MultiHeadDotProductAttention(
             num_heads=self.n_heads, out_features=H,
-        )(cs_normed, mask=cs_mask)).reshape(N, H)
+        )(cs_normed, mask=cs_mask)).reshape(S, H)
         cs_normed2 = nn.LayerNorm()(self_h)
         self_h     = self_h + nn.Dense(H)(nn.gelu(nn.Dense(4 * H)(cs_normed2)))
 
         # Inject source + global context into candidate tokens before attention.
         ctx = (
-            nn.Dense(H)(jnp.broadcast_to(self_h[:, None, :],   (N, K, H)))
-            + nn.Dense(H)(jnp.broadcast_to(global_h[:, None, :], (N, K, H)))
+            nn.Dense(H)(jnp.broadcast_to(self_h[:, None, :],   (S, K, H)))
+            + nn.Dense(H)(jnp.broadcast_to(global_h[:, None, :], (S, K, H)))
         )
-        cand_h = cand_h + ctx                                                   # [N, K, H]
+        cand_h = cand_h + ctx                                                   # [S, K, H]
 
         # Full transformer block: Pre-LN attention + Pre-LN FFN.
         # Pre-LN (LN before sub-layer) is more stable than post-LN during
         # early training when gradients can be large.
-        attn_mask = candidate_mask[:, None, None, :]                            # [N, 1, 1, K]
+        attn_mask = candidate_mask[:, None, None, :]                            # [S, 1, 1, K]
         normed    = nn.LayerNorm()(cand_h)
         attn      = nn.MultiHeadDotProductAttention(
             num_heads=self.n_heads, out_features=H,
@@ -70,16 +74,16 @@ class _PolicyHead(nn.Module):
 
         normed2   = nn.LayerNorm()(cand_h)
         ffn       = nn.Dense(H)(nn.gelu(nn.Dense(4 * H)(normed2)))
-        cand_h    = cand_h + ffn                                                # FFN residual [N, K, H]
+        cand_h    = cand_h + ffn                                                # FFN residual [S, K, H]
 
         # Score each candidate using the full joint context.
         joint = jnp.concatenate([
-            jnp.broadcast_to(self_h[:, None, :],   (N, K, H)),
-            jnp.broadcast_to(global_h[:, None, :], (N, K, H)),
+            jnp.broadcast_to(self_h[:, None, :],   (S, K, H)),
+            jnp.broadcast_to(global_h[:, None, :], (S, K, H)),
             cand_h,
-        ], axis=-1)                                                             # [N, K, 3H]
+        ], axis=-1)                                                             # [S, K, 3H]
 
-        target_logits = nn.Dense(1)(nn.gelu(nn.Dense(H)(joint))).squeeze(-1)   # [N, K]
+        target_logits = nn.Dense(1)(nn.gelu(nn.Dense(H)(joint))).squeeze(-1)   # [S, K]
         # Mask invalid candidates with a large *finite* negative instead of -inf.
         # -inf makes softmax prob exactly 0, but then the entropy term
         # exp(log_p) * log_p = 0 * -inf = NaN, which poisons the PPO loss and
@@ -98,31 +102,31 @@ class _ValueNet(nn.Module):
     @nn.compact
     def __call__(
         self,
-        self_features: jax.Array,       # [N, self_dim]
-        candidate_features: jax.Array,  # [N, K, cand_dim]
-        global_features: jax.Array,     # [N, global_dim]
-        candidate_mask: jax.Array,      # [N, K] bool
-        src_valid: jax.Array,           # [N] bool
+        self_features: jax.Array,       # [S, self_dim]
+        candidate_features: jax.Array,  # [S, K, cand_dim]
+        global_features: jax.Array,     # [S, global_dim]
+        candidate_mask: jax.Array,      # [S, K] bool
+        src_valid: jax.Array,           # [S] bool
     ) -> jax.Array:
         H, K = self.hidden_size, self.candidate_count
-        N = self_features.shape[0]
+        S = self_features.shape[0]
 
         self_h   = nn.gelu(nn.Dense(H)(nn.gelu(nn.Dense(H)(self_features))))
         global_h = nn.gelu(nn.Dense(H)(nn.gelu(nn.Dense(H)(global_features))))
-        cand_flat = candidate_features.reshape(N * K, candidate_features.shape[-1])
-        cand_h   = nn.gelu(nn.Dense(H)(nn.gelu(nn.Dense(H)(cand_flat)))).reshape(N, K, H)
+        cand_flat = candidate_features.reshape(S * K, candidate_features.shape[-1])
+        cand_h   = nn.gelu(nn.Dense(H)(nn.gelu(nn.Dense(H)(cand_flat)))).reshape(S, K, H)
 
         cs_mask    = src_valid[None, None, None, :]
         cs_normed  = nn.LayerNorm()(self_h)
         self_h     = (self_h + nn.MultiHeadDotProductAttention(
             num_heads=self.n_heads, out_features=H,
-        )(cs_normed, mask=cs_mask)).reshape(N, H)
+        )(cs_normed, mask=cs_mask)).reshape(S, H)
         cs_normed2 = nn.LayerNorm()(self_h)
         self_h     = self_h + nn.Dense(H)(nn.gelu(nn.Dense(4 * H)(cs_normed2)))
 
         ctx = (
-            nn.Dense(H)(jnp.broadcast_to(self_h[:, None, :],   (N, K, H)))
-            + nn.Dense(H)(jnp.broadcast_to(global_h[:, None, :], (N, K, H)))
+            nn.Dense(H)(jnp.broadcast_to(self_h[:, None, :],   (S, K, H)))
+            + nn.Dense(H)(jnp.broadcast_to(global_h[:, None, :], (S, K, H)))
         )
         cand_h = cand_h + ctx
 
@@ -135,11 +139,11 @@ class _ValueNet(nn.Module):
 
         normed2   = nn.LayerNorm()(cand_h)
         ffn       = nn.Dense(H)(nn.gelu(nn.Dense(4 * H)(normed2)))
-        cand_h    = cand_h + ffn                                                # [N, K, H]
+        cand_h    = cand_h + ffn                                                # [S, K, H]
 
-        pooled   = cand_h.mean(axis=1)                                          # [N, H]
-        value_in = jnp.concatenate([self_h, global_h, pooled], axis=-1)        # [N, 3H]
-        return nn.Dense(1)(nn.gelu(nn.Dense(H)(value_in))).squeeze(-1)          # [N]
+        pooled   = cand_h.mean(axis=1)                                          # [S, H]
+        value_in = jnp.concatenate([self_h, global_h, pooled], axis=-1)        # [S, 3H]
+        return nn.Dense(1)(nn.gelu(nn.Dense(H)(value_in))).squeeze(-1)          # [S]
 
 
 class CrossSourcePolicy(nn.Module):
@@ -153,11 +157,11 @@ class CrossSourcePolicy(nn.Module):
     @nn.compact
     def __call__(
         self,
-        self_features: jax.Array,       # [N, self_dim]
-        candidate_features: jax.Array,  # [N, K, candidate_dim]
-        global_features: jax.Array,     # [N, global_dim]
-        candidate_mask: jax.Array,      # [N, K] bool
-        src_valid: jax.Array,           # [N] bool
+        self_features: jax.Array,       # [S, self_dim]
+        candidate_features: jax.Array,  # [S, K, candidate_dim]
+        global_features: jax.Array,     # [S, global_dim]
+        candidate_mask: jax.Array,      # [S, K] bool
+        src_valid: jax.Array,           # [S] bool
     ) -> PolicyOutput:
         target_logits = _PolicyHead(
             hidden_size     = self.hidden_size,

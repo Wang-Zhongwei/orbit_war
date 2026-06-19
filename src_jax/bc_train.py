@@ -100,20 +100,22 @@ def _encode_episode(task) -> "dict | None":
 @jax.jit
 def _bc_step(
     state: TrainState,
-    sf: jax.Array,   # [N, self_dim]
-    cf: jax.Array,   # [N, K, cand_dim]
-    gf: jax.Array,   # [N, global_dim]
-    cm: jax.Array,   # [N, K]
-    ti: jax.Array,   # [N]  int32  target index
-    w: jax.Array,    # [N]  float32 per-sample loss weight (win/loss)
+    # S = source rows: a flat BC batch of (state, source) decisions, each with its
+    # own global. (Same leading axis the policy calls S.)
+    sf: jax.Array,   # [S, self_dim]
+    cf: jax.Array,   # [S, K, cand_dim]
+    gf: jax.Array,   # [S, global_dim]
+    cm: jax.Array,   # [S, K]
+    ti: jax.Array,   # [S]  int32  target index
+    w: jax.Array,    # [S]  float32 per-sample loss weight (win/loss)
 ) -> tuple[TrainState, jax.Array, jax.Array]:
     def loss_fn(params):
         sv  = jnp.ones(sf.shape[0], dtype=jnp.bool_)
         out = state.apply_fn(params, sf, cf, gf, cm, sv)
-        N   = ti.shape[0]
+        S   = ti.shape[0]
 
         tgt_lp   = jax.nn.log_softmax(out.target_logits, axis=-1)
-        ce       = -tgt_lp[jnp.arange(N), ti]
+        ce       = -tgt_lp[jnp.arange(S), ti]
         tgt_loss = (w * ce).sum() / (w.sum() + 1e-8)   # weighted CE; zero-weight rows ignored
         tgt_acc  = (jnp.argmax(out.target_logits, axis=-1) == ti).astype(jnp.float32).mean()
 
@@ -132,9 +134,9 @@ def _bc_eval_batch(
     """Eval-only forward: returns (sum_correct, sum_ce) over the batch (unweighted)."""
     sv  = jnp.ones(sf.shape[0], dtype=jnp.bool_)
     out = state.apply_fn(state.params, sf, cf, gf, cm, sv)
-    N   = ti.shape[0]
+    S   = ti.shape[0]
     tgt_lp  = jax.nn.log_softmax(out.target_logits, axis=-1)
-    ce_sum  = -tgt_lp[jnp.arange(N), ti].sum()
+    ce_sum  = -tgt_lp[jnp.arange(S), ti].sum()
     correct = (jnp.argmax(out.target_logits, axis=-1) == ti).sum()
     return correct.astype(jnp.float32), ce_sum
 
