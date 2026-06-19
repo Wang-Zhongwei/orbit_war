@@ -30,7 +30,6 @@ from .rollout import (
     make_rollout_fn,
 )
 
-N_BOARDS = 2048
 _EVAL_BASE_SEED = 1000
 
 def run_eval(params, cfg, base_seed: int = _EVAL_BASE_SEED) -> dict[str, float]:
@@ -183,6 +182,7 @@ def main() -> None:
 
     N     = cfg.ppo.num_envs if cfg.ppo.num_envs > 0 else 10
     cfg.ppo.num_envs = N
+    n_boards = cfg.ppo.n_boards
     K     = cfg.env.candidate_count
     use_wandb = not args.no_wandb
     run_name = args.run_name or cfg.run_name
@@ -202,7 +202,7 @@ def main() -> None:
             name=run_name,
             config={
                 "seed": cfg.seed, "num_envs": N,
-                "n_boards": N_BOARDS,
+                "n_boards": n_boards,
                 "opponents": cfg.opponents,
                 **{f"env/{k}": v for k, v in dataclasses.asdict(cfg.env).items()},
                 **{f"model/{k}": v for k, v in dataclasses.asdict(cfg.model).items()},
@@ -210,11 +210,11 @@ def main() -> None:
             },
         )
 
-    print(f"Using {N} parallel environments, board pool size {N_BOARDS}")
+    print(f"Using {N} parallel environments, board pool size {n_boards}")
 
     # ── Board pool ────────────────────────────────────────────────────────────
     board_pool = make_board_pool(
-        N_BOARDS, cfg.seed, num_agents=cfg.env.num_agents,
+        n_boards, cfg.seed, num_agents=cfg.env.num_agents,
         mix_4player_frac=cfg.env.mix_4player_frac,
     )
 
@@ -320,7 +320,7 @@ def main() -> None:
     # ── JIT-compiled rollout fn ───────────────────────────────────────────────
     collect = make_rollout_fn(
         board_pool          = board_pool,
-        n_boards            = N_BOARDS,
+        n_boards            = n_boards,
         cfg                 = cfg,
         module              = policy,
         rollout_steps       = cfg.ppo.rollout_steps,
@@ -335,7 +335,7 @@ def main() -> None:
 
     # ── Initial carry ─────────────────────────────────────────────────────────
     batched_state, board_idx, ep_reward, learner_players = make_initial_carry_state(
-        board_pool, N_BOARDS, N, cfg.seed, cfg.alternate_player_sides,
+        board_pool, n_boards, N, cfg.seed, cfg.alternate_player_sides,
         num_agents=cfg.env.num_agents,
     )
     carry = RolloutCarry(batched_state, board_idx, ep_reward, learner_players, key)
@@ -388,7 +388,12 @@ def main() -> None:
             t_ppo = time.time() - t_update - t_collect - t_batch
 
             # ── Self-play sync: refresh all "self" slots in the stacked pool ───
-            if any(spec.kind == "self" for spec, _ in opp_pool) and update % cfg.self_play_update_interval == 0:
+            updates_since_start = update - start_update
+            if (
+                any(spec.kind == "self" for spec, _ in opp_pool)
+                and updates_since_start > 0
+                and updates_since_start % cfg.self_play_update_interval == 0
+            ):
                 for i, (spec, _) in enumerate(opp_pool):
                     if spec.kind == "self":
                         stacked_opp_params = jax.tree_util.tree_map(

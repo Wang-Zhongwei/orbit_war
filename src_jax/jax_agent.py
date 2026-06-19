@@ -18,7 +18,6 @@ from typing import Callable
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 from .bc_data import obs_to_env_state
 from .features import MIN_SOURCE_SHIPS, _make_env_encoder, self_feature_dim, candidate_feature_dim, aim_fleets
@@ -148,12 +147,57 @@ def _evac_plan(state: EnvState, player: jax.Array):
     return valid, state.p_id, angle, ships
 
 
+def _make_dummy_state() -> "EnvState":
+    """Synthetic EnvState whose shapes/dtypes mirror obs_to_env_state's output.
+    Used to warm up — or AOT-lower — the encoder; module-level so the gen-time
+    AOT build and runtime build_agent compile on byte-identical input avals."""
+    from .physics import MAX_PATH_LEN
+    return EnvState(
+        p_id=jnp.zeros(MAX_PLANETS, jnp.int32),
+        p_owner=jnp.full(MAX_PLANETS, -1, jnp.int32),
+        p_x=jnp.zeros(MAX_PLANETS, jnp.float32),
+        p_y=jnp.zeros(MAX_PLANETS, jnp.float32),
+        p_radius=jnp.zeros(MAX_PLANETS, jnp.float32),
+        p_ships=jnp.zeros(MAX_PLANETS, jnp.float32),
+        p_production=jnp.zeros(MAX_PLANETS, jnp.float32),
+        p_alive=jnp.zeros(MAX_PLANETS, bool),
+        p_init_x=jnp.zeros(MAX_PLANETS, jnp.float32),
+        p_init_y=jnp.zeros(MAX_PLANETS, jnp.float32),
+        p_is_comet=jnp.zeros(MAX_PLANETS, bool),
+        f_owner=jnp.zeros(MAX_FLEETS, jnp.int32),
+        f_x=jnp.zeros(MAX_FLEETS, jnp.float32),
+        f_y=jnp.zeros(MAX_FLEETS, jnp.float32),
+        f_angle=jnp.zeros(MAX_FLEETS, jnp.float32),
+        f_ships=jnp.zeros(MAX_FLEETS, jnp.float32),
+        f_alive=jnp.zeros(MAX_FLEETS, bool),
+        comet_paths=jnp.zeros((N_COMET_GROUPS, 4, MAX_PATH_LEN, 2), jnp.float32),
+        comet_path_lens=jnp.zeros((N_COMET_GROUPS, 4), jnp.int32),
+        comet_ships=jnp.zeros(N_COMET_GROUPS, jnp.float32),
+        comet_path_idx=jnp.full(N_COMET_GROUPS, -2, jnp.int32),
+        step=jnp.int32(0),
+        angular_velocity=jnp.float32(0.0),
+        num_agents=jnp.int32(2),
+        comet_id_base=jnp.int32(0),
+    )
+
+
 def build_agent(
     params,
     cfg,
     deterministic: bool = True,
+    aot_encode=None,
 ) -> Callable:
-    """Return an obs→moves callable from in-memory params."""
+    """Return an obs→moves callable from in-memory params.
+
+    ``aot_encode`` is an optional ``(serialized, in_tree, out_tree)`` triple from
+    ``jax.experimental.serialize_executable`` holding a PRE-COMPILED encoder
+    executable (produced at submission-gen time). The encoder is the ~5s trace+
+    compile that dominates the first act; loading it instead of compiling matters
+    on Kaggle 4-player games, where FOUR agent instances compile at once and
+    saturate the CPU, ~doubling each compile and pushing the first act past the
+    ~62s overage bank (TIMEOUT). Loading barely contends, so it dodges that.
+    Version-locked to jaxlib: a mismatch makes deserialize raise → we fall back
+    to the freshly-traced encoder (no worse than today)."""
     params  = jax.tree_util.tree_map(jnp.asarray, params)
     rng_key = jax.random.PRNGKey(int(getattr(cfg, "seed", 0)))
 
@@ -161,6 +205,23 @@ def build_agent(
 
     module    = build_policy(cfg)
     encode_fn = make_env_encoder(K, cfg.env, getattr(cfg.model, "feat_version", "v7"))
+    if aot_encode is not None:
+        import sys as _sys
+        try:
+            from jax.experimental import serialize_executable as _se
+            _enc_exe = _se.deserialize_and_load(*aot_encode)
+            def encode_fn(batched, player, _exe=_enc_exe):   # noqa: replaces the jitted encoder
+                return _exe(jax.tree_util.tree_map(jnp.asarray, batched), jnp.asarray(player))
+            # Logged to the (downloadable) agent stderr so the episode log shows
+            # the runtime jax version AND whether AOT engaged or fell back.
+            print(f"[agent] AOT encoder LOADED (jax {jax.__version__})", file=_sys.__stderr__)
+        except Exception as _e:
+            # Most commonly a jaxlib mismatch (e.g. a 0.5.1-built blob loaded under
+            # a different local jaxlib for a quick test) — just compile the encoder.
+            # Clean one-liner, NOT a traceback, so it doesn't look like a crash.
+            # encode_fn stays the freshly-traced encoder, so the agent is correct.
+            print(f"[agent] AOT encoder unavailable ({type(_e).__name__}); "
+                  f"compiling instead (jax {jax.__version__})", file=_sys.__stderr__)
 
     MAX_SRC = MAX_BASE_PLANETS
 
@@ -168,13 +229,31 @@ def build_agent(
     def _forward(sf, cf, gf, cm, sv):
         return module.apply(params, sf, cf, gf, cm, sv)
 
-    _evac = jax.jit(_evac_plan)
+    # _evac (comet-garrison evacuation) intentionally removed from the hot path —
+    # its compile (~1.4s, ~7s on Kaggle CPU) was a meaningful slice of the first-act
+    # budget and the salvage behavior is negligible at this level. _evac_plan stays
+    # defined above for easy re-enable.
+
+    # Player count is not in the obs, so infer it from seat ownership: 2-player
+    # boards seat owners {0,1}, 4-player (FFA) boards {0,1,2,3}. Use the static
+    # initial_planets layout and keep a running max across the episode so an
+    # eliminated seat never downgrades a 4p game to 2p mid-game. num_agents only
+    # drives the encoder's is_4player global feature; the policy was trained with
+    # is_4player=1 in FFA, so feeding the constant 2 here makes it misread every
+    # FFA board as a 1v1 and collapse to no-ops.
+    seen_max_owner = 0
 
     def agent(obs) -> list:
-        nonlocal rng_key
+        nonlocal rng_key, seen_max_owner
 
         obs_dict = _obs_to_dict(obs)
-        state  = obs_to_env_state(obs_dict)
+        for src in (obs_dict.get("initial_planets"), obs_dict.get("planets")):
+            for r in (src or []):
+                o = int(r[1])
+                if o > seen_max_owner:
+                    seen_max_owner = o
+        num_agents = 4 if seen_max_owner >= 2 else 2
+        state  = obs_to_env_state(obs_dict, num_agents)
         player = jnp.array([int(obs_dict.get("player", 0))], dtype=jnp.int32)
 
         batched = jax.tree_util.tree_map(lambda x: x[None], state)
@@ -206,20 +285,11 @@ def build_agent(
         ships_send      = jnp.maximum(MIN_SOURCE_SHIPS, src_ships)
         selected_angles = angles[row_idx, ti]
 
-        # Comet evacuation override: any owned comet about to leave the board dumps
-        # its full garrison to the nearest friendly planet (clear lane) else the
-        # nearest enemy. This is a hard override — the policy move for that same
-        # planet is dropped so the comet doesn't double-send.
-        ev_valid, ev_ids, ev_angle, ev_ships = _evac(state, player)
-        ev_slots   = np.nonzero(np.asarray(ev_valid))[0]   # usually empty; ≤4 active comets
-        ev_ids     = np.asarray(ev_ids)
-        ev_angle   = np.asarray(ev_angle)
-        ev_ships   = np.asarray(ev_ships)
-        evac_ids: set  = {int(ev_ids[s]) for s in ev_slots}
-        evac_moves: list = [
-            [int(ev_ids[s]), float(ev_angle[s]), int(ev_ships[s])] for s in ev_slots
-        ]
-
+        # NOTE: the comet-evacuation override (dump a leaving comet's garrison to a
+        # nearby planet) was removed — its _evac JIT cost ~1.4s to compile (~7s on
+        # Kaggle's CPU), enough to matter against the ~60s first-act overage bank
+        # (see the timeout analysis). _evac_plan/_evac are kept defined but unused
+        # so re-enabling is a small change if the salvage behavior is ever wanted.
         moves: list = []
         for i in range(MAX_SRC):
             if not bool(src_valid[i]):
@@ -229,44 +299,14 @@ def build_agent(
                 continue
             if not bool(cand_mask[i, t]):
                 continue
-            if int(src_ids[i]) in evac_ids:   # comet evacuating: skip policy move
-                continue
             moves.append([int(src_ids[i]), float(selected_angles[i]), int(ships_send[i])])
 
-        moves.extend(evac_moves)
         return moves
 
-    # Warm up both JITs (encode_fn and _forward) so first in-game call doesn't
-    # blow the agentTimeout. encode_fn changed in the pool-K refactor and now
-    # takes longer to trace; both need to compile before entering the env.
-    from .physics import MAX_PATH_LEN
-    _dummy_state = EnvState(
-        p_id=jnp.zeros(MAX_PLANETS, jnp.int32),
-        p_owner=jnp.full(MAX_PLANETS, -1, jnp.int32),
-        p_x=jnp.zeros(MAX_PLANETS, jnp.float32),
-        p_y=jnp.zeros(MAX_PLANETS, jnp.float32),
-        p_radius=jnp.zeros(MAX_PLANETS, jnp.float32),
-        p_ships=jnp.zeros(MAX_PLANETS, jnp.float32),
-        p_production=jnp.zeros(MAX_PLANETS, jnp.float32),
-        p_alive=jnp.zeros(MAX_PLANETS, bool),
-        p_init_x=jnp.zeros(MAX_PLANETS, jnp.float32),
-        p_init_y=jnp.zeros(MAX_PLANETS, jnp.float32),
-        p_is_comet=jnp.zeros(MAX_PLANETS, bool),
-        f_owner=jnp.zeros(MAX_FLEETS, jnp.int32),
-        f_x=jnp.zeros(MAX_FLEETS, jnp.float32),
-        f_y=jnp.zeros(MAX_FLEETS, jnp.float32),
-        f_angle=jnp.zeros(MAX_FLEETS, jnp.float32),
-        f_ships=jnp.zeros(MAX_FLEETS, jnp.float32),
-        f_alive=jnp.zeros(MAX_FLEETS, bool),
-        comet_paths=jnp.zeros((N_COMET_GROUPS, 4, MAX_PATH_LEN, 2), jnp.float32),
-        comet_path_lens=jnp.zeros((N_COMET_GROUPS, 4), jnp.int32),
-        comet_ships=jnp.zeros(N_COMET_GROUPS, jnp.float32),
-        comet_path_idx=jnp.full(N_COMET_GROUPS, -2, jnp.int32),
-        step=jnp.int32(0),
-        angular_velocity=jnp.float32(0.0),
-        num_agents=jnp.int32(2),
-        comet_id_base=jnp.int32(0),
-    )
+    # Warm up the JITs so the first in-game call doesn't blow the actTimeout.
+    # With an AOT encoder the encode warmup is just a fast run; otherwise it
+    # triggers the encoder trace+compile here.
+    _dummy_state = _make_dummy_state()
     _dummy_player = jnp.array([0], dtype=jnp.int32)
     _dummy_batched = jax.tree_util.tree_map(lambda x: x[None], _dummy_state)
     _dummy_enc = encode_fn(_dummy_batched, _dummy_player)
@@ -275,8 +315,7 @@ def build_agent(
     _dummy_gf = jnp.broadcast_to(_dummy_enc.global_feat[0][None, :], (MAX_SRC, GLOB_DIM))
     _dummy_cm = _dummy_enc.cand_mask[0]
     _dummy_sv = _dummy_enc.src_valid[0]
-    _forward(_dummy_sf, _dummy_cf, _dummy_gf, _dummy_cm, _dummy_sv)
-    jax.block_until_ready(_evac(_dummy_state, _dummy_player))   # warm the evac JIT too
+    jax.block_until_ready(_forward(_dummy_sf, _dummy_cf, _dummy_gf, _dummy_cm, _dummy_sv))
 
     return agent
 

@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import base64
 import io
+import os
 import pickle
 import re
+import subprocess
 import sys
+import tempfile
 import zipfile
 import zlib
 from pathlib import Path
@@ -194,6 +197,168 @@ def build_warm_b64() -> str:
     return base64.b64encode(blob).decode()
 
 
+# Driver run in a clean CPU subprocess to populate a persistent XLA compile
+# cache. It reproduces the runtime path EXACTLY (same bundled+patched src, same
+# dearrayified params, same warm-obs replay, same CPU platform) so the cache
+# keys match what the submission produces at import time. Anything else (a
+# different jaxlib build, GPU platform, un-patched src) yields a different HLO
+# and the cache silently misses → harmless recompile.
+_CACHE_DRIVER = r'''
+import os, sys, pickle, zlib, base64
+src_dir, cache_dir, ckpt_b64_path, warm_b64_path = sys.argv[1:5]
+# All cache config via env vars set BEFORE importing jax — config.update() after
+# import lands too late for the metadata-exclusion flag (jax has already frozen
+# the cache-key inputs), leaving the key path-sensitive. Env vars are read at
+# import time and reliably exclude HLO op metadata (source paths) from the key,
+# so the bundled cache hits regardless of where src is extracted at runtime
+# (this host's /tmp vs Kaggle's). MUST match the runtime template exactly.
+os.environ["JAX_PLATFORMS"] = "cpu"
+os.environ["JAX_COMPILATION_CACHE_DIR"] = cache_dir
+os.environ["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] = "0"
+os.environ["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"] = "0"
+os.environ["JAX_COMPILATION_CACHE_INCLUDE_METADATA_IN_KEY"] = "0"
+sys.path.insert(0, src_dir)
+import jax
+import numpy as np
+from src_jax.jax_agent import build_agent
+def _dearrayify(t):
+    if isinstance(t, tuple) and len(t) == 4 and t[0] == "__ARR__":
+        _, shape, dt, buf = t
+        a = np.frombuffer(buf, dtype=np.dtype(dt)).reshape(shape)
+        return a.astype(np.float32) if a.dtype == np.float16 else a
+    if isinstance(t, dict):
+        return {k: _dearrayify(v) for k, v in t.items()}
+    if isinstance(t, (list, tuple)):
+        return type(t)(_dearrayify(v) for v in t)
+    return t
+ckpt = pickle.loads(zlib.decompress(base64.b64decode(open(ckpt_b64_path).read())))
+agent = build_agent(_dearrayify(ckpt["params"]), ckpt["config"], deterministic=True)
+warm = pickle.loads(base64.b64decode(open(warm_b64_path).read()))
+for ob in warm.values():
+    agent(ob); agent(ob)
+print("CACHE_DRIVER_OK")
+'''
+
+
+def build_compile_cache_b64(zip_b64: str, ckpt_b64: str, warm_b64: str, tag: str) -> str:
+    """Precompile the agent on CPU and return a base64 zip of the XLA cache.
+
+    DISABLED — returns "" so no cache is bundled. Rigorously verified (Jun 2026,
+    jax/jaxlib 0.5.3, CPU) that JAX's persistent-compilation-cache KEY is
+    non-deterministic across processes for this agent: two byte-identical builds
+    in identical clean environments (pinned PYTHONHASHSEED, JAX_PLATFORMS=cpu,
+    metadata excluded from the key) produce entirely different keys for every
+    entry, including the param-free `_encode_single`. So a cache built here can
+    never reliably hit at runtime, and a bundled-but-missing cache only ADDS
+    unpack+write time to Kaggle's first-act (billed) window. The real first-act
+    compile win is removing the comet-evac JIT in jax_agent.py. Kept as a stub
+    (not deleted) to document the finding; flip the early return to re-enable if
+    a future jaxlib makes keys reproducible.
+
+    The body below is retained for reference but unreachable.
+    """
+    return ""
+    import shutil  # noqa: unreachable — see docstring
+    with tempfile.TemporaryDirectory() as td:
+        src_dir = os.path.join(tempfile.gettempdir(), "owars_ppo_src_" + tag)
+        cache_dir = os.path.join(td, "cache")
+        shutil.rmtree(src_dir, ignore_errors=True)
+        os.makedirs(src_dir); os.makedirs(cache_dir)
+        with zipfile.ZipFile(io.BytesIO(base64.b64decode(zip_b64))) as zf:
+            zf.extractall(src_dir)
+        ckpt_path = os.path.join(td, "ckpt.b64"); Path(ckpt_path).write_text(ckpt_b64)
+        warm_path = os.path.join(td, "warm.b64"); Path(warm_path).write_text(warm_b64)
+        driver = os.path.join(td, "driver.py"); Path(driver).write_text(_CACHE_DRIVER)
+        env = {**os.environ, "JAX_PLATFORMS": "cpu"}
+        try:
+            r = subprocess.run(
+                [sys.executable, driver, src_dir, cache_dir, ckpt_path, warm_path],
+                env=env, capture_output=True, text=True, timeout=600,
+            )
+        except Exception as e:
+            print(f"  compile-cache: subprocess failed ({e}); shipping without cache")
+            return ""
+        if r.returncode != 0 or "CACHE_DRIVER_OK" not in r.stdout:
+            print("  compile-cache: driver did not finish cleanly; shipping without cache")
+            print((r.stderr or "")[-800:])
+            return ""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:  # entries already compressed
+            for name in sorted(os.listdir(cache_dir)):
+                zf.write(os.path.join(cache_dir, name), name)
+        n = len(os.listdir(cache_dir))
+        print(f"  compile-cache: bundled {n} XLA entries ({buf.tell()/1e6:.1f} MB)")
+        return base64.b64encode(buf.getvalue()).decode()
+
+
+# Driver (clean CPU subprocess) that AOT-compiles the ENCODER and serializes the
+# executable. Unlike the persistent cache, serialize_executable stores the
+# compiled program by value (no key lookup), so it is immune to the cross-process
+# key non-determinism that killed the cache — it just needs the runtime jaxlib to
+# match. Loading it at import skips the encoder's ~5s trace+compile, which is what
+# blows Kaggle's first-act budget when 4 instances compile at once in FFA games.
+_AOT_DRIVER = r'''
+import os, sys, pickle, zlib, base64
+os.environ["JAX_PLATFORMS"] = "cpu"
+src_dir, out_path, ckpt_b64_path = sys.argv[1:4]
+sys.path.insert(0, src_dir)
+import jax, jax.numpy as jnp
+from jax.experimental import serialize_executable as se
+from src_jax.jax_agent import _make_dummy_state
+from src_jax.feature_versions import make_env_encoder
+ck = pickle.loads(zlib.decompress(base64.b64decode(open(ckpt_b64_path).read())))
+cfg = ck["config"]
+enc = make_env_encoder(cfg.env.candidate_count, cfg.env, getattr(cfg.model, "feat_version", "v7"))
+ds = _make_dummy_state()
+batched = jax.tree_util.tree_map(lambda x: x[None], ds)
+compiled = jax.jit(enc).lower(batched, jnp.array([0], jnp.int32)).compile()
+open(out_path, "wb").write(pickle.dumps(se.serialize(compiled)))
+print("AOT_OK")
+'''
+
+
+def build_aot_encode_b64(zip_b64: str, ckpt_b64: str) -> str:
+    """AOT-compile the encoder on CPU and return base64(pickle((serialized, in_tree,
+    out_tree))). "" on any failure — the submission then just compiles the encoder
+    normally at import (today's behaviour)."""
+    with tempfile.TemporaryDirectory() as td:
+        src_dir = os.path.join(td, "src"); os.makedirs(src_dir)
+        with zipfile.ZipFile(io.BytesIO(base64.b64decode(zip_b64))) as zf:
+            zf.extractall(src_dir)
+        ckpt_path = os.path.join(td, "ckpt.b64"); Path(ckpt_path).write_text(ckpt_b64)
+        out_path = os.path.join(td, "aot.pkl")
+        driver = os.path.join(td, "aot_driver.py"); Path(driver).write_text(_AOT_DRIVER)
+        # The serialized executable is locked to the BUILD jaxlib. Kaggle's runner
+        # (kaggle-images/python:v163) is jax 0.5.2 / jaxlib 0.5.1 — NOT this host's
+        # version — so set AOT_PYTHON to a venv with jaxlib==0.5.1 or the blob is
+        # rejected at runtime and the agent falls back to compiling (the timeout).
+        aot_python = os.environ.get("AOT_PYTHON")
+        if not aot_python:
+            _cand = REPO / ".venv_aot051" / "bin" / "python"   # see tools/make_aot_venv.sh
+            aot_python = str(_cand) if _cand.exists() else sys.executable
+        print(f"  aot-encode: building with {aot_python}")
+        if aot_python == sys.executable:
+            print("  aot-encode: WARNING building with THIS host's jaxlib, not Kaggle's "
+                  "0.5.1 — the blob will be rejected on Kaggle and fall back to compiling. "
+                  "Run tools/make_aot_venv.sh (or set AOT_PYTHON).")
+        try:
+            r = subprocess.run(
+                [aot_python, driver, src_dir, out_path, ckpt_path],
+                env={**os.environ, "JAX_PLATFORMS": "cpu"},
+                capture_output=True, text=True, timeout=600,
+            )
+        except Exception as e:
+            print(f"  aot-encode: subprocess failed ({e}); shipping without AOT")
+            return ""
+        if r.returncode != 0 or "AOT_OK" not in r.stdout or not os.path.exists(out_path):
+            print("  aot-encode: driver did not finish cleanly; shipping without AOT")
+            print((r.stderr or "")[-800:])
+            return ""
+        blob = Path(out_path).read_bytes()
+        print(f"  aot-encode: bundled precompiled encoder ({len(blob)/1e6:.1f} MB)")
+        return base64.b64encode(blob).decode()
+
+
 TEMPLATE = '''"""Self-contained Orbit Wars PPO agent — Kaggle submission.
 
 Source checkpoint: {ckpt_rel}
@@ -248,6 +413,40 @@ if not os.path.isdir(os.path.join(_SRC_DIR, "src_jax")):
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
+# --- quiet backend probes (+ optional XLA compile cache, currently disabled) -
+# The rocm/tpu backend-probe failures are harmless (jax falls back to CPU); mute
+# them so the episode log isn't noisy. The `if _CACHE_ZIP_B64:` block below is
+# inert: the generator ships an empty _CACHE_ZIP_B64 because JAX's persistent
+# compilation-cache key proved non-deterministic across processes on jax 0.5.3
+# CPU (a bundled cache never reliably hits and only adds first-act overhead — see
+# build_compile_cache_b64). The real first-act compile win is removing the
+# comet-evac JIT in jax_agent.py. The block is kept (env vars set before any jax
+# import) so re-enabling is a one-line generator change if a future jaxlib makes
+# keys reproducible.
+import logging as _logging
+_logging.getLogger("jax._src.xla_bridge").setLevel(_logging.ERROR)  # silence rocm/tpu probe spam
+try:
+    if _CACHE_ZIP_B64:
+        _CACHE_DIR = os.path.join(tempfile.gettempdir(), "owars_xla_cache_" + _SRC_TAG)
+        if not os.path.isdir(_CACHE_DIR):
+            _ctmp = _CACHE_DIR + "." + str(os.getpid())
+            with zipfile.ZipFile(io.BytesIO(base64.b64decode(_CACHE_ZIP_B64))) as _czf:
+                _czf.extractall(_ctmp)
+            try:
+                os.rename(_ctmp, _CACHE_DIR)
+            except OSError:
+                import shutil as _shutil
+                _shutil.rmtree(_ctmp, ignore_errors=True)
+        os.environ["JAX_COMPILATION_CACHE_DIR"] = _CACHE_DIR
+        os.environ["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] = "0"
+        os.environ["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"] = "0"
+        # Path-independent cache key — lets the bundled cache hit even though
+        # Kaggle extracts src to a different tmp dir than this build host.
+        os.environ["JAX_COMPILATION_CACHE_INCLUDE_METADATA_IN_KEY"] = "0"
+except Exception:
+    import traceback as _tb
+    _tb.print_exc(file=sys.__stderr__)
+
 # --- build the agent (compiles + warms up JITs at IMPORT time) --------------
 _build_agent = importlib.import_module("src_jax.jax_agent").build_agent
 
@@ -267,21 +466,31 @@ def _dearrayify(tree):
     if isinstance(tree, (list, tuple)):
         return type(tree)(_dearrayify(v) for v in tree)
     return tree
-_AGENT = _build_agent(_dearrayify(_ckpt["params"]), _ckpt["config"], deterministic=True)
+# Precompiled (AOT) encoder executable, if bundled — build_agent loads it instead
+# of tracing+compiling the encoder (the ~5s cost that, x4 simultaneous instances
+# in Kaggle FFA games, blows the first-act budget). Falls back to normal compile
+# if absent or if the runtime jaxlib rejects the serialized executable.
+_aot_encode = None
+if _AOT_ENCODE_B64:
+    try:
+        _aot_encode = pickle.loads(base64.b64decode(_AOT_ENCODE_B64))
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc(file=sys.__stderr__)
+_AGENT = _build_agent(_dearrayify(_ckpt["params"]), _ckpt["config"],
+                      deterministic=True, aot_encode=_aot_encode)
 
-# build_agent() warms up the JITs on a synthetic dummy state, but the REAL
-# observation path still triggers more XLA compiles (~3-4s each) on first use —
-# the empty initial board and a populated board take slightly different dtype
-# paths through obs_to_env_state. Either alone would blow the per-step budget
-# (actTimeout 1s + ~2s overage). So replay several REAL captured observations
-# HERE at import time (which the kaggle harness does NOT time against
-# actTimeout), forcing every real-path compile to happen now. The first in-game
-# step then returns in a few ms.
+# build_agent() compiles the jitted functions (encode_fn / _forward) on a
+# synthetic dummy state whose shapes match the real obs path, so most real-obs
+# work reuses those compilations. The small post-encoder ops (argmax/where/...)
+# still compile on the FIRST real obs (~1s) since the dummy warmup doesn't cover
+# them, so replay the captured obs ONCE here to force that compile at import
+# rather than deferring it into a timed in-game act. The redundant second pass
+# was dropped to shave first-act overhead.
 try:
     _warm = pickle.loads(base64.b64decode(_WARM_B64))
     for _ob in _warm.values():
         _AGENT(_ob)
-        _AGENT(_ob)  # second pass confirms the cache is warm (no recompile)
     del _warm
 except Exception:
     # Warm-up is best-effort; never let it break agent construction, but do
@@ -321,11 +530,15 @@ def main() -> None:
     ckpt_b64 = build_ckpt_b64()
     warm_b64 = build_warm_b64()
     tag = hashlib.sha1(zip_b64.encode()).hexdigest()[:12]
+    cache_b64 = build_compile_cache_b64(zip_b64, ckpt_b64, warm_b64, tag)
+    aot_b64 = build_aot_encode_b64(zip_b64, ckpt_b64)
     header = (
         f'_SRC_TAG = "{tag}"\n\n'
         f'_SRC_ZIP_B64 = "{zip_b64}"\n\n'
         f'_CKPT_B64 = "{ckpt_b64}"\n\n'
         f'_WARM_B64 = "{warm_b64}"\n\n'
+        f'_CACHE_ZIP_B64 = "{cache_b64}"\n\n'
+        f'_AOT_ENCODE_B64 = "{aot_b64}"\n\n'
     )
     try:
         ckpt_rel = str(CKPT.resolve().relative_to(REPO))

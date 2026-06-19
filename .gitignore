@@ -16,3 +16,4 @@ configs/*
 !configs/templates/**
 analysis/*
 .jax_cache/
+.venv_aot051/
