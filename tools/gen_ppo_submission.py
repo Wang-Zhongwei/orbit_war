@@ -10,8 +10,10 @@ from __future__ import annotations
 import base64
 import io
 import pickle
+import re
 import sys
 import zipfile
+import zlib
 from pathlib import Path
 
 REPO = Path("/home/018270239/orbit_war")
@@ -19,6 +21,7 @@ sys.path.insert(0, str(REPO))
 # Defaults preserve the original ppo_from_bc_loser0 build; override via CLI.
 CKPT = REPO / "artifacts/ppo/ppo_from_bc_loser0/ckpt_000080.pkl"
 OUT = REPO / "submission/ppo_from_bc_loser0.py"
+MAX_TICKS_IN: int | None = None  # None = keep the value from source; set via --max-ticks-in
 
 # Minimal module closure for inference (no rollout/ppo/optax/wandb).
 BUNDLE = [
@@ -29,6 +32,8 @@ BUNDLE = [
     "src_jax/physics.py",
     "src_jax/features.py",
     "src_jax/features_v9.py",
+    "src_jax/features_v91.py",
+    "src_jax/features_v92.py",
     "src_jax/feature_versions.py",
     "src_jax/bc_data.py",
     "src_jax/jax_agent.py",
@@ -58,6 +63,16 @@ def patched_source(rel: str) -> bytes:
             "GLOB_DIM = _global_feature_dim()",
         )
         # The in-game-call warmup import also lives inside build_agent; fine as-is.
+    if MAX_TICKS_IN is not None and rel.startswith("src_jax/features"):
+        # Override the module-level MAX_TICKS_IN constant so the bundled encoder
+        # uses a shorter horizon at inference (fewer sim ticks → faster per-step).
+        src = re.sub(
+            r"^(MAX_TICKS_IN\s*:\s*int\s*=\s*)\d+",
+            rf"\g<1>{MAX_TICKS_IN}",
+            src,
+            count=1,
+            flags=re.MULTILINE,
+        )
     return src.encode()
 
 
@@ -72,9 +87,38 @@ def build_zip_b64() -> str:
 def build_ckpt_b64() -> str:
     with open(CKPT, "rb") as f:
         ck = pickle.load(f)
-    slim = {"update": ck.get("update"), "params": ck["params"], "config": ck["config"]}
-    blob = pickle.dumps(slim, protocol=4)
+    # Serialize params in a VERSION-INDEPENDENT form: each array leaf becomes a
+    # ("__ARR__", shape, dtype_str, raw_bytes) record reconstructed with
+    # np.frombuffer at load time. Why: training checkpoints store params as JAX
+    # arrays, whose pickle pulls in jax-internal `jax._src.array._reconstruct_array`
+    # (and numpy 2.x's `numpy._core`). Those are fragile across jax/numpy versions
+    # — when Kaggle bumps jaxlib (e.g. the `GpuAllocatorConfig` removal) the embedded
+    # pickle can fail to load or force a slow full-device init. frombuffer + a dtype
+    # string is a stable public API on any jax/numpy. float32 leaves are downcast to
+    # float16 here (halving size); the submission upcasts back to float32 on load.
+    params = _arrayify(ck["params"])
+    slim = {"update": ck.get("update"), "params": params, "config": ck["config"]}
+    blob = zlib.compress(pickle.dumps(slim, protocol=4), level=9)
     return base64.b64encode(blob).decode()
+
+
+def _arrayify(tree):
+    """Recursively convert array leaves → ("__ARR__", shape, dtype, bytes) records.
+
+    Materializes JAX *and* numpy arrays to raw bytes so the pickle has no jax/numpy
+    array dependency. float32 → float16 to shrink; everything else kept as-is.
+    """
+    import numpy as np
+    if isinstance(tree, dict):
+        return {k: _arrayify(v) for k, v in tree.items()}
+    if isinstance(tree, (list, tuple)):
+        return type(tree)(_arrayify(v) for v in tree)
+    if hasattr(tree, "shape") and hasattr(tree, "dtype"):
+        a = np.asarray(tree)
+        if a.dtype == np.float32:
+            a = a.astype(np.float16)
+        return ("__ARR__", list(a.shape), a.dtype.str, a.tobytes())
+    return tree
 
 
 # Persistent (git-trackable) cache of captured warm observations. Replaces the
@@ -207,8 +251,23 @@ if _SRC_DIR not in sys.path:
 # --- build the agent (compiles + warms up JITs at IMPORT time) --------------
 _build_agent = importlib.import_module("src_jax.jax_agent").build_agent
 
-_ckpt = pickle.loads(base64.b64decode(_CKPT_B64))
-_AGENT = _build_agent(_ckpt["params"], _ckpt["config"], deterministic=True)
+import zlib as _zlib
+import numpy as _np
+_ckpt = pickle.loads(_zlib.decompress(base64.b64decode(_CKPT_B64)))
+# Params were serialized as version-independent ("__ARR__", shape, dtype, bytes)
+# records (no jax/numpy array pickle deps). Reconstruct via np.frombuffer and
+# upcast float16 → float32 for inference.
+def _dearrayify(tree):
+    if isinstance(tree, tuple) and len(tree) == 4 and tree[0] == "__ARR__":
+        _, shape, dtypestr, buf = tree
+        a = _np.frombuffer(buf, dtype=_np.dtype(dtypestr)).reshape(shape)
+        return a.astype(_np.float32) if a.dtype == _np.float16 else a
+    if isinstance(tree, dict):
+        return {k: _dearrayify(v) for k, v in tree.items()}
+    if isinstance(tree, (list, tuple)):
+        return type(tree)(_dearrayify(v) for v in tree)
+    return tree
+_AGENT = _build_agent(_dearrayify(_ckpt["params"]), _ckpt["config"], deterministic=True)
 
 # build_agent() warms up the JITs on a synthetic dummy state, but the REAL
 # observation path still triggers more XLA compiles (~3-4s each) on first use —
@@ -250,8 +309,13 @@ def main() -> None:
     parser.add_argument("--src-repo", type=Path, default=SRC_REPO,
                         help="Repo/worktree to bundle src_jax from; must match "
                              "the code the checkpoint was trained with.")
+    parser.add_argument("--max-ticks-in", type=int, default=None,
+                        help="Override MAX_TICKS_IN in bundled feature files "
+                             "(e.g. 30 for a faster inference encoder).")
     a = parser.parse_args()
     CKPT, OUT, SRC_REPO = a.ckpt, a.out, a.src_repo
+    global MAX_TICKS_IN
+    MAX_TICKS_IN = a.max_ticks_in
 
     zip_b64 = build_zip_b64()
     ckpt_b64 = build_ckpt_b64()
